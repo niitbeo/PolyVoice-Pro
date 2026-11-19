@@ -1,0 +1,1 @@
+# Placeholder so Tauri resource bundling succeeds in dev mode before `engine/build_sidecar.py` runs.

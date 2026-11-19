@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.voicerecore.macos-helper</string>
+    <key>CFBundleName</key>
+    <string>VOICERECORE Audio Helper</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>VOICERECORE cần quyền Micro để nhận dạng giọng nói và dịch theo thời gian thực.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>VOICERECORE sử dụng nhận dạng giọng nói offline của macOS trên Apple Neural Engine để đạt tốc độ cao và tiết kiệm CPU.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>VOICERECORE cần quyền ghi âm thanh hệ thống (ScreenCaptureKit) để thu trực tiếp tiếng YouTube, Zoom, Google Meet.</string>
+</dict>
+</plist>

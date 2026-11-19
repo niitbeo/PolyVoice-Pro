@@ -1,0 +1,21 @@
+[package]
+name = "voicerecore"
+version = "0.8.0"
+description = "PolyVoice Pro — Real-time Bilingual Conference Speech Translation (202 Languages)"
+authors = ["PolyVoice Pro"]
+edition = "2021"
+
+[lib]
+name = "voicerecore_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

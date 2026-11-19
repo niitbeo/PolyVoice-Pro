@@ -1,0 +1,86 @@
+name: Release PolyVoice Pro (Windows & macOS + Auto-Update)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  publish-tauri:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target_label: windows-x64
+            args: ""
+          - platform: macos-latest
+            target_label: macos-arm64
+            args: "--target aarch64-apple-darwin"
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "pnpm"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
+
+      - name: Setup uv (Python 3.12)
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+
+      - name: Build macOS native ScreenCaptureKit + ANE Swift helper
+        if: matrix.platform == 'macos-latest'
+        run: bash native-macos/build.sh
+
+      - name: Build standalone AI Engine sidecar (Windows .exe)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          cd engine
+          uv sync
+          uv pip install --python .venv/Scripts/python.exe pyinstaller pyaudiowpatch
+          uv run --no-sync python build_sidecar.py
+
+      - name: Build standalone AI Engine sidecar (macOS)
+        if: matrix.platform == 'macos-latest'
+        run: |
+          cd engine
+          uv sync
+          uv pip install --python .venv/bin/python pyinstaller
+          uv run --no-sync python build_sidecar.py
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Build & Publish Signed Installer + Auto-Update Manifest (latest.json)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v__VERSION__
+          releaseName: "PolyVoice Pro v__VERSION__"
+          releaseBody: |
+            ## PolyVoice Pro v__VERSION__
+
+            Bản phát hành chính thức cho **Windows (`.exe`/`.msi`)** và **macOS (`.dmg`)** tích hợp sẵn AI Engine (không cần cài Python).
+            Người dùng đang cài đặt bản cũ chỉ cần mở app lên để **tự động cập nhật 1 chạm** (giữ nguyên toàn bộ model offline, từ điển và API Key).
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
