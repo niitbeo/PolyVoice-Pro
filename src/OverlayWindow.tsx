@@ -1,14 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlignLeft,
   ArrowDown,
+  Contrast,
+  GripHorizontal,
+  Languages,
   Maximize2,
+  Mic,
   Minimize2,
   Minus,
   Moon,
-  Move,
   Pin,
   PinOff,
   Plus,
+  Radio,
   Sun,
   Trash2,
   X,
@@ -217,7 +222,7 @@ export default function OverlayWindow() {
   };
 
   const paraLabel =
-    currentParaMode === "long" ? "Đoạn: Dài" : currentParaMode === "medium" ? "Đoạn: Vừa" : "Đoạn: Từng câu";
+    currentParaMode === "long" ? "Đoạn dài" : currentParaMode === "medium" ? "Đoạn vừa" : "Từng câu";
 
   const groupedEntries = useMemo(() => groupEntriesByParagraph(entries), [entries]);
 
@@ -227,7 +232,9 @@ export default function OverlayWindow() {
   const cardBg =
     theme === "light"
       ? `rgba(255, 255, 255, ${opacity})`
-      : `rgba(10, 15, 28, ${opacity})`;
+      : `rgba(11, 14, 23, ${opacity})`;
+
+  const isEmpty = entries.length === 0 && !partial;
 
   return (
     <div className={`overlay-stage-root ${filledMonitor ? "filled" : ""}`}>
@@ -236,28 +243,60 @@ export default function OverlayWindow() {
         <header className="overlay-topbar" data-tauri-drag-region>
           <div className="overlay-topbar-left" data-tauri-drag-region>
             <div className="brand-crest sm" data-tauri-drag-region>
-              <img src="/school-logo.png" alt="Logo trường" />
+              <img src="/school-logo.png" alt="PolyVoice Pro" />
             </div>
-            <span
-              className={`dot ${status?.listening ? "pulse" : ""}`}
-              style={{ color: status?.listening ? "var(--red)" : "var(--green)" }}
-            />
             <span className="overlay-brand" data-tauri-drag-region>
-              PolyVoice <span className="brand-pro-tag">PRO</span>
+              <span>PolyVoice</span>
+              <span className="brand-pro-tag">PRO</span>
+            </span>
+            <span className={`pill overlay-status-pill ${status?.listening ? "live" : "ok"}`}>
+              <span className={`dot ${status?.listening ? "pulse" : ""}`} />
+              {status?.listening ? "Đang phát" : "Sẵn sàng"}
             </span>
             <span className="overlay-drag-hint" data-tauri-drag-region>
-              <Move size={11} /> Kéo sang màn hình #2
+              <GripHorizontal size={12} /> Kéo sang màn hình #2
             </span>
           </div>
 
           <div className="overlay-topbar-actions">
+            {/* Group 1: Reading & Layout */}
             <button
-              className="btn sm active"
-              title="Dịch chuẩn từng câu kiểu YouTube và gom hiển thị theo đoạn (Dài: ~3–4 câu / Vừa: ~2 câu / Từng câu)"
+              className="btn sm overlay-ctrl-btn"
+              title="Chế độ gom đoạn hiển thị (Đoạn dài / Đoạn vừa / Từng câu)"
               onClick={cycleParagraphMode}
             >
-              {paraLabel}
+              <AlignLeft size={12} /> {paraLabel}
             </button>
+
+            <div className="overlay-stepper" role="group" aria-label="Cỡ chữ phụ đề">
+              <button
+                className="overlay-step-btn"
+                title="Giảm cỡ chữ"
+                onClick={() => setFontSize((s) => Math.max(14, s - 2))}
+              >
+                <Minus size={12} />
+              </button>
+              <span className="overlay-size-tag">{fontSize}px</span>
+              <button
+                className="overlay-step-btn"
+                title="Tăng cỡ chữ"
+                onClick={() => setFontSize((s) => Math.min(48, s + 2))}
+              >
+                <Plus size={12} />
+              </button>
+            </div>
+
+            <button
+              className="btn sm overlay-ctrl-btn"
+              title="Đổi độ mờ nền (78% / 94% / 100%)"
+              onClick={() => setOpacity((o) => (o >= 0.99 ? 0.78 : o >= 0.9 ? 1.0 : 0.94))}
+            >
+              <Contrast size={12} /> {Math.round(opacity * 100)}%
+            </button>
+
+            <span className="overlay-sep" />
+
+            {/* Group 2: Window & Appearance */}
             <button
               className="btn sm icon-only"
               title={theme === "dark" ? "Chuyển phụ đề sang nền Sáng (cho phòng chiếu sáng)" : "Chuyển phụ đề sang nền Tối"}
@@ -265,45 +304,29 @@ export default function OverlayWindow() {
             >
               {theme === "dark" ? <Sun size={13} /> : <Moon size={13} />}
             </button>
+
             <button
-              className={`btn sm ${alwaysOnTop ? "active" : ""}`}
+              className={`btn sm icon-only ${alwaysOnTop ? "info-active" : ""}`}
               title={alwaysOnTop ? "Đang ghim nổi trên cùng (bấm để tắt)" : "Ghim nổi trên cùng"}
               onClick={handleTogglePin}
             >
               {alwaysOnTop ? <Pin size={13} /> : <PinOff size={13} />}
             </button>
+
             <button
-              className="btn sm"
-              title="Giảm cỡ chữ"
-              onClick={() => setFontSize((s) => Math.max(14, s - 2))}
-            >
-              <Minus size={13} />
-            </button>
-            <span className="overlay-size-tag">{fontSize}px</span>
-            <button
-              className="btn sm"
-              title="Tăng cỡ chữ"
-              onClick={() => setFontSize((s) => Math.min(48, s + 2))}
-            >
-              <Plus size={13} />
-            </button>
-            <button
-              className="btn sm"
-              title="Đổi độ mờ nền (78% / 94% / 100% Đen đặc)"
-              onClick={() => setOpacity((o) => (o >= 0.99 ? 0.78 : o >= 0.9 ? 1.0 : 0.94))}
-            >
-              {Math.round(opacity * 100)}%
-            </button>
-            <button
-              className={`btn sm ${filledMonitor ? "active" : ""}`}
+              className={`btn sm ${filledMonitor ? "info-active" : ""}`}
               title={filledMonitor ? "Thu về kích thước cửa sổ" : "Phóng đầy màn hình hiện tại (màn hình 1 hoặc 2)"}
               onClick={handleToggleFillMonitor}
             >
               {filledMonitor ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
-              {filledMonitor ? "Thu gọn" : "Đầy màn hình"}
+              <span>{filledMonitor ? "Thu gọn" : "Đầy màn hình"}</span>
             </button>
+
+            <span className="overlay-sep" />
+
+            {/* Group 3: Clear & Close */}
             <button
-              className="btn sm"
+              className="btn sm icon-only"
               title="Xóa chữ trên màn hình phụ đề"
               onClick={() => {
                 setEntries([]);
@@ -312,7 +335,7 @@ export default function OverlayWindow() {
             >
               <Trash2 size={13} />
             </button>
-            <button className="btn sm" title="Đóng màn hình phụ đề" onClick={handleClose}>
+            <button className="btn sm icon-only" title="Đóng màn hình phụ đề" onClick={handleClose}>
               <X size={13} />
             </button>
           </div>
@@ -321,75 +344,99 @@ export default function OverlayWindow() {
         {/* Fixed 2-Column Language Headers */}
         <div className="overlay-col-headers">
           <div className="overlay-col-head left">
-            <span className="col-badge src">NGÔN NGỮ GỐC</span>
+            <span className="col-badge src">
+              <Mic size={11} /> NGÔN NGỮ GỐC
+            </span>
             <span className="col-lang">{srcLabel}</span>
           </div>
           <div className="overlay-col-head right">
-            <span className="col-badge tgt">NGÔN NGỮ DỊCH</span>
+            <span className="col-badge tgt">
+              <Languages size={11} /> NGÔN NGỮ DỊCH
+            </span>
             <span className="col-lang">{tgtLabel}</span>
           </div>
         </div>
 
-        {/* Scrollable Paired Bilingual Conversation Feed (pushes upward as turns arrive) */}
+        {/* Scrollable Paired Bilingual Conversation Feed */}
         <div className="overlay-feed" ref={scrollRef} onScroll={handleScroll}>
-          <div className="overlay-feed-inner">
-            {entries.length === 0 && !partial && (
-              <div className="overlay-empty-split">
-                <div className="overlay-empty-col">
-                  Đang chờ giọng nói <b>{srcLabel}</b>...
-                </div>
-                <div className="overlay-empty-col right">
-                  Bản dịch <b>{tgtLabel}</b> sẽ hiển thị song song tại đây và tự đẩy dần lên trên theo cuộc trò chuyện.
+          {isEmpty ? (
+            <div className="overlay-empty-split">
+              <div className="overlay-empty-col">
+                <div className="overlay-empty-card">
+                  <div className="overlay-empty-icon">
+                    <Mic size={19} />
+                  </div>
+                  <div className="overlay-empty-title">
+                    Đang chờ giọng nói <span className="overlay-empty-pill">{srcLabel}</span>
+                  </div>
+                  <p className="overlay-empty-desc">
+                    Lời nói gốc của diễn giả sẽ hiển thị theo thời gian thực tại cột này.
+                  </p>
                 </div>
               </div>
-            )}
+              <div className="overlay-empty-col right">
+                <div className="overlay-empty-card">
+                  <div className="overlay-empty-icon info">
+                    <Languages size={19} />
+                  </div>
+                  <div className="overlay-empty-title">
+                    Bản dịch song song <span className="overlay-empty-pill info">{tgtLabel}</span>
+                  </div>
+                  <p className="overlay-empty-desc">
+                    Bản dịch sẽ xuất hiện đồng bộ tại đây và tự động đẩy dần lên trên theo mạch nói.
+                  </p>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="overlay-feed-inner">
+              {groupedEntries.map((item) => (
+                <div className="overlay-row" key={item.id}>
+                  <div className="overlay-cell left">
+                    <div className="overlay-cell-meta">
+                      {item.speaker === "self" && <span className="spk-badge self">Bạn</span>}
+                      {item.speaker === "remote" && <span className="spk-badge remote">Đối tác</span>}
+                      <span>{item.timestamp}</span>
+                      {(item.sentence_count ?? 1) > 1 ? <span>• {item.sentence_count} câu</span> : null}
+                    </div>
+                    <div className="overlay-cell-text src" style={{ fontSize }}>
+                      {item.source_text}
+                    </div>
+                  </div>
+                  <div className="overlay-cell right">
+                    <div className="overlay-cell-meta">
+                      <span>{item.timestamp}</span>
+                      {item.mt_ms > 0 ? <span>• {item.mt_ms}ms</span> : null}
+                    </div>
+                    <div className="overlay-cell-text tgt" style={{ fontSize }}>
+                      {item.translated_text || "—"}
+                    </div>
+                  </div>
+                </div>
+              ))}
 
-            {groupedEntries.map((item) => (
-              <div className="overlay-row" key={item.id}>
-                <div className="overlay-cell left">
-                  <div className="overlay-cell-meta">
-                    {item.speaker === "self" && <span className="spk-badge self">Bạn</span>}
-                    {item.speaker === "remote" && <span className="spk-badge remote">Đối tác</span>}
-                    {item.timestamp}
-                    {(item.sentence_count ?? 1) > 1 ? ` • ${item.sentence_count} câu` : ""}
+              {partial && (
+                <div className="overlay-row live">
+                  <div className="overlay-cell left">
+                    <div className="overlay-cell-meta live-tag">
+                      <Radio size={12} /> Đang nói...
+                    </div>
+                    <div className="overlay-cell-text src draft" style={{ fontSize }}>
+                      {partial.source_text}
+                    </div>
                   </div>
-                  <div className="overlay-cell-text src" style={{ fontSize }}>
-                    {item.source_text}
-                  </div>
-                </div>
-                <div className="overlay-cell right">
-                  <div className="overlay-cell-meta">
-                    {item.timestamp}
-                    {item.mt_ms > 0 ? ` • ${item.mt_ms}ms` : ""}
-                  </div>
-                  <div className="overlay-cell-text tgt" style={{ fontSize }}>
-                    {item.translated_text || "—"}
+                  <div className="overlay-cell right">
+                    <div className="overlay-cell-meta live-tag">
+                      <Radio size={12} /> Đang dịch trực tiếp...
+                    </div>
+                    <div className="overlay-cell-text tgt draft" style={{ fontSize }}>
+                      {partial.translated_text || "..."}
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))}
-
-            {partial && (
-              <div className="overlay-row live">
-                <div className="overlay-cell left">
-                  <div className="overlay-cell-meta live-tag">
-                    <span className="dot pulse" /> Đang nói...
-                  </div>
-                  <div className="overlay-cell-text src draft" style={{ fontSize }}>
-                    {partial.source_text}
-                  </div>
-                </div>
-                <div className="overlay-cell right">
-                  <div className="overlay-cell-meta live-tag">
-                    <span className="dot pulse" /> Đang dịch trực tiếp...
-                  </div>
-                  <div className="overlay-cell-text tgt draft" style={{ fontSize }}>
-                    {partial.translated_text || "..."}
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          )}
         </div>
 
         {userScrolledUp && (
