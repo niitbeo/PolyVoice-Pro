@@ -29,12 +29,15 @@ import {
   Send,
   Settings,
   Settings2,
+  Smartphone,
   Sparkles,
   Sun,
   Trash2,
+  Tv,
   Upload,
   Volume2,
   VolumeX,
+  Wifi,
   X,
   Zap,
 } from "lucide-react";
@@ -2256,35 +2259,34 @@ export default function App() {
       {/* QR Code LAN Audience & OBS Modal */}
       {qrOpen && (
         <div className="modal-backdrop" onClick={() => setQrOpen(false)}>
-          <div className="modal-card" style={{ width: "min(760px, 100%)" }} onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              <div className="row" style={{ gap: 10 }}>
-                <div className="brand-crest sm">
-                  <img src="/school-logo.png" alt="Logo" />
+          <div className="modal-card qr-modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head qr-modal-head">
+              <div className="row" style={{ gap: 12, minWidth: 0 }}>
+                <div className="brand-crest qr-crest">
+                  <img src="/school-logo.png" alt="PolyVoice Pro" />
                 </div>
-                <div>
-                  <div className="modal-title">PolyVoice Pro — Phát Phụ Đề Hội Trường (QR &amp; OBS)</div>
+                <div style={{ minWidth: 0 }}>
+                  <div className="modal-title qr-modal-title">
+                    <span>Phát Phụ Đề Hội Trường</span>
+                    <span className="brand-pro-tag">QR &amp; OBS</span>
+                  </div>
                   <div className="modal-sub">
-                    Khán giả quét QR bằng điện thoại (cùng Wi-Fi, KHÔNG cần Internet) và tự chọn ngôn ngữ riêng (Anh / Thái / Lào / Trung / Nhật...)
+                    Chiếu mã QR để đại biểu quét xem phụ đề trực tiếp theo ngôn ngữ mong muốn
                   </div>
                 </div>
               </div>
-              <button className="btn sm icon-only" onClick={() => setQrOpen(false)}>
-                <X size={14} />
-              </button>
-            </div>
-
-            <div className="qr-brand-banner">
-              <div className="brand-crest lg">
-                <img src="/school-logo.png" alt="Logo trường" />
-              </div>
-              <div>
-                <div style={{ fontSize: 13.5, fontWeight: 800, color: "var(--text-0)" }}>
-                  Hệ thống Phiên dịch Hội nghị Đa ngôn ngữ — PolyVoice Pro
-                </div>
-                <div style={{ fontSize: 11.5, color: "var(--text-2)" }}>
-                  Chiếu khung mã QR này lên màn hình hội trường để đại biểu quét xem phụ đề trực tiếp theo ngôn ngữ mong muốn
-                </div>
+              <div className="row" style={{ gap: 8, flexShrink: 0 }}>
+                <span className={`pill ${audienceCount > 0 ? "ok" : ""}`}>
+                  <span className={`dot ${audienceCount > 0 ? "pulse" : ""}`} />
+                  {audienceCount} thiết bị
+                </span>
+                <button
+                  className="btn sm icon-only"
+                  onClick={() => setQrOpen(false)}
+                  title="Đóng"
+                >
+                  <X size={14} />
+                </button>
               </div>
             </div>
 
@@ -2295,57 +2297,105 @@ export default function App() {
                     className="qr-svg"
                     dangerouslySetInnerHTML={{ __html: audienceInfo.qr_svg }}
                   />
-                  <div className="hint" style={{ justifyContent: "center" }}>
-                    Đang kết nối: <b style={{ color: "var(--green)" }}>{audienceCount} thiết bị</b>
+                  <div className="qr-scan-caption">
+                    <div className="qr-scan-title">Quét bằng Camera điện thoại</div>
+                    <div className="qr-scan-sub">Cùng Wi-Fi nội bộ • Không cần cài app</div>
+                  </div>
+                  <div className="qr-lang-strip">
+                    {["Anh", "Thái", "Lào", "Trung", "+200"].map((lbl) => (
+                      <span className="qr-lang-chip" key={lbl}>
+                        {lbl}
+                      </span>
+                    ))}
                   </div>
                   {audienceInfo.active_languages.length > 0 && (
-                    <div className="hint" style={{ justifyContent: "center" }}>
-                      Ngôn ngữ riêng: {audienceInfo.active_languages.join(", ")}
+                    <div className="qr-active-langs">
+                      Đang xem: {audienceInfo.active_languages.join(", ")}
                     </div>
                   )}
                 </div>
 
                 <div className="qr-details">
-                  <div className="glossary-col-title">1. Link Khán Giả Trên Điện Thoại (Mạng LAN)</div>
-                  <div className="row">
-                    <input className="input" readOnly value={audienceInfo.audience_url} />
-                    <button
-                      className="btn primary sm"
-                      onClick={() => handleCopy("qr-aud", audienceInfo.audience_url)}
-                    >
-                      {copiedId === "qr-aud" ? <Check size={12} /> : <Copy size={12} />} Chép
-                    </button>
-                  </div>
-                  <div className="glossary-col-hint">
-                    Mỗi khán giả có thể tự chọn ngôn ngữ phụ đề khác nhau ngay trên trình duyệt điện thoại (VD: máy chiếu hiện Tiếng Anh, khách Thái chọn Tiếng Thái, khách Lào chọn Tiếng Lào).
+                  <div className="qr-link-card featured">
+                    <div className="qr-link-head">
+                      <span className="qr-step-num primary">1</span>
+                      <Smartphone size={14} className="qr-link-icon primary" />
+                      <span className="qr-link-title">Khán giả trên điện thoại</span>
+                      <span className="qr-link-tag">Mạng LAN</span>
+                    </div>
+                    <div className="qr-url-row">
+                      <input
+                        className="input qr-url-input"
+                        readOnly
+                        value={audienceInfo.audience_url}
+                        onFocus={(e) => e.currentTarget.select()}
+                      />
+                      <button
+                        className="btn primary sm qr-copy-btn"
+                        onClick={() => handleCopy("qr-aud", audienceInfo.audience_url)}
+                      >
+                        {copiedId === "qr-aud" ? (
+                          <>
+                            <Check size={12} /> Đã chép
+                          </>
+                        ) : (
+                          <>
+                            <Copy size={12} /> Chép
+                          </>
+                        )}
+                      </button>
+                    </div>
+                    <div className="qr-link-desc">
+                      Mỗi khán giả tự chọn ngôn ngữ phụ đề riêng ngay trên trình duyệt (VD: máy chiếu hiện Tiếng Anh, khách Thái/Lào chọn ngôn ngữ riêng).
+                    </div>
                   </div>
 
-                  <div className="glossary-col-title" style={{ marginTop: 12 }}>
-                    2. Link Phụ Đề Trong Suốt cho OBS Studio / Livestream
-                  </div>
-                  <div className="row">
-                    <input className="input" readOnly value={audienceInfo.obs_url} />
-                    <button
-                      className="btn sm"
-                      onClick={() => handleCopy("qr-obs", audienceInfo.obs_url)}
-                    >
-                      {copiedId === "qr-obs" ? <Check size={12} /> : <Copy size={12} />} Chép
-                    </button>
-                  </div>
-                  <div className="glossary-col-hint">
-                    Trong OBS Studio → thêm nguồn <b>Browser Source</b>, dán link trên (kích thước gợi ý 1920×260). Thêm <code>?size=36&amp;bilingual=1</code> để chỉnh cỡ chữ.
+                  <div className="qr-link-card">
+                    <div className="qr-link-head">
+                      <span className="qr-step-num">2</span>
+                      <Tv size={14} className="qr-link-icon" />
+                      <span className="qr-link-title">Phụ đề trong suốt cho OBS / Livestream</span>
+                    </div>
+                    <div className="qr-url-row">
+                      <input
+                        className="input qr-url-input"
+                        readOnly
+                        value={audienceInfo.obs_url}
+                        onFocus={(e) => e.currentTarget.select()}
+                      />
+                      <button
+                        className="btn sm qr-copy-btn"
+                        onClick={() => handleCopy("qr-obs", audienceInfo.obs_url)}
+                      >
+                        {copiedId === "qr-obs" ? (
+                          <>
+                            <Check size={12} /> Đã chép
+                          </>
+                        ) : (
+                          <>
+                            <Copy size={12} /> Chép
+                          </>
+                        )}
+                      </button>
+                    </div>
+                    <div className="qr-link-desc">
+                      OBS Studio → thêm <b>Browser Source</b> (1920×260). Thêm{" "}
+                      <code>?size=36&amp;bilingual=1</code> để tùy chỉnh cỡ chữ.
+                    </div>
                   </div>
                 </div>
               </div>
             ) : (
-              <div style={{ padding: 28, textAlign: "center", color: "var(--text-2)" }}>
+              <div style={{ padding: 36, textAlign: "center", color: "var(--text-2)" }}>
                 Đang tạo mã QR nội bộ...
               </div>
             )}
 
             <div className="modal-foot">
-              <span>Chạy 100% qua mạng nội bộ (Wi-Fi / LAN), không gửi dữ liệu ra ngoài.</span>
-              <button className="btn primary sm" onClick={() => setQrOpen(false)}>
+              <span className="qr-foot-note">
+                <Wifi size={13} /> Chạy 100% qua mạng nội bộ (Wi-Fi / LAN), không gửi dữ liệu ra Internet.
+              </span>
+              <button className="btn sm" onClick={() => setQrOpen(false)}>
                 Đóng
               </button>
             </div>
