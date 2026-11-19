@@ -341,7 +341,7 @@ class EngineRuntime:
         audience_url = f"http://{lan_ip}:{self.server_port}/audience"
         obs_url = f"http://127.0.0.1:{self.server_port}/obs"
         qr = segno.make(audience_url)
-        qr_svg = qr.svg_inline(scale=5, border=2, dark="#0f172a", light="#ffffff")
+        qr_svg = qr.svg_inline(omitsize=True, border=0, dark="#0f172a", light="#ffffff")
         return {
             "lan_ip": lan_ip,
             "port": self.server_port,
