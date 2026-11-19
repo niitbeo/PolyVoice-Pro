@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ArrowLeftRight,
   ArrowUpCircle,
   BookOpen,
@@ -231,6 +232,7 @@ export default function App() {
   const [partial, setPartial] = useState<PartialEvent | null>(null);
   const [history, setHistory] = useState<TranscriptEntry[]>([]);
   const [errorMsg, setErrorMsg] = useState("");
+  const [cloudNotice, setCloudNotice] = useState("");
   const [quickText, setQuickText] = useState("");
   const [quickBusy, setQuickBusy] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -267,6 +269,7 @@ export default function App() {
         if (typeof h.config?.eco_mode === "boolean") setEcoMode(h.config.eco_mode);
         if (typeof h.logs?.saved_count === "number") setSavedLogCount(h.logs.saved_count);
         if (typeof h.audience?.connected_count === "number") setAudienceCount(h.audience.connected_count);
+        if (typeof h.cloud_fallback_notice === "string") setCloudNotice(h.cloud_fallback_notice);
       }
       if (dRes.ok) {
         const d = await dRes.json();
@@ -408,6 +411,8 @@ export default function App() {
               setFileBusy(false);
               setFileCancelling(false);
             }
+          } else if (msg.type === "cloud_notice") {
+            setCloudNotice(String(msg.data?.message || ""));
           } else if (msg.type === "error") {
             setErrorMsg(msg.data?.message || "Đã xảy ra lỗi không xác định");
           }
@@ -1288,11 +1293,12 @@ export default function App() {
   );
 
   const latestItem = history[0] || null;
-  const spotSource = partial?.source_text || latestItem?.source_text || "";
-  const spotTarget = partial?.translated_text || latestItem?.translated_text || "";
+  const isDraft = Boolean(partial);
+  const spotSource = partial ? partial.source_text : latestItem?.source_text || "";
+  const spotTarget = partial ? partial.translated_text : latestItem?.translated_text || "";
+  const spotPendingDraft = isDraft && !spotTarget;
   const spotAsrMs = partial ? partial.asr_ms : latestItem?.asr_ms ?? 0;
   const spotMtMs = partial ? partial.mt_ms : latestItem?.mt_ms ?? 0;
-  const isDraft = Boolean(partial);
   const litBars = Math.round(level * VU_BARS);
 
   return (
@@ -1990,6 +1996,27 @@ export default function App() {
             </div>
           )}
 
+          {mtMode === "cloud-api" && cloudNotice && (
+            <div className="banner-warn">
+              <span className="row" style={{ gap: 7, minWidth: 0 }}>
+                <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+                <span>{cloudNotice}</span>
+              </span>
+              <div className="row" style={{ gap: 6, flexShrink: 0 }}>
+                <button className="btn sm" onClick={() => handleOpenCloudModal()}>
+                  <Settings size={12} /> Đổi API
+                </button>
+                <button
+                  className="btn sm icon-only"
+                  onClick={() => setCloudNotice("")}
+                  title="Ẩn thông báo"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Live Spotlight */}
           <section className={`spotlight ${status?.listening ? "live" : ""}`}>
             <div className="spotlight-head">
@@ -2036,7 +2063,13 @@ export default function App() {
             <div className="spot-divider" />
 
             <div className={`spot-target ${isDraft ? "draft" : ""}`}>
-              {spotTarget || (
+              {spotTarget ? (
+                spotTarget
+              ) : spotPendingDraft ? (
+                <span className="spot-translating">
+                  <Loader2 size={15} className="spin" /> Đang dịch câu hiện tại...
+                </span>
+              ) : (
                 <span className="spot-empty">
                   Bản dịch thời gian thực sẽ xuất hiện tại đây...
                 </span>

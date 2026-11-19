@@ -852,6 +852,21 @@ kbd {
   gap: 10px;
 }
 
+.banner-warn {
+  padding: 8px 12px;
+  border-radius: 9px;
+  background: var(--amber-soft);
+  border: 1px solid var(--amber-border);
+  color: var(--amber);
+  font-size: 12px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
 /* Live Spotlight Hero Card */
 .spotlight {
   position: relative;
@@ -942,7 +957,17 @@ kbd {
 }
 
 .spot-target.draft {
-  color: var(--spot-draft);
+  color: var(--info-text);
+}
+
+.spot-translating {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--info-text);
+  opacity: 0.85;
 }
 
 .spot-empty {

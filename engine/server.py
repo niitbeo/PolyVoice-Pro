@@ -275,6 +275,9 @@ class EngineRuntime:
         self._boot_error: str = ""
         self._file_job_progress: dict[str, Any] = {"active": False}
         self._file_job_cancel: Optional[threading.Event] = None
+        self._cloud_cooldown_until: float = 0.0
+        self._cloud_fallback_reason: str = ""
+        self._cloud_notice_lock = threading.Lock()
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
@@ -651,6 +654,53 @@ class EngineRuntime:
                 return self._gemini_mt
         raise ValueError(f"Unsupported cloud provider: {pid}")
 
+    def clear_cloud_cooldown(self) -> None:
+        changed = False
+        with self._cloud_notice_lock:
+            if self._cloud_cooldown_until > 0.0 or self._cloud_fallback_reason:
+                self._cloud_cooldown_until = 0.0
+                self._cloud_fallback_reason = ""
+                changed = True
+        if changed:
+            self.broadcast_threadsafe({"type": "cloud_notice", "data": {"message": "", "cooldown_s": 0}})
+
+    def get_cloud_fallback_notice(self) -> str:
+        with self._cloud_notice_lock:
+            if self._cloud_cooldown_until > 0.0 and time.time() >= self._cloud_cooldown_until:
+                self._cloud_cooldown_until = 0.0
+                self._cloud_fallback_reason = ""
+            return self._cloud_fallback_reason
+
+    def _record_cloud_error(self, pid: str, exc: Exception) -> None:
+        raw = str(exc or "").strip()
+        low = raw.lower()
+        pname = {"gemini": "Gemini", "azure": "Azure Translator", "google": "Google Cloud"}.get(pid, "Cloud API")
+        if "429" in low or "quota" in low or "rate" in low or "resource_exhausted" in low:
+            if "free_tier" in low or "per day" in low or "limit: 20" in low:
+                cooldown_s = 300
+                reason = f"{pname} đã hết 20 lượt miễn phí trong ngày (HTTP 429) — đang tự dịch bằng Offline."
+            else:
+                cooldown_s = 45
+                reason = f"{pname} đang quá tải tạm thời (HTTP 429) — dùng Offline dự phòng 45 giây."
+        elif "401" in low or "403" in low or "api_key" in low or "unauthorized" in low or "invalid" in low:
+            cooldown_s = 120
+            reason = f"{pname} API Key không hợp lệ hoặc bị từ chối — đã tự chuyển sang Offline."
+        else:
+            cooldown_s = 30
+            reason = f"Không kết nối được {pname} — đang tự chuyển mượt sang Offline."
+
+        with self._cloud_notice_lock:
+            prev_reason = self._cloud_fallback_reason
+            was_cooling = time.time() < self._cloud_cooldown_until
+            self._cloud_cooldown_until = time.time() + cooldown_s
+            self._cloud_fallback_reason = reason
+            should_notify = (not was_cooling) or (prev_reason != reason)
+
+        if should_notify:
+            self.broadcast_threadsafe(
+                {"type": "cloud_notice", "data": {"message": reason, "cooldown_s": cooldown_s}}
+            )
+
     def test_cloud_connection(self, req: CloudTestRequest) -> dict[str, Any]:
         creds = self.cloud_quota.get_credentials(req.provider)
         pid = creds["id"]
@@ -672,6 +722,7 @@ class EngineRuntime:
             else:
                 return {"ok": False, "provider": pid, "error": f"Nhà cung cấp không hỗ trợ: {pid}"}
             self.cloud_quota.record_usage(pid, len(sample))
+            self.clear_cloud_cooldown()
             return {
                 "ok": True,
                 "provider": pid,
@@ -722,38 +773,51 @@ class EngineRuntime:
             creds = self.cloud_quota.get_credentials()
             pid = creds["id"]
             should_call_cloud = (not is_draft) or (not creds.get("draft_offline", True))
-            if should_call_cloud and self.cloud_quota.can_spend(pid, len(clean)):
-                try:
-                    adapter = self._get_cloud_translator(creds)
-                    if pid == "gemini":
-                        res = adapter.translate(
-                            clean,
-                            source_lang,
-                            target_lang,
-                            context=context,
-                            term_locks=active_term_locks,
-                        )
-                        if not res.cached:
-                            self.cloud_quota.record_usage(pid, len(clean))
-                        return res
-                    else:
-                        masked_c, restore_c = self.glossary.protect_terms(clean)
-                        res = adapter.translate(masked_c, source_lang, target_lang)
-                        if not res.cached:
-                            self.cloud_quota.record_usage(pid, len(clean))
-                        restored_c = self.glossary.restore_terms(res.translated_text, restore_c)
-                        return TranslationResult(
-                            source_text=clean,
-                            translated_text=restored_c,
-                            source_lang=res.source_lang,
-                            target_lang=res.target_lang,
-                            latency_ms=res.latency_ms,
-                            engine=res.engine,
-                            cached=res.cached,
-                        )
-                except Exception:
-                    # Seamless zero-downtime fallback to Offline SOTA below!
-                    pass
+            in_cooldown = time.time() < self._cloud_cooldown_until
+            if should_call_cloud and not in_cooldown:
+                if not self.cloud_quota.can_spend(pid, len(clean)):
+                    with self._cloud_notice_lock:
+                        cap_msg = "Đã chạm ngưỡng miễn phí tháng này ($0) — đang tự dịch bằng Offline."
+                        if self._cloud_fallback_reason != cap_msg:
+                            self._cloud_fallback_reason = cap_msg
+                            self._cloud_cooldown_until = time.time() + 120
+                            self.broadcast_threadsafe(
+                                {"type": "cloud_notice", "data": {"message": cap_msg, "cooldown_s": 120}}
+                            )
+                else:
+                    try:
+                        adapter = self._get_cloud_translator(creds)
+                        if pid == "gemini":
+                            res = adapter.translate(
+                                clean,
+                                source_lang,
+                                target_lang,
+                                context=context,
+                                term_locks=active_term_locks,
+                            )
+                            if not res.cached:
+                                self.cloud_quota.record_usage(pid, len(clean))
+                            self.clear_cloud_cooldown()
+                            return res
+                        else:
+                            masked_c, restore_c = self.glossary.protect_terms(clean)
+                            res = adapter.translate(masked_c, source_lang, target_lang)
+                            if not res.cached:
+                                self.cloud_quota.record_usage(pid, len(clean))
+                            self.clear_cloud_cooldown()
+                            restored_c = self.glossary.restore_terms(res.translated_text, restore_c)
+                            return TranslationResult(
+                                source_text=clean,
+                                translated_text=restored_c,
+                                source_lang=res.source_lang,
+                                target_lang=res.target_lang,
+                                latency_ms=res.latency_ms,
+                                engine=res.engine,
+                                cached=res.cached,
+                            )
+                    except Exception as exc:
+                        # Record friendly status + enter cooldown, then fall back seamlessly to Offline SOTA!
+                        self._record_cloud_error(pid, exc)
 
         # Native Hy-MT2-1.8B path (uses direct Terminology Intervention + Context-Aware Background — no placeholders!)
         # 1) Always used when user selects `hy-mt2` (except ultra-fast VI<->EN drafts, where EnViT5 keeps latency <200ms)
@@ -886,6 +950,8 @@ class EngineRuntime:
             "glossary_enabled": g["enabled"],
             "glossary_count": len(g["asr_fixes"]) + len(g["term_locks"]),
             "cloud_api": self.cloud_quota.get_public_status(),
+            "cloud_fallback_notice": self.get_cloud_fallback_notice(),
+            "envit5_device": self._envit5.device if self._envit5 is not None else "cpu",
             "platform": {
                 "os": platform.system(),
                 "arch": platform.machine(),
@@ -1896,6 +1962,7 @@ class EngineRuntime:
     def _mt_worker_loop(self) -> None:
         last_partial_time = 0.0
         last_partial_key: tuple[str, str, str] = ("", "", "")
+        last_final_mt_ms = 0.0
 
         while not self._stop_event.is_set() or not self._final_mt_queue.empty():
             if not self._stop_event.is_set():
@@ -1903,6 +1970,10 @@ class EngineRuntime:
                 self._remote_flush_if_idle()
             try:
                 item = self._final_mt_queue.get_nowait()
+                # Drop any stale draft belonging to the exact utterance now being finalized
+                with self._partial_lock:
+                    if self._pending_partial is not None and self._pending_partial.get("id") == item.get("id"):
+                        self._pending_partial = None
                 cfg = self.config
                 source_text = item["source_text"]
                 speaker = item.get("speaker", "")
@@ -1962,6 +2033,7 @@ class EngineRuntime:
                     translated = res.translated_text
                     mt_ms = res.latency_ms
                     mt_engine = res.engine
+                    last_final_mt_ms = mt_ms
                 except Exception as exc:
                     self.broadcast_threadsafe({"type": "error", "data": {"message": f"Lỗi dịch: {exc}"}})
 
@@ -1999,6 +2071,10 @@ class EngineRuntime:
             if self._stop_event.is_set():
                 break
 
+            # Strict Final Priority: NEVER start a draft translation while a committed sentence is waiting!
+            if not self._final_mt_queue.empty():
+                continue
+
             partial_job = None
             with self._partial_lock:
                 if self._pending_partial is not None:
@@ -2008,7 +2084,12 @@ class EngineRuntime:
             if partial_job is not None:
                 now = time.perf_counter()
                 cfg = self.config
-                debounce_s = 0.90 if cfg.eco_mode else 0.40
+                # Adaptive Draft Throttle: if MT is under heavy load (>3.2s/sentence), skip drafts so finals never fall behind!
+                if last_final_mt_ms > 3200.0:
+                    continue
+                debounce_s = 0.90 if cfg.eco_mode else 0.45
+                if last_final_mt_ms > 1400.0:
+                    debounce_s = max(debounce_s, (last_final_mt_ms / 1000.0) * 0.85)
                 draft_src = self._trim_dangling_tail_for_draft(partial_job["source_text"])
                 key = (draft_src, partial_job["source_lang"], partial_job["target_lang"])
                 if draft_src and key != last_partial_key and (now - last_partial_time >= debounce_s):
@@ -2028,6 +2109,8 @@ class EngineRuntime:
 
                         last_partial_time = time.perf_counter()
                         last_partial_key = key
+                        if r.latency_ms > 2800.0:
+                            last_final_mt_ms = max(last_final_mt_ms, r.latency_ms)
                         self.broadcast_threadsafe(
                             {
                                 "type": "partial_mt",
@@ -2288,6 +2371,7 @@ def api_cloud_get():
 @app.post("/api/cloud/config")
 def api_cloud_update(req: CloudConfigUpdateRequest):
     data = runtime.cloud_quota.update(req.model_dump(exclude_none=True))
+    runtime.clear_cloud_cooldown()
     runtime.broadcast_threadsafe({"type": "status", "data": runtime.get_status_payload()})
     return data
 

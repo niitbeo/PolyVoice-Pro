@@ -230,6 +230,8 @@ export interface EngineStatus {
   glossary_enabled?: boolean;
   glossary_count?: number;
   cloud_api?: CloudApiStatus;
+  cloud_fallback_notice?: string;
+  envit5_device?: string;
   platform: {
     os: string;
     arch: string;
