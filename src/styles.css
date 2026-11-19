@@ -32,6 +32,12 @@
   --green-text: #6ee7b7;
   --green-soft: rgba(52, 211, 153, 0.13);
   --green-border: rgba(52, 211, 153, 0.34);
+  --info: #38bdf8;
+  --info-text: #7dd3fc;
+  --info-soft: rgba(56, 189, 248, 0.13);
+  --info-border: rgba(56, 189, 248, 0.32);
+  --prog-start: #0ea5e9;
+  --prog-end: #10b981;
   --red: #fb7185;
   --red-text: #fda4af;
   --red-soft: rgba(225, 29, 72, 0.16);
@@ -88,6 +94,12 @@
   --green-text: #047857;
   --green-soft: rgba(5, 150, 105, 0.1);
   --green-border: rgba(5, 150, 105, 0.3);
+  --info: #0284c7;
+  --info-text: #0369a1;
+  --info-soft: rgba(2, 132, 199, 0.085);
+  --info-border: rgba(2, 132, 199, 0.28);
+  --prog-start: #0284c7;
+  --prog-end: #059669;
   --red: #c4000f;
   --red-text: #a3000c;
   --red-soft: rgba(196, 0, 15, 0.09);
@@ -732,7 +744,7 @@ kbd {
 
 .progress-fill {
   height: 100%;
-  background: linear-gradient(90deg, #c4000f, #ef4444);
+  background: linear-gradient(90deg, var(--prog-start), var(--prog-end));
   transition: width 0.2s ease;
 }
 
@@ -1356,7 +1368,7 @@ kbd {
   width: min(920px, 100%);
   max-height: min(680px, 90vh);
   background: var(--modal-bg);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border);
   border-radius: 16px;
   box-shadow: var(--shadow-modal);
   display: flex;
@@ -1760,8 +1772,8 @@ kbd {
 }
 
 .dropzone {
-  border: 2px dashed var(--border-strong);
-  background: var(--accent-soft);
+  border: 1.5px dashed var(--border);
+  background: var(--inset-bg);
   border-radius: 14px;
   padding: 26px 18px;
   display: flex;
@@ -1775,13 +1787,175 @@ kbd {
 }
 
 .dropzone:hover {
-  background: var(--accent-soft-2);
-  border-color: var(--accent);
+  background: var(--info-soft);
+  border-color: var(--info-border);
 }
 
 .dropzone.busy {
   opacity: 0.7;
   cursor: wait;
+}
+
+.file-progress-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px 18px;
+  border-radius: 14px;
+  background: var(--inset-bg);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+}
+
+.file-prog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.file-prog-icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  background: var(--info-soft);
+  border: 1px solid var(--info-border);
+  color: var(--info-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.spin {
+  animation: polySpin 1s linear infinite;
+}
+
+@keyframes polySpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.file-prog-name {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text-0);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-prog-stage {
+  font-size: 12px;
+  color: var(--text-2);
+  margin-top: 2px;
+}
+
+.file-prog-pct {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--info-text);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  flex-shrink: 0;
+}
+
+.file-prog-track {
+  position: relative;
+  width: 100%;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  overflow: hidden;
+}
+
+.file-prog-fill {
+  position: relative;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--prog-start), var(--prog-end));
+  transition: width 0.35s ease;
+  overflow: hidden;
+}
+
+.file-prog-fill::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.32) 50%,
+    transparent 100%
+  );
+  animation: polyShimmer 1.6s ease-in-out infinite;
+}
+
+@keyframes polyShimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.file-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.file-stat-box {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.file-stat-box.highlight {
+  background: var(--green-soft);
+  border-color: var(--green-border);
+}
+
+.file-stat-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.file-stat-value {
+  font-size: 14px;
+  font-weight: 800;
+  color: var(--text-0);
+  font-variant-numeric: tabular-nums;
+}
+
+.file-stat-value.accent {
+  color: var(--green-text);
+}
+
+.file-stat-sub {
+  font-size: 11px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.file-prog-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--text-2);
+  padding-top: 2px;
 }
 
 .summary-body {

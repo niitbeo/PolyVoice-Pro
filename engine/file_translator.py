@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import wave
 from pathlib import Path
@@ -23,6 +24,10 @@ import numpy as np
 from session_logger import _fmt_srt_time
 
 SAMPLE_RATE = 16000
+
+
+class FileTranslateCancelled(RuntimeError):
+    """Raised when the user cancels an active batch file translation job."""
 
 
 def decode_media_to_pcm16(file_path: Path) -> np.ndarray:
@@ -152,19 +157,69 @@ def translate_media_file(
     runtime: Any,
     logs_dir: Path,
     on_progress: Callable[[float, str], None] | None = None,
+    on_progress_event: Callable[[dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    job_id: str = "",
 ) -> dict[str, Any]:
-    """Full offline pipeline: Media -> PCM -> ASR -> Glossary -> SOTA MT -> .TXT & .SRT."""
+    """Full offline/hybrid pipeline: Media -> PCM -> ASR -> Glossary -> MT -> .TXT & .SRT."""
     t0 = time.perf_counter()
-    if on_progress:
-        on_progress(5.0, "Đang giải mã âm thanh 16kHz...")
+
+    def _emit(
+        stage: str,
+        pct: float,
+        message: str,
+        *,
+        current_chunk: int = 0,
+        total_chunks: int = 0,
+        processed_audio_s: float = 0.0,
+        duration_s: float = 0.0,
+        eta_s: float | None = None,
+        eta_estimated: bool = False,
+        speed_x: float = 0.0,
+        active: bool = True,
+    ) -> None:
+        if on_progress:
+            on_progress(pct, message)
+        if on_progress_event:
+            on_progress_event(
+                {
+                    "job_id": job_id,
+                    "filename": orig_filename,
+                    "active": active,
+                    "stage": stage,
+                    "percent": round(max(0.0, min(100.0, pct)), 1),
+                    "message": message,
+                    "current_chunk": current_chunk,
+                    "total_chunks": total_chunks,
+                    "processed_audio_s": round(processed_audio_s, 1),
+                    "duration_s": round(duration_s, 1),
+                    "elapsed_s": round(time.perf_counter() - t0, 1),
+                    "eta_s": round(max(0.0, eta_s), 1) if eta_s is not None else None,
+                    "eta_estimated": eta_estimated,
+                    "speed_x": round(speed_x, 1),
+                }
+            )
+
+    _emit("decoding", 3.0, "Đang giải mã âm thanh 16kHz...")
     pcm = decode_media_to_pcm16(file_path)
     duration_s = round(len(pcm) / SAMPLE_RATE, 1)
     if duration_s < 0.3:
         raise RuntimeError("File âm thanh quá ngắn hoặc không có dữ liệu tiếng nói.")
+    if cancel_event is not None and cancel_event.is_set():
+        raise FileTranslateCancelled("Đã hủy dịch file.")
 
     chunks = segment_pcm_by_pauses(pcm)
-    if on_progress:
-        on_progress(15.0, f"Đã chia {len(chunks)} phân đoạn ({duration_s}s). Đang nhận dạng & dịch offline...")
+    est_speed = 6.0 if mt_mode == "cloud-api" else 12.0
+    est_eta_s = max(1.0, round(duration_s / est_speed, 1))
+    _emit(
+        "loading_models",
+        8.0,
+        f"Đã tách {len(chunks)} phân đoạn. Đang nạp mô hình AI...",
+        total_chunks=len(chunks),
+        duration_s=duration_s,
+        eta_s=est_eta_s,
+        eta_estimated=True,
+    )
 
     use_vi_batch = source_lang == "vie_Latn"
     refiner = runtime.ensure_pass2_refiner() if use_vi_batch else None
@@ -181,12 +236,31 @@ def translate_media_file(
     )
     if not use_vi_batch and en_moonshine is None and zf_en is None:
         raise RuntimeError("Dịch file offline hiện hỗ trợ file nói Tiếng Việt hoặc Tiếng Anh.")
+    if cancel_event is not None and cancel_event.is_set():
+        raise FileTranslateCancelled("Đã hủy dịch file.")
 
     protected_terms = runtime._get_glossary_hotwords()
     segments_out: list[dict[str, Any]] = []
     recent_ctx: list[tuple[str, str]] = []
+    processed_audio_s = 0.0
+    t_loop = time.perf_counter()
+
+    _emit(
+        "translating",
+        12.0,
+        f"Đang nhận dạng & dịch đoạn 1/{len(chunks)}...",
+        current_chunk=0,
+        total_chunks=len(chunks),
+        processed_audio_s=0.0,
+        duration_s=duration_s,
+        eta_s=est_eta_s,
+        eta_estimated=True,
+    )
 
     for idx, (start_s, end_s, seg_pcm) in enumerate(chunks):
+        if cancel_event is not None and cancel_event.is_set():
+            raise FileTranslateCancelled("Đã hủy dịch file.")
+
         if use_vi_batch and refiner is not None:
             p1_fallback = ""
             if zf_vi is not None and protected_terms:
@@ -218,36 +292,62 @@ def translate_media_file(
             text = " ".join(parts).strip()
 
         text = runtime.glossary.apply_asr_fixes(text.strip())
-        if not text:
-            continue
+        if text:
+            tr = runtime.translate_text(
+                text,
+                source_lang,
+                target_lang,
+                mt_mode=mt_mode,
+                beam_size=runtime.config.beam_size,
+                llm_url=runtime.config.llm_url,
+                llm_model=runtime.config.llm_model,
+                llm_api_key=runtime.config.llm_api_key,
+                context=recent_ctx[-2:],
+            )
+            recent_ctx.append((text, tr.translated_text))
+            segments_out.append(
+                {
+                    "index": len(segments_out) + 1,
+                    "start_s": round(start_s, 2),
+                    "end_s": round(end_s, 2),
+                    "start_srt": _fmt_srt_time(start_s),
+                    "end_srt": _fmt_srt_time(end_s),
+                    "source_text": text,
+                    "translated_text": tr.translated_text,
+                    "mt_engine": tr.engine,
+                }
+            )
 
-        tr = runtime.translate_text(
-            text,
-            source_lang,
-            target_lang,
-            mt_mode=mt_mode,
-            beam_size=runtime.config.beam_size,
-            llm_url=runtime.config.llm_url,
-            llm_model=runtime.config.llm_model,
-            llm_api_key=runtime.config.llm_api_key,
-            context=recent_ctx[-2:],
+        processed_audio_s = min(duration_s, processed_audio_s + max(0.1, end_s - start_s))
+        loop_elapsed = max(0.05, time.perf_counter() - t_loop)
+        cur_speed = processed_audio_s / loop_elapsed
+        rem_audio_s = max(0.0, duration_s - processed_audio_s)
+        eta_s = rem_audio_s / max(cur_speed, 0.05)
+        pct = min(97.0, 12.0 + (processed_audio_s / max(duration_s, 0.1)) * 85.0)
+        _emit(
+            "translating",
+            pct,
+            f"Đã xử lý {idx + 1}/{len(chunks)} phân đoạn...",
+            current_chunk=idx + 1,
+            total_chunks=len(chunks),
+            processed_audio_s=processed_audio_s,
+            duration_s=duration_s,
+            eta_s=eta_s,
+            eta_estimated=False,
+            speed_x=cur_speed,
         )
-        recent_ctx.append((text, tr.translated_text))
-        segments_out.append(
-            {
-                "index": len(segments_out) + 1,
-                "start_s": round(start_s, 2),
-                "end_s": round(end_s, 2),
-                "start_srt": _fmt_srt_time(start_s),
-                "end_srt": _fmt_srt_time(end_s),
-                "source_text": text,
-                "translated_text": tr.translated_text,
-                "mt_engine": tr.engine,
-            }
-        )
-        if on_progress:
-            pct = round(15.0 + ((idx + 1) / max(len(chunks), 1)) * 82.0, 1)
-            on_progress(pct, f"Đã xử lý {idx + 1}/{len(chunks)} phân đoạn...")
+
+    _emit(
+        "saving",
+        98.5,
+        "Đang xuất file biên bản .TXT & .SRT song ngữ...",
+        current_chunk=len(chunks),
+        total_chunks=len(chunks),
+        processed_audio_s=duration_s,
+        duration_s=duration_s,
+        eta_s=0.5,
+        speed_x=round(duration_s / max(time.perf_counter() - t_loop, 0.1), 1),
+    )
 
     # Build .TXT and .SRT
     txt_lines = [
@@ -282,8 +382,18 @@ def translate_media_file(
 
     elapsed_s = round(time.perf_counter() - t0, 2)
     speed_x = round(duration_s / max(elapsed_s, 0.1), 1)
-    if on_progress:
-        on_progress(100.0, f"Hoàn tất trong {elapsed_s}s ({speed_x}× tốc độ thực)!")
+    _emit(
+        "done",
+        100.0,
+        f"Hoàn tất trong {elapsed_s}s ({speed_x}× tốc độ thực)!",
+        current_chunk=len(chunks),
+        total_chunks=len(chunks),
+        processed_audio_s=duration_s,
+        duration_s=duration_s,
+        eta_s=0.0,
+        speed_x=speed_x,
+        active=False,
+    )
 
     return {
         "ok": True,

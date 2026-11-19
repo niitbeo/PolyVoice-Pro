@@ -57,7 +57,7 @@ from audio_capture import (
     has_windows_loopback,
     list_input_devices,
 )
-from file_translator import translate_media_file
+from file_translator import FileTranslateCancelled, translate_media_file
 from glossary import GlossaryManager
 from languages import (
     get_hymt2_lang_name,
@@ -273,6 +273,8 @@ class EngineRuntime:
         self._last_level_emit = 0.0
         self._history: list[dict[str, Any]] = []
         self._boot_error: str = ""
+        self._file_job_progress: dict[str, Any] = {"active": False}
+        self._file_job_cancel: Optional[threading.Event] = None
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
@@ -2337,14 +2339,57 @@ def api_session_summarize():
     )
 
 
+@app.get("/api/files/progress")
+def api_files_progress():
+    return runtime._file_job_progress
+
+
+@app.post("/api/files/cancel")
+def api_files_cancel():
+    ev = runtime._file_job_cancel
+    if ev is not None:
+        ev.set()
+        return {"ok": True, "cancelling": True}
+    return {"ok": True, "cancelling": False}
+
+
 @app.post("/api/files/translate")
 async def api_files_translate(
     file: UploadFile = File(...),
     source_lang: str = Form("vie_Latn"),
     target_lang: str = Form("eng_Latn"),
     mt_mode: str = Form("auto-offline"),
+    job_id: str = Form(""),
 ):
-    suffix = Path(file.filename or "audio.wav").suffix or ".wav"
+    active_job_id = job_id.strip() or uuid.uuid4().hex[:10]
+    orig_name = file.filename or "audio.wav"
+    suffix = Path(orig_name).suffix or ".wav"
+    cancel_ev = threading.Event()
+    runtime._file_job_cancel = cancel_ev
+
+    def _on_file_progress(evt: dict[str, Any]) -> None:
+        runtime._file_job_progress = evt
+        runtime.broadcast_threadsafe({"type": "file_progress", "data": evt})
+
+    _on_file_progress(
+        {
+            "job_id": active_job_id,
+            "filename": orig_name,
+            "active": True,
+            "stage": "uploading",
+            "percent": 1.0,
+            "message": "Đang tiếp nhận file âm thanh/video...",
+            "current_chunk": 0,
+            "total_chunks": 0,
+            "processed_audio_s": 0.0,
+            "duration_s": 0.0,
+            "elapsed_s": 0.0,
+            "eta_s": None,
+            "eta_estimated": True,
+            "speed_x": 0.0,
+        }
+    )
+
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
         tmp_path = Path(tf.name)
         content = await file.read()
@@ -2353,17 +2398,41 @@ async def api_files_translate(
         result = await asyncio.to_thread(
             translate_media_file,
             tmp_path,
-            file.filename or "audio.wav",
+            orig_name,
             source_lang,
             target_lang,
             mt_mode,
             runtime,
             runtime.logger.logs_dir,
+            None,
+            _on_file_progress,
+            cancel_ev,
+            active_job_id,
         )
         return result
+    except FileTranslateCancelled:
+        _on_file_progress(
+            {
+                **runtime._file_job_progress,
+                "active": False,
+                "stage": "cancelled",
+                "message": "Đã hủy dịch file.",
+            }
+        )
+        return {"ok": False, "cancelled": True}
     except Exception as exc:
+        _on_file_progress(
+            {
+                **runtime._file_job_progress,
+                "active": False,
+                "stage": "error",
+                "message": str(exc),
+            }
+        )
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
+        if runtime._file_job_cancel is cancel_ev:
+            runtime._file_job_cancel = None
         tmp_path.unlink(missing_ok=True)
 
 

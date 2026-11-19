@@ -157,8 +157,26 @@ export interface MeetingSummary {
   action_items: Array<{ timestamp: string; speaker?: string; source_text: string; translated_text: string }>;
 }
 
+export interface FileTranslateProgress {
+  job_id: string;
+  filename: string;
+  active: boolean;
+  stage: "uploading" | "decoding" | "loading_models" | "translating" | "saving" | "done" | "cancelled" | "error";
+  percent: number;
+  message: string;
+  current_chunk: number;
+  total_chunks: number;
+  processed_audio_s: number;
+  duration_s: number;
+  elapsed_s: number;
+  eta_s: number | null;
+  eta_estimated?: boolean;
+  speed_x: number;
+}
+
 export interface FileTranslateResult {
   ok: boolean;
+  cancelled?: boolean;
   filename: string;
   duration_s: number;
   elapsed_s: number;

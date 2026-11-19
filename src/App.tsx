@@ -6,6 +6,7 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Clock,
   Cloud,
   Copy,
   Cpu,
@@ -16,6 +17,7 @@ import {
   Globe,
   Headphones,
   Layers,
+  Loader2,
   Mic,
   MicOff,
   MonitorSpeaker,
@@ -51,6 +53,7 @@ import {
   ENGINE_HTTP,
   ENGINE_WS,
   EngineStatus,
+  FileTranslateProgress,
   FileTranslateResult,
   GlossaryData,
   LanguageEntry,
@@ -84,6 +87,30 @@ function compareSemver(a: string, b: string): number {
     if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
   }
   return 0;
+}
+
+function formatClockSec(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+  }
+  return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+}
+
+function formatEtaVi(seconds: number | null | undefined, estimated?: boolean): string {
+  if (seconds == null || !Number.isFinite(seconds)) return "Đang ước tính...";
+  const s = Math.max(0, Math.round(seconds));
+  if (s <= 4) return "< 5 giây";
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const prefix = estimated ? "Ước tính ~" : "Còn ~";
+  if (h > 0) return m > 0 ? `${prefix}${h} giờ ${m} phút` : `${prefix}${h} giờ`;
+  if (m > 0) return sec > 0 ? `${prefix}${m} phút ${sec} giây` : `${prefix}${m} phút`;
+  return `${prefix}${sec} giây`;
 }
 const PINNED_CODES = [
   "vie_Latn",
@@ -154,6 +181,11 @@ export default function App() {
 
   const [fileModalOpen, setFileModalOpen] = useState(false);
   const [fileBusy, setFileBusy] = useState(false);
+  const [fileCancelling, setFileCancelling] = useState(false);
+  const [fileProgress, setFileProgress] = useState<FileTranslateProgress | null>(null);
+  const [fileTickNow, setFileTickNow] = useState(() => Date.now());
+  const fileStartTsRef = useRef<number>(0);
+  const fileProgUpdatedAtRef = useRef<number>(0);
   const [fileResult, setFileResult] = useState<FileTranslateResult | null>(null);
 
   const [summaryOpen, setSummaryOpen] = useState(false);
@@ -362,6 +394,20 @@ export default function App() {
               if (prog.model_id === "envit5") return { ...prev, mt_envit5: prog };
               return prev;
             });
+          } else if (msg.type === "file_progress") {
+            const fp: FileTranslateProgress = msg.data;
+            fileProgUpdatedAtRef.current = Date.now();
+            setFileProgress(fp);
+            if (fp.active) {
+              if (!fileStartTsRef.current) {
+                fileStartTsRef.current = Date.now() - Math.round((fp.elapsed_s || 0) * 1000);
+              }
+              setFileBusy(true);
+            } else {
+              fileStartTsRef.current = 0;
+              setFileBusy(false);
+              setFileCancelling(false);
+            }
           } else if (msg.type === "error") {
             setErrorMsg(msg.data?.message || "Đã xảy ra lỗi không xác định");
           }
@@ -650,16 +696,64 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    if (!fileBusy) return;
+    const tick = window.setInterval(() => {
+      setFileTickNow(Date.now());
+    }, 1000);
+    const poll = window.setInterval(async () => {
+      try {
+        const r = await fetch(`${ENGINE_HTTP}/api/files/progress`);
+        if (r.ok) {
+          const p: FileTranslateProgress = await r.json();
+          if (p && p.active) {
+            fileProgUpdatedAtRef.current = Date.now();
+            setFileProgress(p);
+          }
+        }
+      } catch {
+        // ignore fallback poll error
+      }
+    }, 2000);
+    return () => {
+      clearInterval(tick);
+      clearInterval(poll);
+    };
+  }, [fileBusy]);
+
   const handleUploadMediaFile = async (file: File) => {
+    const jobId = `job_${Date.now()}`;
+    const now = Date.now();
+    fileStartTsRef.current = now;
+    fileProgUpdatedAtRef.current = now;
+    setFileTickNow(now);
     setFileBusy(true);
+    setFileCancelling(false);
     setFileResult(null);
     setErrorMsg("");
+    setFileProgress({
+      job_id: jobId,
+      filename: file.name,
+      active: true,
+      stage: "uploading",
+      percent: 2,
+      message: "Đang tải file lên engine nội bộ...",
+      current_chunk: 0,
+      total_chunks: 0,
+      processed_audio_s: 0,
+      duration_s: 0,
+      elapsed_s: 0,
+      eta_s: null,
+      eta_estimated: true,
+      speed_x: 0,
+    });
     try {
       const fd = new FormData();
       fd.append("file", file);
       fd.append("source_lang", sourceLang);
       fd.append("target_lang", targetLang);
       fd.append("mt_mode", mtMode);
+      fd.append("job_id", jobId);
       const res = await fetch(`${ENGINE_HTTP}/api/files/translate`, {
         method: "POST",
         body: fd,
@@ -667,6 +761,8 @@ export default function App() {
       const data = await res.json();
       if (!res.ok) {
         setErrorMsg(data.detail || "Không thể dịch file âm thanh/video");
+      } else if (data.cancelled) {
+        setFileProgress(null);
       } else {
         setFileResult(data);
       }
@@ -674,6 +770,16 @@ export default function App() {
       setErrorMsg(`Lỗi dịch file: ${String(e)}`);
     } finally {
       setFileBusy(false);
+      setFileCancelling(false);
+    }
+  };
+
+  const handleCancelFileTranslate = async () => {
+    setFileCancelling(true);
+    try {
+      await fetch(`${ENGINE_HTTP}/api/files/cancel`, { method: "POST" });
+    } catch {
+      // ignore
     }
   };
 
@@ -2417,42 +2523,136 @@ export default function App() {
                   </div>
                 </div>
               </div>
-              <button className="btn sm" disabled={fileBusy} onClick={() => setFileModalOpen(false)}>
+              <button className="btn sm icon-only" disabled={fileBusy} onClick={() => setFileModalOpen(false)} title="Đóng">
                 <X size={14} />
               </button>
             </div>
 
             <div className="modal-body-pad">
-              <label
-                className={`dropzone ${fileBusy ? "busy" : ""}`}
-                onDragOver={(e) => e.preventDefault()}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  const f = e.dataTransfer.files?.[0];
-                  if (f && !fileBusy) handleUploadMediaFile(f);
-                }}
-              >
-                <input
-                  type="file"
-                  accept="audio/*,video/*,.wav,.mp3,.m4a,.mp4,.mov,.webm,.ogg,.flac"
-                  style={{ display: "none" }}
-                  disabled={fileBusy}
-                  onChange={(e) => {
-                    const f = e.target.files?.[0];
-                    if (f) handleUploadMediaFile(f);
-                    e.target.value = "";
+              {fileBusy ? (
+                (() => {
+                  const pct = Math.max(2, Math.min(100, Math.round(fileProgress?.percent ?? 2)));
+                  const elapsedClient = fileStartTsRef.current
+                    ? Math.max(0, Math.floor((fileTickNow - fileStartTsRef.current) / 1000))
+                    : Math.floor(fileProgress?.elapsed_s ?? 0);
+                  const sinceUpdate = fileProgUpdatedAtRef.current
+                    ? Math.max(0, (fileTickNow - fileProgUpdatedAtRef.current) / 1000)
+                    : 0;
+                  const liveEta =
+                    fileProgress?.eta_s != null
+                      ? Math.max(1, fileProgress.eta_s - sinceUpdate)
+                      : null;
+                  const hasDur = (fileProgress?.duration_s ?? 0) > 0;
+                  const hasChunks = (fileProgress?.total_chunks ?? 0) > 0;
+                  return (
+                    <div className="file-progress-card">
+                      <div className="file-prog-head">
+                        <div className="row" style={{ gap: 10, minWidth: 0 }}>
+                          <div className="file-prog-icon">
+                            <Loader2 size={18} className="spin" />
+                          </div>
+                          <div style={{ minWidth: 0 }}>
+                            <div className="file-prog-name">
+                              {fileProgress?.filename || "Đang xử lý file..."}
+                            </div>
+                            <div className="file-prog-stage">
+                              {fileCancelling
+                                ? "Đang dừng tác vụ sau phân đoạn hiện tại..."
+                                : fileProgress?.message || "Đang khởi tạo..."}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="file-prog-pct">{pct}%</div>
+                      </div>
+
+                      <div className="file-prog-track" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
+                        <div className="file-prog-fill" style={{ width: `${pct}%` }} />
+                      </div>
+
+                      <div className="file-stats-grid">
+                        <div className="file-stat-box highlight">
+                          <div className="file-stat-label">
+                            <Clock size={12} /> Thời gian còn lại
+                          </div>
+                          <div className="file-stat-value accent">
+                            {formatEtaVi(liveEta, fileProgress?.eta_estimated)}
+                          </div>
+                        </div>
+
+                        <div className="file-stat-box">
+                          <div className="file-stat-label">
+                            <Layers size={12} /> Tiến độ phân đoạn
+                          </div>
+                          <div className="file-stat-value">
+                            {hasChunks
+                              ? `${fileProgress?.current_chunk ?? 0} / ${fileProgress?.total_chunks} đoạn`
+                              : "Đang phân tách..."}
+                          </div>
+                          {hasDur && (
+                            <div className="file-stat-sub">
+                              {formatClockSec(fileProgress?.processed_audio_s ?? 0)} / {formatClockSec(fileProgress?.duration_s ?? 0)} âm thanh
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="file-stat-box">
+                          <div className="file-stat-label">
+                            <Zap size={12} /> Tốc độ &amp; Đã chạy
+                          </div>
+                          <div className="file-stat-value">
+                            {(fileProgress?.speed_x ?? 0) > 0
+                              ? `${fileProgress?.speed_x}× thực tế`
+                              : "Đang đo..."}
+                          </div>
+                          <div className="file-stat-sub">
+                            Đã chạy: {formatClockSec(elapsedClient)}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="file-prog-foot">
+                        <span>Tự động lưu sẵn file .TXT &amp; .SRT song ngữ khi hoàn tất</span>
+                        <button
+                          className="btn sm"
+                          disabled={fileCancelling}
+                          onClick={handleCancelFileTranslate}
+                        >
+                          <X size={12} /> {fileCancelling ? "Đang hủy..." : "Hủy dịch"}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })()
+              ) : (
+                <label
+                  className="dropzone"
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const f = e.dataTransfer.files?.[0];
+                    if (f && !fileBusy) handleUploadMediaFile(f);
                   }}
-                />
-                <Upload size={22} color="var(--accent)" />
-                <div style={{ fontWeight: 700, fontSize: 13.5 }}>
-                  {fileBusy
-                    ? "Đang nhận dạng & dịch offline (tốc độ ~15–20× thời gian thực)..."
-                    : "Bấm chọn file hoặc kéo thả file .MP3 / .WAV / .M4A / .MP4 vào đây"}
-                </div>
-                <div style={{ fontSize: 11.5, color: "var(--text-2)" }}>
-                  Tự động lưu sẵn file .TXT &amp; .SRT song ngữ vào thư mục Biên bản
-                </div>
-              </label>
+                >
+                  <input
+                    type="file"
+                    accept="audio/*,video/*,.wav,.mp3,.m4a,.mp4,.mov,.webm,.ogg,.flac"
+                    style={{ display: "none" }}
+                    disabled={fileBusy}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) handleUploadMediaFile(f);
+                      e.target.value = "";
+                    }}
+                  />
+                  <Upload size={22} color="var(--info)" />
+                  <div style={{ fontWeight: 700, fontSize: 13.5 }}>
+                    Bấm chọn file hoặc kéo thả file .MP3 / .WAV / .M4A / .MP4 vào đây
+                  </div>
+                  <div style={{ fontSize: 11.5, color: "var(--text-2)" }}>
+                    Tự động lưu sẵn file .TXT &amp; .SRT song ngữ vào thư mục Biên bản
+                  </div>
+                </label>
+              )}
 
               {fileResult && (
                 <div className="summary-body" style={{ marginTop: 12 }}>
@@ -2492,7 +2692,7 @@ export default function App() {
 
             <div className="modal-foot">
               <span>{fileResult ? `Đã lưu tại: ${fileResult.srt_file}` : "Hỗ trợ tốt nhất cho file Tiếng Việt & Tiếng Anh"}</span>
-              <button className="btn primary sm" disabled={fileBusy} onClick={() => setFileModalOpen(false)}>
+              <button className="btn sm" disabled={fileBusy} onClick={() => setFileModalOpen(false)}>
                 Đóng
               </button>
             </div>
