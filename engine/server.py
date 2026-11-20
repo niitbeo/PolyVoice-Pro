@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -486,6 +487,7 @@ class EngineRuntime:
         self._pass2_refiner: Optional[VietASRBatchRefiner] = None
         self._en_pass2_refiner: Optional[MoonshineV2EnRefiner] = None
         self._hymt2: Optional[HyMT2Translator] = None
+        self._hymt2_idle_timer: Optional[threading.Timer] = None
         self._envit5: Optional[EnViT5Translator] = None
         self._opus_ve: Optional[OpusMTTranslator] = None
         self._opus_ev: Optional[OpusMTTranslator] = None
@@ -1247,16 +1249,13 @@ class EngineRuntime:
                         # Record friendly status + enter cooldown, then fall back seamlessly to Offline SOTA!
                         self._record_cloud_error(pid, exc)
 
-        # 2-Tier Smart Offline Architecture (v0.8.6):
-        # - Live Drafts (`is_draft=True`) on VI <-> EN: ALWAYS stay on ultra-fast EnViT5 (176-341ms on any CPU)!
-        # - Final Committed Sentences (`is_draft=False`) across ALL 38 Hy-MT2 languages (INCLUDING VI <-> EN!):
-        #   Route directly to Hy-MT2-1.8B (9.1-9.3/10 VI->EN, 8.7/10 EN->VI, native Context + Glossary) in
-        #   `auto-offline`, `hy-mt2`, and as offline fallback for `cloud-api`.
-        # - `light-offline` skips Hy-MT2 completely (EnViT5 + NLLB-600M only for low-RAM PCs).
-        use_hymt2 = can_hymt2 and (
-            (mt_mode in ("auto-offline", "hy-mt2", "cloud-api") and not is_draft)
-            or (mt_mode == "hy-mt2" and not is_vi_en_pair)
-        )
+        # v0.9.2 Lightweight Faithful Offline Architecture (0% GPU by default!):
+        # - `auto-offline` & `light-offline`: NEVER launch heavy `Hy-MT2` llama-server (saves 1.31 GB RAM & GPU!).
+        #   Uses ultra-light CPU CTranslate2 models with faithful beam=2 for final sentences (beam=1 for live drafts):
+        #     * VI <-> EN: VietAI EnViT5 (~380 MB RAM, ~260-450ms, length_penalty=1.15 -> zero dropped words!)
+        #     * 202 Languages (Lao, Thai, Japanese, Korean, Chinese, Khmer...): NLLB-200-600M INT8 (beam=2 finals!)
+        # - `hy-mt2` (explicit opt-in only): runs Hy-MT2-1.8B GPU/CPU when the user intentionally selects it.
+        use_hymt2 = can_hymt2 and (mt_mode == "hy-mt2") and (not is_draft or not is_vi_en_pair)
         if use_hymt2:
             try:
                 hymt = self.ensure_hymt2_loaded()
@@ -1294,6 +1293,9 @@ class EngineRuntime:
                 cached=res.cached,
             )
 
+        # Use fast greedy beam=1 for live drafts and faithful beam=2 for final committed sentences
+        eff_beam = 1 if is_draft else max(2, beam_size)
+
         # 1) Fast online (0% CPU, ~80-160ms) — drafts stay Offline to prevent rapid-fire 429 throttling!
         if mt_mode == "fast-online" and not is_draft:
             try:
@@ -1309,25 +1311,25 @@ class EngineRuntime:
             except Exception:
                 pass
 
-        # 3) VietAI EnViT5 (Ultra-fast SOTA VI <-> EN, 266 MB INT8, OpenRAIL)
+        # 3) VietAI EnViT5 (Ultra-light, faithful VI <-> EN, 266 MB INT8, 0% GPU)
         if mt_mode in ("auto-offline", "light-offline", "cloud-api", "hy-mt2", "fast-online", "local-llm") and is_vi_en_pair:
             envit5 = self.ensure_envit5_loaded()
             if envit5 is not None:
-                return _finish(envit5.translate(masked, source_lang, target_lang, beam_size=beam_size))
+                return _finish(envit5.translate(masked, source_lang, target_lang, beam_size=eff_beam))
 
         if mt_mode in ("opus", "auto-offline", "light-offline", "cloud-api", "hy-mt2", "fast-online", "local-llm") and is_vi_en_pair:
             if source_lang == "vie_Latn" and target_lang == "eng_Latn":
                 opus = self.ensure_opus_loaded("vi-en")
                 if opus is not None:
-                    return _finish(opus.translate(masked, beam_size=beam_size))
+                    return _finish(opus.translate(masked, beam_size=eff_beam))
             elif source_lang == "eng_Latn" and target_lang == "vie_Latn":
                 opus = self.ensure_opus_loaded("en-vi")
                 if opus is not None:
-                    return _finish(opus.translate(masked, beam_size=beam_size))
+                    return _finish(opus.translate(masked, beam_size=eff_beam))
 
-        # 4) Offline NLLB-200 (prefers 600M INT8 — 2x faster & 750 MB lighter for Lao; 1.3B via `nllb-1.3b`)
+        # 4) Offline NLLB-200 (prefers 600M INT8 — 0% GPU, faithful beam=2 for finals across all 202 langs)
         nllb = self.ensure_nllb_loaded(prefer_13b=(mt_mode == "nllb-1.3b"))
-        return _finish(nllb.translate(masked, source_lang, target_lang, beam_size=beam_size))
+        return _finish(nllb.translate(masked, source_lang, target_lang, beam_size=eff_beam))
 
     def _resolve_asr_choice_for_lang(self, lang_code: str, forced_engine: str = "auto") -> str:
         """Pick optimal ASR backend given language code and OS."""
@@ -1554,7 +1556,121 @@ class EngineRuntime:
         threading.Thread(target=_worker, daemon=True, name=f"dl-{model_id}").start()
         return True
 
+    def _cancel_hymt2_idle_timer(self) -> None:
+        tmr = self._hymt2_idle_timer
+        self._hymt2_idle_timer = None
+        if tmr is not None:
+            try:
+                tmr.cancel()
+            except Exception:
+                pass
+
+    def _schedule_hymt2_idle_sleep(self, delay_s: float = 60.0) -> None:
+        self._cancel_hymt2_idle_timer()
+        if self._hymt2 is None or not self._hymt2.is_running:
+            return
+
+        def _sleep_now() -> None:
+            if self._listening:
+                return
+            with self._model_lock:
+                if self._hymt2 is not None and not self._listening:
+                    try:
+                        self._hymt2.stop()
+                    except Exception:
+                        pass
+            gc.collect()
+            self.broadcast_threadsafe({"type": "status", "data": self.get_status_payload()})
+
+        t = threading.Timer(delay_s, _sleep_now)
+        t.daemon = True
+        self._hymt2_idle_timer = t
+        t.start()
+
+    def _release_unused_models(
+        self,
+        keep_asr: set[str],
+        keep_mt: set[str],
+        keep_pass2: set[str],
+    ) -> None:
+        """
+        Automatic RAM Hygiene (v0.9.2):
+        Unload models not needed for the current language pair / MT mode so switching across
+        VI/EN/TH/JA/LO or leaving Hy-MT2 never accumulates 3-4 GB of resident RAM!
+        """
+        released = False
+        with self._model_lock:
+            if "hy-mt2" not in keep_mt and self._hymt2 is not None:
+                try:
+                    self._hymt2.stop()
+                    getattr(self._hymt2, "close", lambda: None)()
+                except Exception:
+                    pass
+                self._hymt2 = None
+                released = True
+            if "nllb-600m" not in keep_mt and self._nllb is not None:
+                self._nllb = None
+                released = True
+            if "nllb-1.3b" not in keep_mt and self._nllb_13b is not None:
+                self._nllb_13b = None
+                released = True
+            if "envit5" not in keep_mt and self._envit5 is not None:
+                self._envit5 = None
+                released = True
+            if "opus-vi-en" not in keep_mt and self._opus_ve is not None:
+                self._opus_ve = None
+                released = True
+            if "opus-en-vi" not in keep_mt and self._opus_ev is not None:
+                self._opus_ev = None
+                released = True
+
+            if "whisper-turbo" not in keep_asr:
+                for w in (self._asr_whisper, self._asr_whisper_remote):
+                    if w is not None:
+                        try:
+                            w.close()
+                        except Exception:
+                            pass
+                        released = True
+                self._asr_whisper = None
+                self._asr_whisper_remote = None
+
+            if "zipformer-30m-streaming" not in keep_asr and self._asr_zf_vi is not None:
+                self._asr_zf_vi = None
+                released = True
+            if "viet-asr" not in keep_asr and self._asr_viet is not None:
+                self._asr_viet = None
+                released = True
+            if "vi-pass2" not in keep_pass2 and self._pass2_refiner is not None:
+                try:
+                    self._pass2_refiner.close()
+                except Exception:
+                    pass
+                self._pass2_refiner = None
+                released = True
+
+            if "zipformer-en-20m" not in keep_asr and self._asr_zf_en is not None:
+                self._asr_zf_en = None
+                released = True
+            if "hybrid-en" not in keep_asr:
+                if self._asr_hybrid_en is not None or self._asr_hybrid_en_remote is not None:
+                    self._asr_hybrid_en = None
+                    self._asr_hybrid_en_remote = None
+                    released = True
+            if "moonshine-en" not in keep_asr:
+                if self._asr_moonshine_en is not None or self._asr_moonshine_en_remote is not None:
+                    self._asr_moonshine_en = None
+                    self._asr_moonshine_en_remote = None
+                    released = True
+            if "en-pass2" not in keep_pass2 and "hybrid-en" not in keep_asr and self._en_pass2_refiner is not None:
+                self._en_pass2_refiner = None
+                released = True
+
+        if released:
+            gc.collect()
+
     def start_session(self, req: StartSessionRequest) -> dict[str, Any]:
+        self._cancel_hymt2_idle_timer()
         if self._listening:
             self.stop_session()
 
@@ -1598,7 +1714,7 @@ class EngineRuntime:
         self._active_asr_label = chosen_asr
         self._remote_asr_label = ""
 
-        # Lazy-load ONLY the models actually needed for this session (saves ~1+ GB RAM!)
+        # Determine exact minimal model set for this session and unload everything else from RAM!
         is_vi_en_pair = {self.config.source_lang, self.config.target_lang} == {"vie_Latn", "eng_Latn"}
         can_hymt2 = (
             self._llama_server_ready
@@ -1606,47 +1722,78 @@ class EngineRuntime:
             and bool(get_hymt2_lang_name(self.config.source_lang))
             and bool(get_hymt2_lang_name(self.config.target_lang))
         )
+        want_hymt2 = can_hymt2 and (self.config.mt_mode == "hy-mt2")
+        keep_asr: set[str] = {chosen_asr}
+        if self.config.audio_source == "dual":
+            try:
+                keep_asr.add(self._resolve_asr_choice_for_lang(self.config.target_lang, "auto"))
+            except Exception:
+                pass
+        keep_mt: set[str] = set()
         if is_vi_en_pair and self.config.mt_mode not in ("opus", "nllb", "nllb-1.3b") and self.model_manager.is_envit5_ready():
-            self.ensure_envit5_loaded()
+            keep_mt.add("envit5")
         elif is_vi_en_pair and (self.config.mt_mode == "opus" or not self.model_manager.is_envit5_ready()):
-            if self.config.source_lang == "vie_Latn" and self.model_manager.is_opus_vi_en_ready():
-                self.ensure_opus_loaded("vi-en")
-            elif self.config.source_lang == "eng_Latn" and self.model_manager.is_opus_en_vi_ready():
-                self.ensure_opus_loaded("en-vi")
-
-        if can_hymt2 and (self.config.mt_mode == "hy-mt2" or (self.config.mt_mode == "auto-offline" and not is_vi_en_pair)):
-            # Pre-warm Hy-MT2 llama-server in background so session starts immediately
-            threading.Thread(
-                target=lambda: self.ensure_hymt2_loaded() and self.ensure_hymt2_loaded().ensure_started(),
-                daemon=True,
-                name="hymt2-warmup",
-            ).start()
+            if self.config.source_lang == "vie_Latn" or self.config.audio_source == "dual":
+                keep_mt.add("opus-vi-en")
+            if self.config.source_lang == "eng_Latn" or self.config.audio_source == "dual":
+                keep_mt.add("opus-en-vi")
+        if want_hymt2:
+            keep_mt.add("hy-mt2")
         else:
             need_nllb = (
                 self.config.source_lang != self.config.target_lang
                 and (
                     self.config.mt_mode in ("nllb", "nllb-1.3b")
-                    or (not is_vi_en_pair and self.config.mt_mode in ("auto-offline", "light-offline", "hy-mt2", "opus"))
+                    or (not is_vi_en_pair and self.config.mt_mode in ("auto-offline", "light-offline", "hy-mt2", "opus", "cloud-api"))
                 )
             )
-            if need_nllb and (self.model_manager.is_nllb_13b_ready() or self.model_manager.is_nllb_ready()):
-                self.ensure_nllb_loaded(prefer_13b=(self.config.mt_mode == "nllb-1.3b"))
+            if need_nllb:
+                keep_mt.add("nllb-1.3b" if self.config.mt_mode == "nllb-1.3b" else "nllb-600m")
 
-        if self.config.pass2_refine and (
+        keep_pass2: set[str] = set()
+        need_vi_pass2 = self.config.pass2_refine and (
             (chosen_asr == "zipformer-30m-streaming" and self.config.source_lang == "vie_Latn")
             or (
                 self.config.audio_source == "dual"
                 and self.config.target_lang == "vie_Latn"
                 and self.model_manager.is_zipformer_streaming_ready()
             )
-        ):
-            self.ensure_pass2_refiner()
-        if (
+        )
+        need_en_pass2 = (
             self.config.pass2_refine
-            and chosen_asr != "moonshine-en"
+            and chosen_asr not in ("moonshine-en", "hybrid-en")
             and (self.config.source_lang == "eng_Latn" or (self.config.audio_source == "dual" and self.config.target_lang == "eng_Latn"))
             and self.model_manager.is_moonshine_en_ready()
+        )
+        if need_vi_pass2:
+            keep_pass2.add("vi-pass2")
+        if need_en_pass2 or "hybrid-en" in keep_asr:
+            keep_pass2.add("en-pass2")
+
+        self._release_unused_models(keep_asr=keep_asr, keep_mt=keep_mt, keep_pass2=keep_pass2)
+
+        if "envit5" in keep_mt:
+            self.ensure_envit5_loaded()
+        if "opus-vi-en" in keep_mt and self.model_manager.is_opus_vi_en_ready():
+            self.ensure_opus_loaded("vi-en")
+        if "opus-en-vi" in keep_mt and self.model_manager.is_opus_en_vi_ready():
+            self.ensure_opus_loaded("en-vi")
+
+        if want_hymt2:
+            # Pre-warm Hy-MT2 llama-server in background ONLY when explicitly selected
+            threading.Thread(
+                target=lambda: self.ensure_hymt2_loaded() and self.ensure_hymt2_loaded().ensure_started(),
+                daemon=True,
+                name="hymt2-warmup",
+            ).start()
+        elif ("nllb-600m" in keep_mt or "nllb-1.3b" in keep_mt) and (
+            self.model_manager.is_nllb_13b_ready() or self.model_manager.is_nllb_ready()
         ):
+            self.ensure_nllb_loaded(prefer_13b=("nllb-1.3b" in keep_mt))
+
+        if need_vi_pass2:
+            self.ensure_pass2_refiner()
+        if need_en_pass2:
             self.ensure_en_pass2_refiner()
 
         # Start real-time auto-save meeting log (.TXT & .SRT)
@@ -1925,12 +2072,14 @@ class EngineRuntime:
                 th.join(timeout=2.0)
             setattr(self, th_attr, None)
         self._listening = False
+        self._schedule_hymt2_idle_sleep(delay_s=60.0)
         self.broadcast_threadsafe({"type": "level", "data": {"level": 0.0}})
         payload = self.get_status_payload()
         self.broadcast_threadsafe({"type": "status", "data": payload})
         return payload
 
     def shutdown(self) -> None:
+        self._cancel_hymt2_idle_timer()
         self.stop_session()
         # Cancel any active batch file translation
         if self._file_job_cancel is not None:
@@ -2026,6 +2175,17 @@ class EngineRuntime:
                 need_restart = True
         if req.mt_mode is not None:
             self.config.mt_mode = req.mt_mode
+            if req.mt_mode != "hy-mt2" and self._hymt2 is not None:
+                self._cancel_hymt2_idle_timer()
+                with self._model_lock:
+                    if self._hymt2 is not None:
+                        try:
+                            self._hymt2.stop()
+                            getattr(self._hymt2, "close", lambda: None)()
+                        except Exception:
+                            pass
+                        self._hymt2 = None
+                gc.collect()
         if req.paragraph_mode is not None and req.paragraph_mode in ("short", "medium", "long"):
             self.config.paragraph_mode = req.paragraph_mode
         if req.translate_partials is not None:

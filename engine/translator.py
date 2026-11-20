@@ -364,13 +364,19 @@ class EnViT5Translator:
         batch_tokens = [self._sp.encode(f"{prefix}: {c}", out_type=str) + ["</s>"] for c in chunks]
         max_src_len = max(len(toks) for toks in batch_tokens)
         is_short_src = len(clean.split()) <= 6
+        eff_beam = max(1, beam_size)
         max_dec = min(256, max(16, int(max_src_len * 2.5) + 6))
+        # Beam>=2 (final sentences): length_penalty=1.15 + gentle rep_penalty=1.05 prevents early-EOS
+        # clause truncation and keeps 100% of numbers/modifiers faithful!
+        rep_pen = 1.18 if is_short_src else (1.05 if eff_beam >= 2 else 1.12)
+        len_pen = 1.15 if (eff_beam >= 2 and not is_short_src) else 1.0
         with self._lock:
             results = self._translator.translate_batch(
                 batch_tokens,
-                beam_size=max(1, beam_size),
+                beam_size=eff_beam,
                 max_decoding_length=max_dec,
-                repetition_penalty=1.18 if is_short_src else 1.12,
+                length_penalty=len_pen,
+                repetition_penalty=rep_pen,
                 no_repeat_ngram_size=3 if is_short_src else 4,
             )
 

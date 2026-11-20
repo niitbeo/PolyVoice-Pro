@@ -1430,15 +1430,18 @@ export default function App() {
   const handleDownloadCoreModels = async () => {
     setErrorMsg("");
     setShowAdvanced(true);
-    const missingIds: Array<"zipformer-30m-streaming" | "envit5" | "hy-mt2"> = [];
+    const missingIds: Array<"zipformer-30m-streaming" | "moonshine-en" | "envit5" | "nllb-600m"> = [];
     if (models?.asr_zipformer_streaming?.status !== "ready" && models?.asr_zipformer_streaming?.status !== "downloading") {
       missingIds.push("zipformer-30m-streaming");
+    }
+    if (models?.asr_moonshine_en?.status !== "ready" && models?.asr_moonshine_en?.status !== "downloading") {
+      missingIds.push("moonshine-en");
     }
     if (models?.mt_envit5?.status !== "ready" && models?.mt_envit5?.status !== "downloading") {
       missingIds.push("envit5");
     }
-    if (models?.mt_hymt2?.status !== "ready" && models?.mt_hymt2?.status !== "downloading") {
-      missingIds.push("hy-mt2");
+    if (models?.mt_nllb_600m?.status !== "ready" && models?.mt_nllb_600m?.status !== "downloading") {
+      missingIds.push("nllb-600m");
     }
     for (const id of missingIds) {
       await handleDownloadModel(id);
@@ -1618,10 +1621,9 @@ export default function App() {
     () =>
       [
         ["Nghe Tiếng Việt (+Hotwords)", models?.asr_zipformer_streaming, "zipformer-30m-streaming", "49 MB"],
-        ["Nghe Tiếng Anh (Nháp live)", models?.asr_zipformer_en_20m, "zipformer-en-20m", "130 MB"],
-        ["Nghe Tiếng Anh (Chuẩn 0.6%)", models?.asr_moonshine_en, "moonshine-en", "135 MB"],
-        ["Dịch Nháp Việt ⇄ Anh (EnViT5)", models?.mt_envit5, "envit5", "266 MB"],
-        ["Dịch Chuẩn 38 NN (Hy-MT2)", models?.mt_hymt2, "hy-mt2", "1.05 GB"],
+        ["Nghe Tiếng Anh (Moonshine-v2)", models?.asr_moonshine_en, "moonshine-en", "135 MB"],
+        ["Dịch Việt ⇄ Anh (EnViT5 • Nhẹ)", models?.mt_envit5, "envit5", "266 MB"],
+        ["Dịch Lào & 202 NN (NLLB-600M)", models?.mt_nllb_600m, "nllb-600m", "604 MB"],
       ] as const,
     [models]
   );
@@ -1630,7 +1632,8 @@ export default function App() {
     () =>
       [
         ["Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)", models?.asr_whisper_turbo, "whisper-turbo", "540 MB"],
-        ["Dịch Tiếng Lào & 202 NN (NLLB-600M)", models?.mt_nllb_600m, "nllb-600m", "604 MB"],
+        ["Dịch Chuyên sâu 38 NN (Hy-MT2 • Nặng GPU)", models?.mt_hymt2, "hy-mt2", "1.05 GB"],
+        ["Nghe Tiếng Anh Siêu nhẹ (Zipformer-20M)", models?.asr_zipformer_en_20m, "zipformer-en-20m", "130 MB"],
       ] as const,
     [models]
   );
@@ -1668,28 +1671,39 @@ export default function App() {
   );
 
   const latestItem = history[0] || null;
+  const prevHistoryItem = history[1] || null;
   const isDraft = Boolean(partial);
+  const isLiveSession = Boolean(status?.listening || isDraft);
   const partialHasMt = Boolean(
     partial && (partial.translated_text || partial.stable_text || partial.unstable_text)
   );
-  // Atomic EN <-> VI pairing: hold BOTH previous source & translation during the ~150ms gap
-  // before the next sentence's first live draft translation arrives (zero mismatched pairing & zero flash!)
-  const holdPrevAtomic = Boolean(
-    isDraft && !partialHasMt && translatePartials && latestItem?.translated_text
+  // Continuous 2-tier Top-to-Bottom Flow inside Spotlight:
+  // - Hold the finished sentence clearly in the active lower slot for ~150ms until the next
+  //   sentence's first live draft translation arrives (zero dimming bleach & zero EN/VI mismatch).
+  // - When the next sentence is ready, the finished sentence promotes gently upward into
+  //   `flowPrevItem` while the new sentence flows smoothly in below (`flowCurrId`).
+  // - Because backend keeps `partial.id === final.id`, finalizing a sentence NEVER changes
+  //   either key -> 0 DOM remounts, 0 flashes, 0 flicker!
+  const showPartialAsActive = Boolean(
+    partial && (partialHasMt || !translatePartials || !latestItem?.translated_text)
   );
-  const spotSource = holdPrevAtomic
-    ? latestItem?.source_text || ""
-    : partial
-    ? partial.source_text
-    : latestItem?.source_text || "";
-  const spotTarget = holdPrevAtomic
-    ? ""
-    : partial
-    ? partial.translated_text
-    : latestItem?.translated_text || "";
-  const spotPendingDraft = isDraft && !partialHasMt;
-  const spotAsrMs = partial ? partial.asr_ms : latestItem?.asr_ms ?? 0;
-  const spotMtMs = partial ? partial.mt_ms : latestItem?.mt_ms ?? 0;
+  const partialIsNewSentence = Boolean(
+    showPartialAsActive && partial && (!latestItem || partial.id !== latestItem.id)
+  );
+  const flowPrevItem: TranscriptEntry | null = partialIsNewSentence
+    ? latestItem
+    : prevHistoryItem;
+  const flowCurrId = showPartialAsActive && partial ? partial.id : latestItem?.id || "empty";
+  const flowCurrSource =
+    showPartialAsActive && partial ? partial.source_text : latestItem?.source_text || "";
+  const flowCurrTarget =
+    showPartialAsActive && partial ? partial.translated_text : latestItem?.translated_text || "";
+  const flowCurrIsDraft = showPartialAsActive;
+  const spotPendingDraft = Boolean(showPartialAsActive && partial && !partialHasMt);
+  const spotAsrMs =
+    showPartialAsActive && partial ? partial.asr_ms : latestItem?.asr_ms ?? partial?.asr_ms ?? 0;
+  const spotMtMs =
+    showPartialAsActive && partial ? partial.mt_ms : latestItem?.mt_ms ?? partial?.mt_ms ?? 0;
   const litBars = Math.round(level * VU_BARS);
 
   return (
@@ -2311,7 +2325,7 @@ export default function App() {
                 <span>Engine Dịch Offline (MT)</span>
                 <select
                   className="select"
-                  value={mtMode === "auto-offline" || mtMode === "light-offline" || mtMode === "local-llm" ? mtMode : "auto-offline"}
+                  value={mtMode === "auto-offline" || mtMode === "hy-mt2" || mtMode === "local-llm" ? mtMode : "auto-offline"}
                   onChange={(e) => {
                     const mode = e.target.value as MtModeId;
                     setMtMode(mode);
@@ -2320,10 +2334,12 @@ export default function App() {
                   }}
                 >
                   <option value="auto-offline">
-                    2 Tầng Chuẩn cao (Nháp EnViT5 + Chốt Hy-MT2 • 38 NN)
+                    Siêu nhẹ &amp; Sát nghĩa (EnViT5 + NLLB 202 NN • 0% GPU)
                   </option>
-                  <option value="light-offline">
-                    Siêu nhẹ &amp; Nhanh (Chỉ EnViT5 + NLLB-600M • 202 NN)
+                  <option value="hy-mt2" disabled={!status?.hymt2_ready}>
+                    {status?.hymt2_ready
+                      ? "Chuyên sâu 38 NN (Hy-MT2 1.8B • Dùng GPU/RAM)"
+                      : "Chuyên sâu 38 NN (Hy-MT2 — chưa tải)"}
                   </option>
                   <option value="local-llm">Local LLM nâng cao (Ollama / llama.cpp)</option>
                 </select>
@@ -2524,12 +2540,12 @@ export default function App() {
                                 ✓ {sz}
                               </span>
                             )}
-                            {id === "hy-mt2" && (
+                            {id === "nllb-600m" && (
                               <button
                                 className="btn sm icon-only"
                                 style={{ width: 22, height: 22, minWidth: 22, padding: 3 }}
-                                onClick={() => handleDeleteModel("hy-mt2")}
-                                title="Xóa Hy-MT2 (1.05 GB) nếu dùng máy cấu hình nhẹ — app tự chạy bằng EnViT5"
+                                onClick={() => handleDeleteModel("nllb-600m")}
+                                title="Xóa NLLB-600M (604 MB) nếu bạn chỉ dùng Việt ⇄ Anh"
                               >
                                 <Trash2 size={11} />
                               </button>
@@ -2573,7 +2589,7 @@ export default function App() {
                 })}
 
                 <div className="hint" style={{ marginTop: 4, fontWeight: 700, color: "var(--text-1)" }}>
-                  <span>Mở rộng Đa ngôn ngữ &amp; Tiếng Lào (Tùy chọn)</span>
+                  <span>Mở rộng Đa ngôn ngữ &amp; Chuyên sâu (Tùy chọn)</span>
                 </div>
 
                 {optionalModelRows.map(([label, st, id, sz]) => {
@@ -2844,13 +2860,13 @@ export default function App() {
               );
             })()}
 
-          {/* Live Spotlight */}
+          {/* Live Spotlight — Smooth Continuous Top-to-Bottom 2-Tier Flow */}
           <section className={`spotlight ${status?.listening ? "live" : ""}`}>
             <div className="spotlight-head">
               <span className="row" style={{ gap: 7 }}>
-                {isDraft && <span className="dot pulse" style={{ color: "var(--accent)" }} />}
+                {isLiveSession && <span className="dot pulse" style={{ color: "var(--accent)" }} />}
                 <span>
-                  {isDraft
+                  {isLiveSession
                     ? `Đang nghe (${shortLangName(sourceLang, currentSrcObj?.name_vi)}) & dịch trực tiếp...`
                     : `${currentSrcObj?.name_vi || sourceLang} → ${currentTgtObj?.name_vi || targetLang}`}
                 </span>
@@ -2858,86 +2874,92 @@ export default function App() {
               <div className="metric-badges">
                 {spotAsrMs > 0 && <span className="metric">ASR {Math.round(spotAsrMs)}ms</span>}
                 {spotMtMs > 0 && <span className="metric">MT {Math.round(spotMtMs)}ms</span>}
-                {spotTarget && (
-                  <>
-                    <button
-                      className="btn sm icon-only"
-                      onClick={() => speakOfflineTTS(spotTarget, targetLang)}
-                      title="Đọc bản dịch"
-                    >
-                      <Volume2 size={12} />
-                    </button>
-                    <button
-                      className="btn sm icon-only"
-                      onClick={() => handleCopy("spot", spotTarget)}
-                      title="Sao chép bản dịch"
-                    >
-                      {copiedId === "spot" ? <Check size={12} /> : <Copy size={12} />}
-                    </button>
-                  </>
-                )}
+                <div className={`spot-head-actions ${flowCurrTarget ? "ready" : ""}`}>
+                  <button
+                    className="btn sm icon-only"
+                    disabled={!flowCurrTarget}
+                    onClick={() => flowCurrTarget && speakOfflineTTS(flowCurrTarget, targetLang)}
+                    title="Đọc bản dịch"
+                  >
+                    <Volume2 size={12} />
+                  </button>
+                  <button
+                    className="btn sm icon-only"
+                    disabled={!flowCurrTarget}
+                    onClick={() => flowCurrTarget && handleCopy("spot", flowCurrTarget)}
+                    title="Sao chép bản dịch"
+                  >
+                    {copiedId === "spot" ? <Check size={12} /> : <Copy size={12} />}
+                  </button>
+                </div>
               </div>
             </div>
 
-            <div className={`spot-source ${isDraft ? "draft" : ""}`}>
-              {spotSource ? (
-                holdPrevAtomic ? (
-                  <span className="spot-prev-hold">
-                    {spotSource}
-                    <span className="live-caret src" aria-hidden="true" />
-                  </span>
-                ) : (
-                  <>
-                    {spotSource}
-                    {isDraft && <span className="live-caret src" aria-hidden="true" />}
-                  </>
-                )
-              ) : (
-                <span className="spot-empty">
-                  Chọn <b>Ngôn ngữ nói</b> rồi bấm <b>Bắt đầu dịch</b> — hỗ trợ thu trực tiếp <b>Micro</b>, <b>YouTube</b> hoặc họp <b>2 Chiều</b>.
-                </span>
+            <div className="spot-flow-stage">
+              {flowPrevItem && (flowPrevItem.source_text || flowPrevItem.translated_text) && (
+                <div className="spot-flow-prev" key={`prev-${flowPrevItem.id}`} aria-label="Câu vừa kết thúc">
+                  {flowPrevItem.source_text && (
+                    <div className="spot-prev-src">{flowPrevItem.source_text}</div>
+                  )}
+                  {flowPrevItem.translated_text && (
+                    <div className="spot-prev-tgt">{flowPrevItem.translated_text}</div>
+                  )}
+                </div>
               )}
-            </div>
 
-            <div className="spot-divider" />
+              <div
+                className={`spot-flow-curr ${flowCurrId !== "empty" ? "animated" : ""}`}
+                key={`curr-${flowCurrId}`}
+              >
+                <div className={`spot-source ${flowCurrIsDraft ? "draft" : ""}`}>
+                  {flowCurrSource ? (
+                    <>
+                      {flowCurrSource}
+                      {flowCurrIsDraft && <span className="live-caret src" aria-hidden="true" />}
+                    </>
+                  ) : (
+                    <span className="spot-empty">
+                      Chọn <b>Ngôn ngữ nói</b> rồi bấm <b>Bắt đầu dịch</b> — hỗ trợ thu trực tiếp <b>Micro</b>, <b>YouTube</b> hoặc họp <b>2 Chiều</b>.
+                    </span>
+                  )}
+                </div>
 
-            <div className={`spot-target ${isDraft ? "draft" : ""}`}>
-              {spotTarget ? (
-                isDraft && (partial?.stable_text || partial?.unstable_text) ? (
-                  <>
-                    {partial.stable_text && (
-                      <span className="mt-stable">{partial.stable_text}</span>
-                    )}
-                    {partial.stable_text && partial.unstable_text ? " " : null}
-                    {partial.unstable_text && (
-                      <span className="mt-unstable">{partial.unstable_text}</span>
-                    )}
-                    <span className="live-caret" aria-hidden="true" />
-                  </>
-                ) : (
-                  <>
-                    {spotTarget}
-                    {isDraft && <span className="live-caret" aria-hidden="true" />}
-                  </>
-                )
-              ) : holdPrevAtomic && latestItem?.translated_text ? (
-                <span className="spot-prev-hold">
-                  {latestItem.translated_text}
-                  <span className="live-caret" aria-hidden="true" />
-                </span>
-              ) : spotPendingDraft ? (
-                <span className="spot-translating subtle" aria-label="Đang dịch trực tiếp">
-                  <span className="live-dots" aria-hidden="true">
-                    <span />
-                    <span />
-                    <span />
-                  </span>
-                </span>
-              ) : (
-                <span className="spot-empty">
-                  Bản dịch thời gian thực sẽ xuất hiện tại đây...
-                </span>
-              )}
+                <div className="spot-divider" />
+
+                <div className={`spot-target ${flowCurrIsDraft ? "draft" : ""}`}>
+                  {flowCurrTarget ? (
+                    flowCurrIsDraft && partial && (partial.stable_text || partial.unstable_text) ? (
+                      <>
+                        {partial.stable_text && (
+                          <span className="mt-stable">{partial.stable_text}</span>
+                        )}
+                        {partial.stable_text && partial.unstable_text ? " " : null}
+                        {partial.unstable_text && (
+                          <span className="mt-unstable">{partial.unstable_text}</span>
+                        )}
+                        <span className="live-caret" aria-hidden="true" />
+                      </>
+                    ) : (
+                      <>
+                        {flowCurrTarget}
+                        {flowCurrIsDraft && <span className="live-caret" aria-hidden="true" />}
+                      </>
+                    )
+                  ) : spotPendingDraft ? (
+                    <span className="spot-translating subtle" aria-label="Đang dịch trực tiếp">
+                      <span className="live-dots" aria-hidden="true">
+                        <span />
+                        <span />
+                        <span />
+                      </span>
+                    </span>
+                  ) : (
+                    <span className="spot-empty">
+                      Bản dịch thời gian thực sẽ xuất hiện tại đây...
+                    </span>
+                  )}
+                </div>
+              </div>
             </div>
           </section>
 
