@@ -73,7 +73,7 @@ import segno
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from asr_engine import (
@@ -2632,6 +2632,8 @@ app.add_middleware(
 async def api_shutdown():
     """Graceful sidecar shutdown called by Tauri on app exit or before Windows/macOS auto-update."""
     def _do_exit() -> None:
+        # Brief pause so HTTP 200 response flushes cleanly before tearing down streams & process
+        time.sleep(0.12)
         try:
             runtime.shutdown()
         except Exception:
@@ -2639,14 +2641,12 @@ async def api_shutdown():
         srv = runtime._uvicorn_server
         if srv is not None:
             srv.should_exit = True
-        else:
-            try:
-                os.kill(os.getpid(), signal.SIGTERM)
-            except Exception:
-                os._exit(0)
+        # Guarantee fast process exit on Windows/macOS so auto-updater never hits file locks
+        time.sleep(0.35)
+        os._exit(0)
 
-    threading.Timer(0.05, _do_exit).start()
-    return {"ok": True, "shutting_down": True}
+    threading.Thread(target=_do_exit, daemon=True, name="api-shutdown").start()
+    return JSONResponse({"ok": True, "shutting_down": True}, headers={"Connection": "close"})
 
 
 @app.get("/api/health")
