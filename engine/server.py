@@ -2457,7 +2457,7 @@ class EngineRuntime:
     def _audio_loop(self, asr) -> None:
         silent_chunks = 0
         breath_chunks = 0
-        speech_rms = 0.06
+        speech_rms = 0.04
         gated = False
         preroll: deque[np.ndarray] = deque(maxlen=2)
         try:
@@ -2473,10 +2473,10 @@ class EngineRuntime:
                 elif rms >= 0.0055:
                     silent_chunks = 0
 
-                # Adaptive Speech/Noise-Floor Breath Detector (works on both studio mic & hall/YouTube!)
-                if rms > 0.025:
+                # Adaptive Speech/Noise-Floor Breath Detector (works on studio mic, quiet classroom mic & hall!)
+                if rms > 0.012:
                     speech_rms = speech_rms * 0.92 + rms * 0.08
-                dip_thresh = max(0.011, min(0.028, speech_rms * 0.22))
+                dip_thresh = max(0.007, min(0.028, speech_rms * 0.28))
                 if rms < dip_thresh:
                     breath_chunks += 1
                 elif rms >= dip_thresh * 1.25:
@@ -2637,7 +2637,7 @@ class EngineRuntime:
     def _remote_audio_loop(self, asr) -> None:
         silent_chunks = 0
         breath_chunks = 0
-        speech_rms = 0.06
+        speech_rms = 0.04
         gated = False
         preroll: deque[np.ndarray] = deque(maxlen=2)
         try:
@@ -2650,9 +2650,9 @@ class EngineRuntime:
                     silent_chunks += 1
                 elif rms >= 0.0055:
                     silent_chunks = 0
-                if rms > 0.025:
+                if rms > 0.012:
                     speech_rms = speech_rms * 0.92 + rms * 0.08
-                dip_thresh = max(0.011, min(0.028, speech_rms * 0.22))
+                dip_thresh = max(0.007, min(0.028, speech_rms * 0.28))
                 if rms < dip_thresh:
                     breath_chunks += 1
                 elif rms >= dip_thresh * 1.25:

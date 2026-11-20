@@ -966,7 +966,8 @@ class HyMT2Translator:
         src_words = cls._content_words(clean_src)
         prev_src_words = cls._content_words(prev_src)
         overlap_src = len(src_words & prev_src_words) / max(min(len(src_words), len(prev_src_words)), 1) if src_words and prev_src_words else 0.0
-        return overlap_out >= 0.55 and overlap_src <= 0.35
+        # Catch both distinct-sentence leaks (55%+) and same-topic near-verbatim copies (72%+)
+        return (overlap_out >= 0.55 and overlap_src <= 0.35) or (overlap_out >= 0.72 and overlap_src < 0.65)
 
     def _build_prompt(
         self,
@@ -1038,8 +1039,10 @@ class HyMT2Translator:
             if s and t and s.lower() in low_clean:
                 matched_terms.append((s, t))
 
-        # Keep single most recent turn for pronoun/topic continuity without overwhelming short target segments
-        ctx_pairs = (context or [])[-1:]
+        # Keep single most recent turn for pronoun/topic continuity on short/medium segments;
+        # skip prior-turn context on long self-contained paragraphs (>=38 words) to prevent 1.8B context-copying
+        # and keep long-sentence latency ~25% faster.
+        ctx_pairs = [] if len(clean.split()) >= 38 else (context or [])[-1:]
         term_sig = "|".join(f"{s}->{t}" for s, t in matched_terms)
         ctx_sig = "|".join(s for s, _ in ctx_pairs)
         cache_key = (f"{term_sig}||{ctx_sig}||{clean}", src_lang, tgt_lang, 2)

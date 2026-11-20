@@ -707,13 +707,20 @@ def _sanitize_vi_punct(tokens: list[str]) -> list[str]:
         return tokens
     out = list(tokens)
 
-    # 1. Heal orphan 1-word trailing split at the very end (e.g. "... mình ngưỡng. Mộ")
+    # 1. Heal orphan 1-2 word unpunctuated trailing split at the very end
+    # (e.g. "... mình ngưỡng. Mộ" -> "... mình ngưỡng mộ.", "... thành công. Rực rỡ" -> "... thành công rực rỡ.")
     if len(out) >= 4:
         lp, cp, rp = _strip_edge_punct(out[-2])
         ll, cl, rl = _strip_edge_punct(out[-1])
         if rp == "." and not any(ch in ".?!" for ch in rl):
             out[-2] = f"{lp}{cp}"
             out[-1] = f"{ll}{_uncap_title_word(cl)}{rl}."
+        elif len(out) >= 5 and not any(ch in ".?!" for ch in rl) and not any(ch in ".?!" for ch in rp):
+            lp3, cp3, rp3 = _strip_edge_punct(out[-3])
+            if rp3 == ".":
+                out[-3] = f"{lp3}{cp3}"
+                out[-2] = f"{lp}{_uncap_title_word(cp)}{rp}"
+                out[-1] = f"{ll}{cl}{rl}."
 
     # 2. Heal spurious mid-sentence periods before auxiliary / copula / modifier tokens
     for i in range(len(out) - 1):
