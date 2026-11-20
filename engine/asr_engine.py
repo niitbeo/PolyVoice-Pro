@@ -11,7 +11,9 @@ Cross-Platform Real-Time Streaming ASR Engines (Vietnamese & English ONNX).
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -41,6 +43,19 @@ def _format_sentence(raw: str) -> str:
     return txt
 
 
+def _resolve_hotwords_path(provider_label: str) -> Path:
+    """Store temporary BPE hotwords file in user cache dir (ASCII-safe fallback on Windows)."""
+    safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", provider_label or "asr")
+    base = Path(os.environ.get("VOICERECORE_CACHE_DIR", Path.home() / ".cache" / "voicerecore"))
+    if os.name == "nt":
+        try:
+            str(base).encode("ascii")
+        except UnicodeEncodeError:
+            base = Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "PolyVoicePro"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"active_hotwords_{safe_label}.txt"
+
+
 class _SherpaOnlineTransducerBase:
     """Base O(1) stateful streaming transducer engine via sherpa-onnx OnlineRecognizer."""
 
@@ -64,7 +79,7 @@ class _SherpaOnlineTransducerBase:
         self._joiner = Path(joiner)
         self._num_threads = num_threads
         self._bpe_model = Path(bpe_model) if bpe_model and Path(bpe_model).exists() else None
-        self._hotwords_file = self._tokens.parent / "active_hotwords.txt"
+        self._hotwords_file = _resolve_hotwords_path(provider_label)
         self._hotwords_count = 0
         self._lock = threading.Lock()
         self._last_partial = ""
@@ -78,15 +93,14 @@ class _SherpaOnlineTransducerBase:
         except Exception:
             pass
 
-        self._recognizer = self._build_recognizer(hotwords)
+        self._recognizer, self._hotwords_count = self._build_recognizer(hotwords)
         self._stream = self._recognizer.create_stream()
 
-    def _encode_hotwords_file(self, phrases: list[str] | None) -> Path | None:
+    def _encode_hotwords_file(self, phrases: list[str] | None) -> tuple[Path | None, int]:
         if not phrases or self._bpe_model is None:
-            self._hotwords_count = 0
-            return None
+            return None, 0
         try:
-            sp = spm.SentencePieceProcessor(model_file=str(self._bpe_model))
+            sp = spm.SentencePieceProcessor(model_proto=self._bpe_model.read_bytes())
             seen: set[str] = set()
             lines: list[str] = []
             for raw in phrases:
@@ -101,17 +115,33 @@ class _SherpaOnlineTransducerBase:
                 if len(lines) >= 80:
                     break
             if not lines:
-                self._hotwords_count = 0
-                return None
-            self._hotwords_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            self._hotwords_count = len(lines)
-            return self._hotwords_file
+                return None, 0
+            self._hotwords_file.parent.mkdir(parents=True, exist_ok=True)
+            content = "\n".join(lines) + "\n"
+            tmp_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=self._hotwords_file.parent,
+                    prefix=f".{self._hotwords_file.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as tf:
+                    tmp_path = Path(tf.name)
+                    tf.write(content)
+                    tf.flush()
+                os.replace(tmp_path, self._hotwords_file)
+            except Exception:
+                if tmp_path is not None:
+                    tmp_path.unlink(missing_ok=True)
+                self._hotwords_file.write_text(content, encoding="utf-8")
+            return self._hotwords_file, len(lines)
         except Exception:
-            self._hotwords_count = 0
-            return None
+            return None, 0
 
-    def _build_recognizer(self, hotwords: list[str] | None = None):
-        hw_path = self._encode_hotwords_file(hotwords)
+    def _build_recognizer(self, hotwords: list[str] | None = None) -> tuple[sherpa_onnx.OnlineRecognizer, int]:
+        hw_path, hw_count = self._encode_hotwords_file(hotwords)
         base_kwargs = dict(
             tokens=str(self._tokens),
             encoder=str(self._encoder),
@@ -126,28 +156,64 @@ class _SherpaOnlineTransducerBase:
             rule3_min_utterance_length=9.5,
             provider="cpu",
         )
-        if hw_path is not None:
+        if hw_path is not None and hw_count > 0:
             try:
-                return sherpa_onnx.OnlineRecognizer.from_transducer(
+                rec = sherpa_onnx.OnlineRecognizer.from_transducer(
                     **base_kwargs,
                     decoding_method="modified_beam_search",
                     hotwords_file=str(hw_path),
                     hotwords_score=1.5,
                 )
+                return rec, hw_count
             except Exception:
-                self._hotwords_count = 0
-        return sherpa_onnx.OnlineRecognizer.from_transducer(
+                pass
+        rec = sherpa_onnx.OnlineRecognizer.from_transducer(
             **base_kwargs,
             decoding_method="greedy_search",
         )
+        return rec, 0
 
     def update_hotwords(self, phrases: list[str] | None) -> int:
-        """Dynamically reload acoustic hotwords (e.g. when user updates Meeting Glossary)."""
+        """Dynamically reload acoustic hotwords outside self._lock and swap atomically (zero 2s audio stall)."""
+        new_rec, new_count = self._build_recognizer(phrases)
+        new_stream = new_rec.create_stream()
         with self._lock:
-            self._recognizer = self._build_recognizer(phrases)
-            self._stream = self._recognizer.create_stream()
+            self._recognizer = new_rec
+            self._stream = new_stream
+            self._hotwords_count = new_count
             self._last_partial = ""
             return self._hotwords_count
+
+    def transcribe_pcm_isolated(self, pcm_s16: np.ndarray) -> str:
+        """Transcribe a standalone PCM segment on a fresh stream without mutating live streaming state."""
+        if pcm_s16 is None or len(pcm_s16) == 0:
+            return ""
+        with self._lock:
+            recognizer = self._recognizer
+        stream = recognizer.create_stream()
+        audio_f32 = pcm_s16.astype(np.float32) / 32768.0
+        step = max(1600, int(self.sample_rate * 0.1))
+        parts: list[str] = []
+        for pos in range(0, len(audio_f32), step):
+            stream.accept_waveform(self.sample_rate, audio_f32[pos : pos + step])
+            while recognizer.is_ready(stream):
+                recognizer.decode_stream(stream)
+            if recognizer.is_endpoint(stream):
+                raw_text = recognizer.get_result(stream).strip()
+                recognizer.reset(stream)
+                formatted = _format_sentence(raw_text)
+                if formatted:
+                    parts.append(formatted)
+        stream.accept_waveform(
+            self.sample_rate,
+            np.zeros(int(self.sample_rate * 0.4), dtype=np.float32),
+        )
+        while recognizer.is_ready(stream):
+            recognizer.decode_stream(stream)
+        tail = _format_sentence(recognizer.get_result(stream).strip())
+        if tail:
+            parts.append(tail)
+        return " ".join(parts).strip()
 
     def reset(self) -> None:
         with self._lock:
@@ -384,18 +450,38 @@ class VietASRBatchRefiner:
             if not refined or (fb_words > 0 and rf_words < max(2, int(fb_words * 0.55))):
                 return fallback_text, ms
 
-            # Safety guard 2: if Pass-1 (+BPE Hotwords / ASR fixes) heard protected domain/brand terms
-            # (e.g. MCP, API, CLI, Cloudflare, proper names) that VietASR Pass-2 dropped/corrupted
-            # (e.g. MCP -> MB), keep Pass-1 so glossary keywords are NEVER lost!
-            if fallback_text and protected_terms:
+            # Safety guard 2: always protect glossary terms AND auto-extracted Pass-1 uppercase Latin
+            # acronyms (MCP, API, CLI, USD...) + high-magnitude Vietnamese units (triệu tỷ, nghìn tỷ, tỷ)
+            # even when custom glossary is disabled so Pass-2 never drops critical acronyms or 10^9 units!
+            if fallback_text:
+                effective_terms: list[str] = list(protected_terms or [])
+                if not fallback_text.isupper():
+                    effective_terms.extend(re.findall(r"(?<!\w)[A-Z]{2,}(?!\w)", fallback_text))
+                seen_terms: set[str] = set()
                 dropped = 0
-                for term in protected_terms:
+                for term in effective_terms:
                     t = term.strip()
-                    if len(t) < 2:
+                    tl = t.lower()
+                    if len(t) < 2 or tl in seen_terms:
                         continue
+                    seen_terms.add(tl)
                     pat = re.compile(rf"(?<!\w){re.escape(t)}(?!\w)", re.IGNORECASE | re.UNICODE)
                     if pat.search(fallback_text) and not pat.search(refined):
                         dropped += 1
+
+                # Guard financial/magnitude units ("triệu tỷ", "nghìn tỷ", "tỷ" / "tỉ")
+                if dropped == 0:
+                    for unit_pat in (
+                        r"(?<!\w)triệu\s+t[ỷỉ](?!\w)",
+                        r"(?<!\w)nghìn\s+t[ỷỉ](?!\w)",
+                        r"(?<!\w)ngàn\s+t[ỷỉ](?!\w)",
+                        r"(?<!\w)t[ỷỉ](?!\w)",
+                    ):
+                        up = re.compile(unit_pat, re.IGNORECASE | re.UNICODE)
+                        if up.search(fallback_text) and not up.search(refined):
+                            dropped += 1
+                            break
+
                 if dropped >= 1:
                     return _format_sentence(fallback_text), ms
 

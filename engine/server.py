@@ -18,9 +18,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
+import os
 import platform
 import queue
+import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -30,6 +34,39 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
+
+# Windows PyInstaller `--noconsole` & SSL CA bootstrap:
+# In frozen GUI builds on Windows, sys.stdout/sys.stderr can be None or cp1252, causing
+# print/logging/tqdm to crash with AttributeError or UnicodeEncodeError. Also ensure
+# bundled certifi CA roots are registered before any HTTPS calls.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+elif hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+elif hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+try:
+    import certifi as _certifi
+
+    _ca_bundle = _certifi.where()
+    if _ca_bundle and os.path.isfile(_ca_bundle):
+        os.environ.setdefault("SSL_CERT_FILE", _ca_bundle)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", _ca_bundle)
+except Exception:
+    pass
 
 import numpy as np
 import segno
@@ -52,10 +89,12 @@ from audio_capture import (
     SAMPLE_RATE,
     MacSystemAudioStream,
     MicrophoneStream,
+    MixedAudioStream,
     WindowsLoopbackStream,
     find_macos_helper,
     has_windows_loopback,
     list_input_devices,
+    list_output_loopback_devices,
 )
 from file_translator import FileTranslateCancelled, translate_media_file
 from glossary import GlossaryManager
@@ -84,11 +123,42 @@ from translator import (
     summarize_meeting_entries,
 )
 
+logger = logging.getLogger("voicerecore.server")
+
+
+def _adaptive_mt_threads() -> int:
+    return max(2, min(4, (os.cpu_count() or 4) // 2))
+
+
+def _drain_stderr_async(proc: Optional[subprocess.Popen], label: str) -> None:
+    """Drain subprocess stderr in a daemon thread so the 64 KB pipe buffer never deadlocks."""
+    if proc is None or proc.stderr is None:
+        return
+    pipe = proc.stderr
+
+    def _reader() -> None:
+        try:
+            for _ in pipe:
+                pass
+        except Exception:
+            pass
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=_reader, daemon=True, name=f"stderr-drain-{label}").start()
+
 
 @dataclass
 class SessionConfig:
     device_id: Optional[int] = None
-    audio_source: str = "mic"          # "mic" | "system" | "dual"
+    loopback_device_id: Optional[int] = None
+    audio_source: str = "mic"          # "mic" | "system" | "dual" | "mix"
+    input_channel: str = "mix"         # "mix" | "left" | "right"
+    input_gain_db: float = 0.0         # -12.0 .. +24.0 dB
+    auto_gain: bool = False            # Broadcast AGC + soft limiter
     source_lang: str = "vie_Latn"
     target_lang: str = "eng_Latn"
     asr_engine: str = "auto"           # "auto" | "apple-native" | "zipformer-30m-streaming" | "zipformer-en-20m" | "viet-asr"
@@ -105,7 +175,11 @@ class SessionConfig:
 
 class StartSessionRequest(BaseModel):
     device_id: Optional[int] = None
+    loopback_device_id: Optional[int] = None
     audio_source: str = "mic"
+    input_channel: str = "mix"
+    input_gain_db: float = 0.0
+    auto_gain: bool = False
     source_lang: str = "vie_Latn"
     target_lang: str = "eng_Latn"
     asr_engine: str = "auto"
@@ -121,7 +195,12 @@ class StartSessionRequest(BaseModel):
 
 
 class UpdateConfigRequest(BaseModel):
+    device_id: Optional[int] = None
+    loopback_device_id: Optional[int] = None
     audio_source: Optional[str] = None
+    input_channel: Optional[str] = None
+    input_gain_db: Optional[float] = None
+    auto_gain: Optional[bool] = None
     source_lang: Optional[str] = None
     target_lang: Optional[str] = None
     asr_engine: Optional[str] = None
@@ -256,6 +335,7 @@ class EngineRuntime:
         self._remote_lock = threading.Lock()
         self._remote_parts: list[str] = []
         self._remote_pcm_chunks: list[np.ndarray] = []
+        self._remote_has_active_partial: bool = False
         self._remote_last_speech_ts: float = 0.0
         self._remote_last_asr_ms: float = 0.0
         self._remote_seg_id: str = ""
@@ -275,6 +355,15 @@ class EngineRuntime:
         self._boot_error: str = ""
         self._file_job_progress: dict[str, Any] = {"active": False}
         self._file_job_cancel: Optional[threading.Event] = None
+        self._file_job_lock = threading.Lock()
+        self._file_job_busy: bool = False
+        self._active_downloads: set[str] = set()
+        self._downloads_lock = threading.Lock()
+        self._fanout_queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(maxsize=32)
+        self._fanout_lock = threading.Lock()
+        self._fanout_thread: Optional[threading.Thread] = None
+        self._fanout_stop = threading.Event()
+        self._uvicorn_server: Optional[uvicorn.Server] = None
         self._cloud_cooldown_until: float = 0.0
         self._cloud_fallback_reason: str = ""
         self._cloud_notice_lock = threading.Lock()
@@ -298,13 +387,25 @@ class EngineRuntime:
         async with self._ws_lock:
             self._ws_clients.discard(ws)
 
+    def get_audience_status_payload(self) -> dict[str, Any]:
+        """Minimal, sanitized status for untrusted LAN `/ws/audience` clients (no API config or host paths)."""
+        src = get_source_language(self.config.source_lang)
+        tgt = get_language(self.config.target_lang)
+        return {
+            "listening": self._listening,
+            "source_lang": self.config.source_lang,
+            "target_lang": self.config.target_lang,
+            "source_lang_meta": asdict(src) if src else None,
+            "target_lang_meta": asdict(tgt) if tgt else None,
+        }
+
     async def register_audience_ws(self, ws: WebSocket, lang: str = "follow") -> None:
         req_lang = lang.strip() if lang and lang.strip() else "follow"
         async with self._ws_lock:
             self._audience_ws[ws] = req_lang
-        await ws.send_json({"type": "status", "data": self.get_status_payload()})
-        # Send recent history (translating on-demand if audience picked a custom language)
-        recent = self._history[-40:]
+        await ws.send_json({"type": "status", "data": self.get_audience_status_payload()})
+        # Send recent history (capped at last 8 entries to avoid MT lock starvation on connect)
+        recent = list(self._history)[-8:]
         if recent:
             if req_lang == "follow":
                 await ws.send_json({"type": "history", "data": recent})
@@ -324,7 +425,8 @@ class EngineRuntime:
                                 1,
                             )
                             customized.append({**e, "target_lang": req_lang, "translated_text": tr.translated_text})
-                        except Exception:
+                        except Exception as exc:
+                            logger.warning("Audience history backfill failed for %s: %s", req_lang, exc)
                             customized.append(e)
                 await ws.send_json({"type": "history", "data": customized})
         await self.broadcast({"type": "audience_count", "data": self.get_audience_summary()})
@@ -368,13 +470,22 @@ class EngineRuntime:
                 dead.append(ws)
 
         ev_type = payload.get("type")
-        ev_data = payload.get("data") or {}
+        ev_data = payload.get("data")
+        aud_status_payload = (
+            {"type": "status", "data": self.get_audience_status_payload()}
+            if ev_type == "status" and aud_items
+            else None
+        )
         dead_aud: list[WebSocket] = []
         for aws, alang in aud_items:
             try:
-                if ev_type in ("status", "partial"):
+                if ev_type == "status" and aud_status_payload is not None:
+                    await aws.send_json(aud_status_payload)
+                elif ev_type == "partial":
                     await aws.send_json(payload)
-                elif ev_type in ("partial_mt", "final"):
+                elif ev_type == "history" and isinstance(ev_data, list) and len(ev_data) == 0:
+                    await aws.send_json(payload)
+                elif ev_type in ("partial_mt", "final") and isinstance(ev_data, dict):
                     if alang == "follow" or alang == ev_data.get("target_lang"):
                         await aws.send_json(payload)
             except Exception:
@@ -387,20 +498,37 @@ class EngineRuntime:
                 for aws in dead_aud:
                     self._audience_ws.pop(aws, None)
 
-    def _fanout_audience_final(self, entry: dict[str, Any]) -> None:
-        """Translate a committed sentence ONCE per distinct extra language watched by QR audience phones."""
-        if not self._audience_ws or self.loop is None or self.loop.is_closed():
-            return
-        extra_langs = {
-            lang
-            for lang in list(self._audience_ws.values())
-            if lang != "follow" and lang != entry.get("target_lang")
-        }
-        if not extra_langs:
-            return
+    def _ensure_fanout_worker(self) -> None:
+        with self._fanout_lock:
+            if self._fanout_thread is None or not self._fanout_thread.is_alive():
+                self._fanout_stop.clear()
+                self._fanout_thread = threading.Thread(
+                    target=self._fanout_worker_loop,
+                    daemon=True,
+                    name="audience-fanout-worker",
+                )
+                self._fanout_thread.start()
 
-        def _worker() -> None:
+    def _fanout_worker_loop(self) -> None:
+        while not self._fanout_stop.is_set():
+            try:
+                entry = self._fanout_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if entry is None:
+                break
+            if not self._audience_ws or self.loop is None or self.loop.is_closed():
+                continue
+            extra_langs = sorted(
+                {
+                    lang
+                    for lang in list(self._audience_ws.values())
+                    if lang != "follow" and lang != entry.get("target_lang")
+                }
+            )
             for tgt in extra_langs:
+                if self._fanout_stop.is_set():
+                    break
                 try:
                     tr = self.translate_text(
                         entry["source_text"],
@@ -431,10 +559,32 @@ class EngineRuntime:
 
                     if self.loop and not self.loop.is_closed():
                         asyncio.run_coroutine_threadsafe(_push(), self.loop)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Audience fan-out translation failed for %s: %s", tgt, exc)
 
-        threading.Thread(target=_worker, daemon=True, name="audience-fanout").start()
+    def _fanout_audience_final(self, entry: dict[str, Any]) -> None:
+        """Enqueue a committed sentence onto the bounded FIFO audience fan-out worker."""
+        if not self._audience_ws or self.loop is None or self.loop.is_closed():
+            return
+        extra_langs = {
+            lang
+            for lang in list(self._audience_ws.values())
+            if lang != "follow" and lang != entry.get("target_lang")
+        }
+        if not extra_langs:
+            return
+        self._ensure_fanout_worker()
+        try:
+            self._fanout_queue.put_nowait(dict(entry))
+        except queue.Full:
+            try:
+                self._fanout_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._fanout_queue.put_nowait(dict(entry))
+            except queue.Full:
+                pass
 
     def _probe_mac_helper(self) -> None:
         if self.mac_helper is None:
@@ -498,7 +648,7 @@ class EngineRuntime:
                 self._en_pass2_refiner = MoonshineV2EnRefiner(
                     self.model_manager.moonshine_en_dir,
                     sample_rate=SAMPLE_RATE,
-                    num_threads=4,
+                    num_threads=_adaptive_mt_threads(),
                 )
             return self._en_pass2_refiner
 
@@ -550,13 +700,20 @@ class EngineRuntime:
             if not self._llama_server_ready or not self.model_manager.is_hymt2_ready():
                 return None
             if self._hymt2 is None:
-                self._hymt2 = HyMT2Translator(self.model_manager.hy_mt2_gguf_path, port=18766, threads=4)
+                self._hymt2 = HyMT2Translator(
+                    self.model_manager.hy_mt2_gguf_path,
+                    port=18766,
+                    threads=_adaptive_mt_threads(),
+                )
             return self._hymt2
 
     def ensure_envit5_loaded(self) -> Optional[EnViT5Translator]:
         with self._model_lock:
             if self._envit5 is None and self.model_manager.is_envit5_ready():
-                self._envit5 = EnViT5Translator(self.model_manager.envit5_dir, intra_threads=4)
+                self._envit5 = EnViT5Translator(
+                    self.model_manager.envit5_dir,
+                    intra_threads=_adaptive_mt_threads(),
+                )
             return self._envit5
 
     def ensure_opus_loaded(self, direction: str) -> Optional[OpusMTTranslator]:
@@ -586,7 +743,7 @@ class EngineRuntime:
                 self._nllb_13b = NLLBTranslator(
                     self.model_manager.nllb_13b_dir,
                     device="cpu",
-                    intra_threads=4,
+                    intra_threads=_adaptive_mt_threads(),
                     engine_name="nllb-200-1.3b-int8",
                 )
             return self._nllb_13b
@@ -607,7 +764,7 @@ class EngineRuntime:
                 self._nllb = NLLBTranslator(
                     self.model_manager.nllb_600m_dir,
                     device="cpu",
-                    intra_threads=4,
+                    intra_threads=_adaptive_mt_threads(),
                     engine_name="nllb-200-600m-int8",
                 )
             if self._nllb is not None:
@@ -615,7 +772,9 @@ class EngineRuntime:
         n13 = self.ensure_nllb_13b_loaded()
         if n13 is not None:
             return n13
-        raise RuntimeError("Model dịch NLLB-200 INT8 chưa được tải.")
+        raise RuntimeError(
+            "Chưa tải mô hình dịch Offline trên máy. Hãy bấm 'Tải bộ mô hình lõi' trong mục Mô hình Offline hoặc chuyển sang Cloud API."
+        )
 
     def get_llm_translator(self, url: str, model: str, api_key: str) -> LocalLLMTranslator:
         with self._model_lock:
@@ -852,6 +1011,7 @@ class EngineRuntime:
                 target_lang=res.target_lang,
                 latency_ms=res.latency_ms,
                 engine=res.engine,
+                cached=res.cached,
             )
 
         # 1) Fast online (0% CPU, ~80-160ms) — drafts stay Offline to prevent rapid-fire 429 throttling!
@@ -920,6 +1080,14 @@ class EngineRuntime:
         src = get_source_language(self.config.source_lang)
         tgt = get_language(self.config.target_lang)
         g = self.glossary.get()
+        cfg_public = asdict(self.config)
+        raw_llm_key = str(cfg_public.get("llm_api_key", "") or "").strip()
+        if raw_llm_key and raw_llm_key != "local":
+            cfg_public["llm_api_key"] = (
+                f"{raw_llm_key[:4]}••••{raw_llm_key[-4:]}"
+                if len(raw_llm_key) > 8
+                else "••••"
+            )
         return {
             "listening": self._listening,
             "active_asr_label": self._active_asr_label,
@@ -942,7 +1110,7 @@ class EngineRuntime:
             "mac_helper_ready": self.mac_helper is not None,
             "system_audio_ready": (self.mac_helper is not None) or has_windows_loopback(),
             "apple_caps": self.apple_caps,
-            "config": asdict(self.config),
+            "config": cfg_public,
             "source_lang_meta": asdict(src) if src else None,
             "target_lang_meta": asdict(tgt) if tgt else None,
             "logs": self.logger.get_status(),
@@ -965,6 +1133,7 @@ class EngineRuntime:
             if model_id == "hy-mt2" and self._hymt2 is not None:
                 try:
                     self._hymt2.stop()
+                    getattr(self._hymt2, "close", lambda: None)()
                 except Exception:
                     pass
                 self._hymt2 = None
@@ -980,13 +1149,49 @@ class EngineRuntime:
                 self._opus_ev = None
             elif model_id == "moonshine-en":
                 self._en_pass2_refiner = None
-        res = self.model_manager.delete_model(model_id)
+            elif model_id == "zipformer-30m-streaming":
+                self._asr_zf_vi = None
+            elif model_id == "zipformer-en-20m":
+                self._asr_zf_en = None
+            elif model_id == "viet-asr":
+                self._asr_viet = None
+                self._pass2_refiner = None
+        try:
+            res = self.model_manager.delete_model(model_id)
+        except PermissionError as exc:
+            raise RuntimeError(
+                f"Không thể xóa model '{model_id}' vì file đang được sử dụng. Hãy dừng phiên dịch rồi thử lại. ({exc})"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"Lỗi hệ điều hành khi xóa model '{model_id}': {exc}") from exc
         self.broadcast_threadsafe({"type": "status", "data": self.get_status_payload()})
         return res
 
-    def start_download(self, model_id: str) -> None:
+    def start_download(self, model_id: str) -> bool:
+        with self._downloads_lock:
+            if model_id in self._active_downloads:
+                return False
+            self._active_downloads.add(model_id)
+
         def _on_progress(state: dict[str, Any]) -> None:
             self.broadcast_threadsafe({"type": "model_progress", "data": state})
+
+        _on_progress(
+            {
+                "model_id": model_id,
+                "status": "downloading",
+                "progress": 1.0,
+                "downloaded_mb": 0.0,
+                "total_mb": 0.0,
+                "message": f"Đang bắt đầu tải {model_id}...",
+            }
+        )
+
+        def _try_warm_load(fn) -> None:
+            try:
+                fn()
+            except Exception as warm_exc:
+                print(f"[engine] Post-download warm-load skipped for {model_id}: {warm_exc}", flush=True)
 
         def _worker() -> None:
             try:
@@ -998,29 +1203,43 @@ class EngineRuntime:
                     self.model_manager.ensure_hymt2(on_progress=_on_progress)
                 elif model_id == "zipformer-30m-streaming":
                     self.model_manager.ensure_zipformer_streaming(on_progress=_on_progress)
-                    self.ensure_onnx_asr_loaded("zipformer-30m-streaming")
+                    _try_warm_load(lambda: self.ensure_onnx_asr_loaded("zipformer-30m-streaming"))
                 elif model_id == "zipformer-en-20m":
                     self.model_manager.ensure_zipformer_en_20m(on_progress=_on_progress)
-                    self.ensure_onnx_asr_loaded("zipformer-en-20m")
+                    _try_warm_load(lambda: self.ensure_onnx_asr_loaded("zipformer-en-20m"))
                 elif model_id == "moonshine-en":
                     self.model_manager.ensure_moonshine_en(on_progress=_on_progress)
-                    self.ensure_en_pass2_refiner()
+                    _try_warm_load(self.ensure_en_pass2_refiner)
                 elif model_id == "opus-vi-en":
                     self.model_manager.ensure_opus("vi-en", on_progress=_on_progress)
-                    self.ensure_opus_loaded("vi-en")
+                    _try_warm_load(lambda: self.ensure_opus_loaded("vi-en"))
                 elif model_id == "opus-en-vi":
                     self.model_manager.ensure_opus("en-vi", on_progress=_on_progress)
-                    self.ensure_opus_loaded("en-vi")
+                    _try_warm_load(lambda: self.ensure_opus_loaded("en-vi"))
                 elif model_id == "envit5":
                     self.model_manager.ensure_envit5(on_progress=_on_progress)
-                    self.ensure_envit5_loaded()
+                    _try_warm_load(self.ensure_envit5_loaded)
                 else:
                     raise ValueError(f"Unknown model_id: {model_id}")
                 self.broadcast_threadsafe({"type": "status", "data": self.get_status_payload()})
             except Exception as exc:
-                self.broadcast_threadsafe({"type": "error", "data": {"message": str(exc)}})
+                _on_progress(
+                    {
+                        "model_id": model_id,
+                        "status": "error",
+                        "progress": 0.0,
+                        "downloaded_mb": 0.0,
+                        "total_mb": 0.0,
+                        "message": str(exc),
+                    }
+                )
+                self.broadcast_threadsafe({"type": "error", "data": {"message": f"Lỗi tải {model_id}: {exc}"}})
+            finally:
+                with self._downloads_lock:
+                    self._active_downloads.discard(model_id)
 
         threading.Thread(target=_worker, daemon=True, name=f"dl-{model_id}").start()
+        return True
 
     def start_session(self, req: StartSessionRequest) -> dict[str, Any]:
         if self._listening:
@@ -1028,7 +1247,11 @@ class EngineRuntime:
 
         self.config = SessionConfig(
             device_id=req.device_id,
-            audio_source=req.audio_source if req.audio_source in ("mic", "system", "dual") else "mic",
+            loopback_device_id=req.loopback_device_id,
+            audio_source=req.audio_source if req.audio_source in ("mic", "system", "dual", "mix") else "mic",
+            input_channel=req.input_channel if req.input_channel in ("mix", "left", "right") else "mix",
+            input_gain_db=max(-12.0, min(24.0, float(req.input_gain_db))),
+            auto_gain=bool(req.auto_gain),
             source_lang=req.source_lang,
             target_lang=req.target_lang,
             asr_engine=req.asr_engine,
@@ -1044,6 +1267,11 @@ class EngineRuntime:
         )
 
         chosen_asr = self._resolve_asr_choice(self.config)
+        if self.config.audio_source == "mix" and chosen_asr == "apple-native":
+            if self.config.source_lang == "vie_Latn" and self.model_manager.is_zipformer_streaming_ready():
+                chosen_asr = "zipformer-30m-streaming"
+            elif self.config.source_lang == "eng_Latn" and self.model_manager.is_zipformer_en_20m_ready():
+                chosen_asr = "zipformer-en-20m"
         self._active_asr_label = chosen_asr
         self._remote_asr_label = ""
 
@@ -1055,7 +1283,7 @@ class EngineRuntime:
             and bool(get_hymt2_lang_name(self.config.source_lang))
             and bool(get_hymt2_lang_name(self.config.target_lang))
         )
-        if is_vi_en_pair and self.config.mt_mode not in ("opus", "nllb") and self.model_manager.is_envit5_ready():
+        if is_vi_en_pair and self.config.mt_mode not in ("opus", "nllb", "nllb-1.3b") and self.model_manager.is_envit5_ready():
             self.ensure_envit5_loaded()
         elif is_vi_en_pair and (self.config.mt_mode == "opus" or not self.model_manager.is_envit5_ready()):
             if self.config.source_lang == "vie_Latn" and self.model_manager.is_opus_vi_en_ready():
@@ -1074,17 +1302,20 @@ class EngineRuntime:
             need_nllb = (
                 self.config.source_lang != self.config.target_lang
                 and (
-                    self.config.mt_mode == "nllb"
+                    self.config.mt_mode in ("nllb", "nllb-1.3b")
                     or (not is_vi_en_pair and self.config.mt_mode in ("auto-offline", "hy-mt2", "opus"))
                 )
             )
             if need_nllb and (self.model_manager.is_nllb_13b_ready() or self.model_manager.is_nllb_ready()):
                 self.ensure_nllb_loaded(prefer_13b=(self.config.mt_mode == "nllb-1.3b"))
 
-        if (
-            self.config.pass2_refine
-            and chosen_asr == "zipformer-30m-streaming"
-            and self.config.source_lang == "vie_Latn"
+        if self.config.pass2_refine and (
+            (chosen_asr == "zipformer-30m-streaming" and self.config.source_lang == "vie_Latn")
+            or (
+                self.config.audio_source == "dual"
+                and self.config.target_lang == "vie_Latn"
+                and self.model_manager.is_zipformer_streaming_ready()
+            )
         ):
             self.ensure_pass2_refiner()
         if (
@@ -1116,6 +1347,7 @@ class EngineRuntime:
         with self._remote_lock:
             self._remote_parts.clear()
             self._remote_pcm_chunks.clear()
+            self._remote_has_active_partial = False
             self._remote_last_speech_ts = 0.0
             self._remote_seg_id = uuid.uuid4().hex[:10]
         with self._group_lock:
@@ -1131,8 +1363,14 @@ class EngineRuntime:
         self._mt_thread = threading.Thread(target=self._mt_worker_loop, daemon=True, name="mt-worker")
         self._mt_thread.start()
 
-        # Primary audio channel: "mic" in mic/dual mode, "system" in system mode
-        primary_source = "system" if self.config.audio_source == "system" else "mic"
+        # Primary audio channel: "mic" in mic/dual mode, "system" in system mode, "mix" in hall-mixer mode
+        primary_source = (
+            "mix"
+            if self.config.audio_source == "mix"
+            else "system"
+            if self.config.audio_source == "system"
+            else "mic"
+        )
 
         if chosen_asr == "apple-native":
             if self.mac_helper is None:
@@ -1147,13 +1385,14 @@ class EngineRuntime:
                     "--locale",
                     locale,
                     "--source",
-                    primary_source,
+                    "system" if primary_source == "system" else "mic",
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
             )
+            _drain_stderr_async(self._apple_proc, "apple-asr")
             self._listening = True
             self._asr_thread = threading.Thread(
                 target=self._apple_asr_loop,
@@ -1165,30 +1404,63 @@ class EngineRuntime:
             asr = self.ensure_onnx_asr_loaded(chosen_asr)
             asr.reset()
 
-            def _on_level(level: float) -> None:
+            def _on_meter(level: float, clipping: bool) -> None:
                 now = time.perf_counter()
-                if now - self._last_level_emit >= 0.08:
+                if clipping or (now - self._last_level_emit >= 0.08):
                     self._last_level_emit = now
-                    self.broadcast_threadsafe({"type": "level", "data": {"level": round(level, 3)}})
+                    self.broadcast_threadsafe(
+                        {"type": "level", "data": {"level": round(level, 3), "clipping": bool(clipping)}}
+                    )
+
+            def _make_system_stream(meter_cb=None, apply_cond: bool = True):
+                err_cb = lambda m: self.broadcast_threadsafe({"type": "error", "data": {"message": m}})
+                g_db = self.config.input_gain_db if apply_cond else 0.0
+                agc = self.config.auto_gain if apply_cond else False
+                if self.mac_helper is not None:
+                    return MacSystemAudioStream(
+                        self.mac_helper,
+                        on_meter=meter_cb,
+                        on_error=err_cb,
+                        gain_db=g_db,
+                        auto_gain=agc,
+                    )
+                if platform.system() == "Windows":
+                    return WindowsLoopbackStream(
+                        on_meter=meter_cb,
+                        on_error=err_cb,
+                        loopback_device_id=self.config.loopback_device_id,
+                        gain_db=g_db,
+                        auto_gain=agc,
+                    )
+                raise RuntimeError(
+                    "Thu âm thanh hệ thống trực tiếp hỗ trợ trên macOS (ScreenCaptureKit) và Windows (WASAPI Loopback)."
+                )
 
             if primary_source == "system":
-                if self.mac_helper is not None:
-                    self._audio_stream = MacSystemAudioStream(
-                        self.mac_helper,
-                        on_level=_on_level,
-                        on_error=lambda m: self.broadcast_threadsafe({"type": "error", "data": {"message": m}}),
-                    )
-                elif platform.system() == "Windows":
-                    self._audio_stream = WindowsLoopbackStream(
-                        on_level=_on_level,
-                        on_error=lambda m: self.broadcast_threadsafe({"type": "error", "data": {"message": m}}),
-                    )
-                else:
-                    raise RuntimeError(
-                        "Thu âm thanh hệ thống trực tiếp hỗ trợ trên macOS (ScreenCaptureKit) và Windows (WASAPI Loopback)."
-                    )
+                self._audio_stream = _make_system_stream(meter_cb=_on_meter, apply_cond=True)
+            elif primary_source == "mix":
+                mic_st = MicrophoneStream(
+                    device_id=self.config.device_id,
+                    channel_mode=self.config.input_channel,
+                    gain_db=0.0,
+                    auto_gain=False,
+                )
+                sys_st = _make_system_stream(meter_cb=None, apply_cond=False)
+                self._audio_stream = MixedAudioStream(
+                    mic_st,
+                    sys_st,
+                    on_meter=_on_meter,
+                    gain_db=self.config.input_gain_db,
+                    auto_gain=self.config.auto_gain,
+                )
             else:
-                self._audio_stream = MicrophoneStream(device_id=self.config.device_id, on_level=_on_level)
+                self._audio_stream = MicrophoneStream(
+                    device_id=self.config.device_id,
+                    on_meter=_on_meter,
+                    channel_mode=self.config.input_channel,
+                    gain_db=self.config.input_gain_db,
+                    auto_gain=self.config.auto_gain,
+                )
 
             self._audio_stream.start()
             self._listening = True
@@ -1232,6 +1504,7 @@ class EngineRuntime:
                             text=True,
                             bufsize=1,
                         )
+                        _drain_stderr_async(self._remote_apple_proc, "remote-apple-asr")
                         self._remote_asr_thread = threading.Thread(
                             target=self._remote_apple_asr_loop,
                             daemon=True,
@@ -1248,6 +1521,7 @@ class EngineRuntime:
                             )
                         else:
                             self._remote_audio_stream = WindowsLoopbackStream(
+                                loopback_device_id=self.config.loopback_device_id,
                                 on_error=lambda m: self.broadcast_threadsafe({"type": "error", "data": {"message": m}}),
                             )
                         self._remote_audio_stream.start()
@@ -1303,17 +1577,85 @@ class EngineRuntime:
 
     def shutdown(self) -> None:
         self.stop_session()
-        if self._hymt2 is not None:
-            self._hymt2.stop()
+        # Cancel any active batch file translation
+        if self._file_job_cancel is not None:
+            try:
+                self._file_job_cancel.set()
+            except Exception:
+                pass
+        # Stop audience fan-out worker cleanly
+        self._fanout_stop.set()
+        try:
+            self._fanout_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._fanout_thread is not None and self._fanout_thread.is_alive():
+            self._fanout_thread.join(timeout=1.5)
+        self._fanout_thread = None
+
+        with self._model_lock:
+            if self._hymt2 is not None:
+                try:
+                    self._hymt2.stop()
+                    getattr(self._hymt2, "close", lambda: None)()
+                except Exception:
+                    pass
+                self._hymt2 = None
+            for client_obj in (
+                self._fast_online,
+                self._google_cloud,
+                self._azure_mt,
+                self._gemini_mt,
+                self._llm,
+            ):
+                if client_obj is not None:
+                    try:
+                        getattr(client_obj, "close", lambda: None)()
+                    except Exception:
+                        pass
+            self._google_cloud = None
+            self._azure_mt = None
+            self._gemini_mt = None
+            self._llm = None
+            self._pass2_refiner = None
+            self._en_pass2_refiner = None
+            self._asr_viet = None
+            self._asr_zf_vi = None
+            self._asr_zf_en = None
 
     def update_config(self, req: UpdateConfigRequest) -> dict[str, Any]:
         need_restart = False
+        if req.device_id is not None and req.device_id != self.config.device_id:
+            self.config.device_id = req.device_id
+            if self.config.audio_source in ("mic", "dual", "mix"):
+                need_restart = True
+        if req.loopback_device_id is not None and req.loopback_device_id != self.config.loopback_device_id:
+            self.config.loopback_device_id = req.loopback_device_id
+            if self.config.audio_source in ("system", "dual", "mix"):
+                need_restart = True
         if req.source_lang is not None and req.source_lang != self.config.source_lang:
             self.config.source_lang = req.source_lang
             need_restart = True
         if req.audio_source is not None and req.audio_source != self.config.audio_source:
             self.config.audio_source = req.audio_source
             need_restart = True
+        if req.input_channel is not None and req.input_channel in ("mix", "left", "right"):
+            prev_ch = self.config.input_channel
+            self.config.input_channel = req.input_channel
+            # Switching between mono ("mix") and discrete stereo ("left"/"right") may need 2ch reopen if currently 1ch
+            if self._audio_stream is not None and hasattr(self._audio_stream, "set_conditioning"):
+                self._audio_stream.set_conditioning(channel_mode=self.config.input_channel)
+                src_ch = getattr(self._audio_stream, "_src_channels", 2)
+                if prev_ch != req.input_channel and req.input_channel in ("left", "right") and src_ch < 2:
+                    need_restart = True
+        if req.input_gain_db is not None:
+            self.config.input_gain_db = max(-12.0, min(24.0, float(req.input_gain_db)))
+            if self._audio_stream is not None and hasattr(self._audio_stream, "set_conditioning"):
+                self._audio_stream.set_conditioning(gain_db=self.config.input_gain_db)
+        if req.auto_gain is not None:
+            self.config.auto_gain = bool(req.auto_gain)
+            if self._audio_stream is not None and hasattr(self._audio_stream, "set_conditioning"):
+                self._audio_stream.set_conditioning(auto_gain=self.config.auto_gain)
         if req.asr_engine is not None and req.asr_engine != self.config.asr_engine:
             self.config.asr_engine = req.asr_engine
             need_restart = True
@@ -1357,8 +1699,17 @@ class EngineRuntime:
         self._recent_context.clear()
         self.broadcast_threadsafe({"type": "history", "data": []})
 
+    def _get_capitalized_glossary_words(self) -> set[str]:
+        """Collect lowercased leading tokens of capitalized glossary terms/proper nouns to preserve casing."""
+        words: set[str] = set()
+        for phrase in self._get_glossary_hotwords():
+            toks = phrase.strip().split()
+            if toks and toks[0] and toks[0][0].isupper():
+                words.add(toks[0].lower())
+        return words
+
     @classmethod
-    def _join_fragments(cls, parts: list[str]) -> str:
+    def _join_fragments(cls, parts: list[str], preserve_case: Optional[set[str]] = None) -> str:
         valid_single = {"i", "a", "à", "ừ", "ờ", "ý", "ở", "ồ", "ô", "ơ", "ư"}
         clean_parts: list[str] = []
         for p in parts:
@@ -1377,13 +1728,17 @@ class EngineRuntime:
             if merged.endswith((".", "!", "?", "…")):
                 merged = f"{merged} {nxt}"
             else:
-                first_word = nxt.split()[0]
-                if (
-                    len(nxt) > 1
-                    and nxt[0].isupper()
-                    and not first_word.isupper()
-                    and first_word != "I"
-                ):
+                words_nxt = nxt.split()
+                first_word = words_nxt[0]
+                first_clean = first_word.strip(".,!?;:\"'()[]")
+                is_proper_or_acronym = (
+                    first_clean.isupper()
+                    or first_clean in {"I", "I'm", "I've", "I'll", "I'd"}
+                    or any(ch.isupper() for ch in first_clean[1:])
+                    or (len(words_nxt) >= 2 and bool(words_nxt[1]) and words_nxt[1][0].isupper())
+                    or (bool(preserve_case) and first_clean.lower() in preserve_case)
+                )
+                if len(nxt) > 1 and nxt[0].isupper() and not is_proper_or_acronym:
                     nxt_norm = nxt[0].lower() + nxt[1:]
                 else:
                     nxt_norm = nxt
@@ -1533,7 +1888,7 @@ class EngineRuntime:
     def _flush_paragraph_locked(self, allow_carry_over: bool = False) -> None:
         if not self._para_parts:
             return
-        raw_text = self._join_fragments(self._para_parts)
+        raw_text = self._join_fragments(self._para_parts, preserve_case=self._get_capitalized_glossary_words())
         src_lang = self._para_src_lang or self.config.source_lang
         tgt_lang = self._para_tgt_lang or self.config.target_lang
         asr_ms = self._para_last_asr_ms
@@ -1656,7 +2011,9 @@ class EngineRuntime:
             if out.kind == "partial":
                 self._para_has_active_partial = True
                 parts_snapshot = [*self._para_parts, out.text]
-                combined = self.glossary.apply_asr_fixes(self._join_fragments(parts_snapshot))
+                combined = self.glossary.apply_asr_fixes(
+                    self._join_fragments(parts_snapshot, preserve_case=self._get_capitalized_glossary_words())
+                )
                 seg_id = self._current_segment_id
                 self.broadcast_threadsafe(
                     {
@@ -1667,6 +2024,7 @@ class EngineRuntime:
                             "source_lang": src_lang,
                             "target_lang": tgt_lang,
                             "asr_ms": out.latency_ms,
+                            "speaker": "self" if cfg.audio_source == "dual" else "",
                         },
                     }
                 )
@@ -1685,7 +2043,7 @@ class EngineRuntime:
             if out.kind == "final":
                 self._para_has_active_partial = False
                 self._para_parts.append(out.text)
-                combined = self._join_fragments(self._para_parts)
+                combined = self._join_fragments(self._para_parts, preserve_case=self._get_capitalized_glossary_words())
                 wc = len(combined.split())
                 min_words, target_words, _ = self._paragraph_thresholds()
 
@@ -1821,7 +2179,9 @@ class EngineRuntime:
     def _remote_flush_locked(self) -> None:
         if not self._remote_parts:
             return
-        full_text = self.glossary.apply_asr_fixes(self._join_fragments(self._remote_parts))
+        full_text = self.glossary.apply_asr_fixes(
+            self._join_fragments(self._remote_parts, preserve_case=self._get_capitalized_glossary_words())
+        )
         pcm_snap: Optional[np.ndarray] = None
         if self._remote_pcm_chunks:
             try:
@@ -1830,6 +2190,7 @@ class EngineRuntime:
                 pcm_snap = None
         self._remote_parts.clear()
         self._remote_pcm_chunks.clear()
+        self._remote_has_active_partial = False
         self._remote_last_speech_ts = 0.0
         seg_id = self._remote_seg_id or uuid.uuid4().hex[:10]
         self._remote_seg_id = uuid.uuid4().hex[:10]
@@ -1872,7 +2233,13 @@ class EngineRuntime:
                 self._remote_seg_id = uuid.uuid4().hex[:10]
 
             if out.kind == "partial":
-                combined = self.glossary.apply_asr_fixes(self._join_fragments([*self._remote_parts, out.text]))
+                self._remote_has_active_partial = True
+                combined = self.glossary.apply_asr_fixes(
+                    self._join_fragments(
+                        [*self._remote_parts, out.text],
+                        preserve_case=self._get_capitalized_glossary_words(),
+                    )
+                )
                 self.broadcast_threadsafe(
                     {
                         "type": "partial",
@@ -1889,15 +2256,31 @@ class EngineRuntime:
                 return
 
             if out.kind == "final":
+                self._remote_has_active_partial = False
                 self._remote_parts.append(out.text)
-                combined = self._join_fragments(self._remote_parts)
+                combined = self._join_fragments(
+                    self._remote_parts,
+                    preserve_case=self._get_capitalized_glossary_words(),
+                )
                 wc = len(combined.split())
                 min_words, target_words, _ = self._paragraph_thresholds()
                 if wc >= target_words or (wc >= min_words and not self._ends_with_connector(combined)):
                     self._remote_flush_locked()
 
+    def _append_remote_pcm(self, chunk: np.ndarray) -> None:
+        with self._remote_lock:
+            self._remote_pcm_chunks.append(chunk)
+            if not self._remote_parts and not self._remote_has_active_partial:
+                # Keep only ~0.8s lead-in before speech starts so Pass-2 doesn't scan dead silence
+                if len(self._remote_pcm_chunks) > 8:
+                    self._remote_pcm_chunks = self._remote_pcm_chunks[-8:]
+            elif len(self._remote_pcm_chunks) > 240:
+                self._remote_pcm_chunks = self._remote_pcm_chunks[-240:]
+
     def _remote_audio_loop(self, asr) -> None:
         silent_chunks = 0
+        gated = False
+        preroll: deque[np.ndarray] = deque(maxlen=2)
         try:
             while not self._stop_event.is_set() and self._remote_audio_stream is not None:
                 chunk = self._remote_audio_stream.read_chunk(timeout=0.15)
@@ -1910,12 +2293,18 @@ class EngineRuntime:
                     silent_chunks = 0
                 if silent_chunks > 25:
                     with self._remote_lock:
-                        if not self._remote_parts:
-                            continue
-                with self._remote_lock:
-                    self._remote_pcm_chunks.append(chunk)
-                    if len(self._remote_pcm_chunks) > 200:
-                        self._remote_pcm_chunks = self._remote_pcm_chunks[-200:]
+                        can_gate = (not self._remote_parts) and (not self._remote_has_active_partial)
+                    if can_gate:
+                        gated = True
+                        preroll.append(chunk)
+                        continue
+                if gated:
+                    gated = False
+                    while preroll:
+                        pre = preroll.popleft()
+                        self._append_remote_pcm(pre)
+                        self._remote_enqueue_asr_output(asr.accept_pcm(pre))
+                self._append_remote_pcm(chunk)
                 out = asr.accept_pcm(chunk)
                 self._remote_enqueue_asr_output(out)
         except Exception as exc:
@@ -1953,8 +2342,11 @@ class EngineRuntime:
                     self._remote_enqueue_asr_output(
                         ASROutput("final", str(ev.get("text", "")), float(ev.get("asr_ms", 25.0)), "apple-ane")
                     )
-        except Exception:
-            pass
+                elif kind == "error":
+                    self.broadcast_threadsafe({"type": "error", "data": {"message": str(ev.get("message", ""))}})
+        except Exception as exc:
+            if not self._stop_event.is_set():
+                self.broadcast_threadsafe({"type": "error", "data": {"message": f"Apple ASR đối tác lỗi: {exc}"}})
         finally:
             with self._remote_lock:
                 self._remote_flush_locked()
@@ -1983,7 +2375,8 @@ class EngineRuntime:
                 # - Vietnamese: VietASRBatchRefiner (punctuation + ITN) with Glossary-Keyword Preservation Guard!
                 # - English: Moonshine-v2-Base (106 MB, 44x RT, 1.82% TED WER + full punctuation!)
                 if cfg.pass2_refine and item.get("pcm") is not None:
-                    if item["source_lang"] == "vie_Latn" and self._active_asr_label == "zipformer-30m-streaming":
+                    asr_label = self._remote_asr_label if speaker == "remote" else self._active_asr_label
+                    if item["source_lang"] == "vie_Latn" and asr_label == "zipformer-30m-streaming":
                         try:
                             p1_fixed = self.glossary.apply_asr_fixes(source_text)
                             refiner = self.ensure_pass2_refiner()
@@ -2225,7 +2618,7 @@ async def lifespan(_app: FastAPI):
     runtime.shutdown()
 
 
-app = FastAPI(title="VOICERECORE Local Engine", version="0.7.0", lifespan=lifespan)
+app = FastAPI(title="VOICERECORE Local Engine", version="0.8.1", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -2235,6 +2628,27 @@ app.add_middleware(
 )
 
 
+@app.post("/api/shutdown")
+async def api_shutdown():
+    """Graceful sidecar shutdown called by Tauri on app exit or before Windows/macOS auto-update."""
+    def _do_exit() -> None:
+        try:
+            runtime.shutdown()
+        except Exception:
+            pass
+        srv = runtime._uvicorn_server
+        if srv is not None:
+            srv.should_exit = True
+        else:
+            try:
+                os.kill(os.getpid(), signal.SIGTERM)
+            except Exception:
+                os._exit(0)
+
+    threading.Timer(0.05, _do_exit).start()
+    return {"ok": True, "shutting_down": True}
+
+
 @app.get("/api/health")
 def api_health():
     return {"ok": True, **runtime.get_status_payload()}
@@ -2242,7 +2656,10 @@ def api_health():
 
 @app.get("/api/devices")
 def api_devices():
-    return {"devices": list_input_devices()}
+    return {
+        "devices": list_input_devices(),
+        "loopback_devices": list_output_loopback_devices(),
+    }
 
 
 @app.get("/api/languages")
@@ -2276,8 +2693,8 @@ def api_download_model(model_id: str):
         "envit5",
     ):
         raise HTTPException(status_code=400, detail="Unsupported model_id")
-    runtime.start_download(model_id)
-    return {"ok": True, "model_id": model_id}
+    started = runtime.start_download(model_id)
+    return {"ok": True, "model_id": model_id, "started": started}
 
 
 @app.delete("/api/models/{model_id}")
@@ -2416,7 +2833,7 @@ def api_audience_info():
 @app.post("/api/session/summarize")
 def api_session_summarize():
     return summarize_meeting_entries(
-        runtime._history,
+        list(runtime._history),
         runtime.config.source_lang,
         runtime.config.target_lang,
         translate_fn=lambda txt, s, t: runtime.translate_text(txt, s, t, mt_mode=runtime.config.mt_mode, beam_size=1),
@@ -2445,11 +2862,20 @@ async def api_files_translate(
     mt_mode: str = Form("auto-offline"),
     job_id: str = Form(""),
 ):
+    with runtime._file_job_lock:
+        if runtime._file_job_busy:
+            raise HTTPException(
+                status_code=409,
+                detail="Đang có một tác vụ dịch file khác chạy. Vui lòng đợi xong hoặc bấm Hủy trước.",
+            )
+        runtime._file_job_busy = True
+
     active_job_id = job_id.strip() or uuid.uuid4().hex[:10]
     orig_name = file.filename or "audio.wav"
     suffix = Path(orig_name).suffix or ".wav"
     cancel_ev = threading.Event()
     runtime._file_job_cancel = cancel_ev
+    tmp_path: Optional[Path] = None
 
     def _on_file_progress(evt: dict[str, Any]) -> None:
         runtime._file_job_progress = evt
@@ -2474,11 +2900,17 @@ async def api_files_translate(
         }
     )
 
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
-        tmp_path = Path(tf.name)
-        content = await file.read()
-        tf.write(content)
     try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+            tmp_path = Path(tf.name)
+            while True:
+                if cancel_ev.is_set():
+                    raise FileTranslateCancelled("Đã hủy dịch file.")
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tf.write(chunk)
+
         result = await asyncio.to_thread(
             translate_media_file,
             tmp_path,
@@ -2517,7 +2949,10 @@ async def api_files_translate(
     finally:
         if runtime._file_job_cancel is cancel_ev:
             runtime._file_job_cancel = None
-        tmp_path.unlink(missing_ok=True)
+        with runtime._file_job_lock:
+            runtime._file_job_busy = False
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 @app.post("/api/demo/simulate")
@@ -2561,7 +2996,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18765)
     args = parser.parse_args()
     runtime.server_port = args.port
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    config = uvicorn.Config(app, host=args.host, port=args.port, log_level="warning")
+    server = uvicorn.Server(config)
+    runtime._uvicorn_server = server
+    server.run()
 
 
 if __name__ == "__main__":

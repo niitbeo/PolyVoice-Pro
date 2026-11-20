@@ -2,7 +2,9 @@
 Real-Time Auto-Save Meeting Logger (.TXT and .SRT) for multi-hour seminars & meetings.
 
 Appends and flushes every committed paragraph directly to disk under
-`~/Documents/VOICERECORE_Logs/` so zero data is ever lost during 2–3+ hour sessions.
+`~/Documents/VOICERECORE_Logs/` (with safe fallback if Documents is blocked by
+Windows Controlled Folder Access or macOS TCC) so zero data is ever lost during
+2–3+ hour sessions.
 """
 
 from __future__ import annotations
@@ -10,17 +12,56 @@ from __future__ import annotations
 import os
 import platform
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Optional
 
-DEFAULT_LOGS_DIR = Path(
-    os.environ.get(
-        "VOICERECORE_LOG_DIR",
-        Path.home() / "Documents" / "VOICERECORE_Logs",
-    )
-)
+
+def _windows_documents_dir() -> Path:
+    """Resolve real Windows Documents folder (handles OneDrive redirection)."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", wintypes.DWORD),
+                    ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD),
+                    ("Data4", ctypes.c_ubyte * 8),
+                ]
+
+            # FOLDERID_Documents = {FDD39AD0-238F-46AF-ADB4-6C85480369C7}
+            fid = _GUID(
+                0xFDD39AD0,
+                0x238F,
+                0x46AF,
+                (ctypes.c_ubyte * 8)(0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7),
+            )
+            p_path = ctypes.c_wchar_p()
+            hr = ctypes.windll.shell32.SHGetKnownFolderPath(  # type: ignore[attr-defined]
+                ctypes.byref(fid), 0, None, ctypes.byref(p_path)
+            )
+            if hr == 0 and p_path.value:
+                resolved = Path(p_path.value)
+                ctypes.windll.ole32.CoTaskMemFree(p_path)  # type: ignore[attr-defined]
+                return resolved
+        except Exception:
+            pass
+    return Path.home() / "Documents"
+
+
+def _resolve_default_logs_dir() -> Path:
+    env_dir = os.environ.get("VOICERECORE_LOG_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return _windows_documents_dir() / "VOICERECORE_Logs"
+
+
+DEFAULT_LOGS_DIR = _resolve_default_logs_dir()
 
 
 def _fmt_srt_time(seconds: float) -> str:
@@ -34,10 +75,24 @@ def _fmt_srt_time(seconds: float) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
 
 
+def _ensure_writable_dir(preferred: Path) -> Path:
+    candidates = [
+        preferred,
+        Path.home() / ".cache" / "voicerecore" / "logs",
+        Path(tempfile.gettempdir()) / "voicerecore_logs",
+    ]
+    for cand in candidates:
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            return cand
+        except OSError:
+            continue
+    return preferred
+
+
 class SessionLogger:
     def __init__(self, logs_dir: Path | None = None) -> None:
-        self.logs_dir = Path(logs_dir or DEFAULT_LOGS_DIR)
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir = _ensure_writable_dir(Path(logs_dir or DEFAULT_LOGS_DIR))
         self._lock = threading.Lock()
         self._txt_path: Optional[Path] = None
         self._srt_path: Optional[Path] = None
@@ -55,6 +110,7 @@ class SessionLogger:
 
     def start_new_session(self, source_lang: str, target_lang: str) -> dict:
         with self._lock:
+            self.logs_dir = _ensure_writable_dir(self.logs_dir)
             stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
             self._txt_path = self.logs_dir / f"meeting_{stamp}.txt"
             self._srt_path = self.logs_dir / f"meeting_{stamp}.srt"
@@ -78,6 +134,22 @@ class SessionLogger:
             self._srt_path.write_text("", encoding="utf-8")
             self._cur_para_offset = self._txt_path.stat().st_size
             return self.get_status_unlocked()
+
+    def _write_txt_inplace(self, payload: bytes) -> None:
+        assert self._txt_path is not None
+        for attempt in range(2):
+            try:
+                with open(self._txt_path, "r+b") as fb:
+                    fb.seek(self._cur_para_offset)
+                    fb.write(payload)
+                    fb.truncate()
+                    fb.flush()
+                return
+            except PermissionError:
+                if attempt == 0:
+                    time.sleep(0.02)
+                else:
+                    raise
 
     def append_entry(self, entry: dict) -> None:
         with self._lock:
@@ -116,11 +188,7 @@ class SessionLogger:
                     f"[{self._cur_para_ts}] {spk_tag}({src_lang}): {merged_src}\n"
                     f"[{self._cur_para_ts}] {spk_tag}({tgt_lang}): {merged_tgt}\n\n"
                 )
-                with open(self._txt_path, "r+b") as fb:
-                    fb.seek(self._cur_para_offset)
-                    fb.write(txt_block.encode("utf-8"))
-                    fb.truncate()
-                    fb.flush()
+                self._write_txt_inplace(txt_block.encode("utf-8"))
             else:
                 self._cur_para_id = para_id
                 self._cur_para_ts = ts
@@ -161,13 +229,13 @@ class SessionLogger:
             return self.get_status_unlocked()
 
     def open_logs_folder(self) -> bool:
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir = _ensure_writable_dir(self.logs_dir)
         sys_name = platform.system()
         try:
             if sys_name == "Darwin":
                 subprocess.Popen(["open", str(self.logs_dir)])
             elif sys_name == "Windows":
-                subprocess.Popen(["explorer", str(self.logs_dir)])
+                os.startfile(str(self.logs_dir))  # type: ignore[attr-defined]
             else:
                 subprocess.Popen(["xdg-open", str(self.logs_dir)])
             return True

@@ -5,6 +5,7 @@ import {
   ArrowUpCircle,
   BookOpen,
   Check,
+  CheckCircle2,
   ChevronDown,
   ChevronUp,
   Clock,
@@ -32,6 +33,7 @@ import {
   Send,
   Settings,
   Settings2,
+  SlidersHorizontal,
   Smartphone,
   Sparkles,
   Sun,
@@ -57,6 +59,7 @@ import {
   FileTranslateProgress,
   FileTranslateResult,
   GlossaryData,
+  InputChannelId,
   LanguageEntry,
   MeetingSummary,
   ModelState,
@@ -77,9 +80,46 @@ import {
   speakOfflineTTS,
 } from "./types";
 
-const APP_VERSION = "0.8.0";
+const APP_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.8.1";
 const GITHUB_REPO = "niitbeo/PolyVoice-Pro";
 const VU_BARS = 18;
+
+const MODEL_DISPLAY_NAMES: Record<string, string> = {
+  "zipformer-30m-streaming": "Nghe Tiếng Việt (+Hotwords)",
+  "zipformer-en-20m": "Nghe Tiếng Anh (Nháp live)",
+  "moonshine-en": "Nghe Tiếng Anh (Moonshine-v2)",
+  envit5: "Dịch Việt ⇄ Anh (EnViT5)",
+  "nllb-600m": "Dịch Lào & 202 NN (NLLB-600M)",
+  "hy-mt2": "Dịch Thái / 38 NN (Hy-MT2)",
+  "nllb-1.3b": "Dịch 202 NN (NLLB-1.3B)",
+  "opus-vi-en": "Dịch Việt → Anh (Opus-MT)",
+  "opus-en-vi": "Dịch Anh → Việt (Opus-MT)",
+};
+
+function applyModelStateUpdate(prev: ModelsStatus | null, prog: ModelState): ModelsStatus | null {
+  if (!prev) return prev;
+  if (prog.model_id === "hy-mt2") return { ...prev, mt_hymt2: prog };
+  if (prog.model_id === "nllb-1.3b") return { ...prev, mt_nllb_13b: prog };
+  if (prog.model_id === "nllb-600m") return { ...prev, mt_nllb_600m: prog };
+  if (prog.model_id === "zipformer-30m-streaming")
+    return { ...prev, asr_zipformer_streaming: prog };
+  if (prog.model_id === "zipformer-en-20m")
+    return { ...prev, asr_zipformer_en_20m: prog };
+  if (prog.model_id === "moonshine-en")
+    return { ...prev, asr_moonshine_en: prog };
+  if (prog.model_id === "opus-vi-en") return { ...prev, mt_opus_vi_en: prog };
+  if (prog.model_id === "opus-en-vi") return { ...prev, mt_opus_en_vi: prog };
+  if (prog.model_id === "envit5") return { ...prev, mt_envit5: prog };
+  return prev;
+}
+
+function stripFileExtension(filename: string): string {
+  return filename.replace(/\.[^./\\]+$/, "") || filename;
+}
+
+function makeFileProgKey(p: FileTranslateProgress): string {
+  return `${p.job_id}|${p.stage}|${p.current_chunk}|${p.percent}|${p.eta_s ?? ""}`;
+}
 
 function compareSemver(a: string, b: string): number {
   const pa = a.replace(/^v/i, "").split(".").map((n) => parseInt(n, 10) || 0);
@@ -129,11 +169,20 @@ export default function App() {
   const [status, setStatus] = useState<EngineStatus | null>(null);
   const [models, setModels] = useState<ModelsStatus | null>(null);
   const [devices, setDevices] = useState<AudioDevice[]>([]);
+  const [loopbackDevices, setLoopbackDevices] = useState<AudioDevice[]>([]);
+  const [refreshingDevices, setRefreshingDevices] = useState(false);
   const [languages, setLanguages] = useState<LanguageEntry[]>([]);
   const [sourceLanguages, setSourceLanguages] = useState<SourceLanguageEntry[]>([]);
 
   const [audioSource, setAudioSource] = useState<AudioSourceId>("mic");
   const [selectedDevice, setSelectedDevice] = useState<number | null>(null);
+  const [selectedLoopback, setSelectedLoopback] = useState<number | null>(null);
+  const [inputChannel, setInputChannel] = useState<InputChannelId>("mix");
+  const [inputGainDb, setInputGainDb] = useState<number>(0);
+  const [autoGain, setAutoGain] = useState<boolean>(false);
+  const [showMixerPanel, setShowMixerPanel] = useState<boolean>(false);
+  const [clipping, setClipping] = useState<boolean>(false);
+  const clipTimerRef = useRef<number | undefined>(undefined);
   const [sourceLang, setSourceLang] = useState("vie_Latn");
   const [targetLang, setTargetLang] = useState("eng_Latn");
   const [langQuery, setLangQuery] = useState("");
@@ -187,7 +236,9 @@ export default function App() {
   const [fileTickNow, setFileTickNow] = useState(() => Date.now());
   const fileStartTsRef = useRef<number>(0);
   const fileProgUpdatedAtRef = useRef<number>(0);
+  const lastFileProgKeyRef = useRef<string>("");
   const [fileResult, setFileResult] = useState<FileTranslateResult | null>(null);
+  const [setupBannerDismissed, setSetupBannerDismissed] = useState(false);
 
   const [summaryOpen, setSummaryOpen] = useState(false);
   const [summaryBusy, setSummaryBusy] = useState(false);
@@ -233,6 +284,8 @@ export default function App() {
   const [history, setHistory] = useState<TranscriptEntry[]>([]);
   const [errorMsg, setErrorMsg] = useState("");
   const [cloudNotice, setCloudNotice] = useState("");
+  const [modelSuccessNotice, setModelSuccessNotice] = useState("");
+  const [justDownloadedIds, setJustDownloadedIds] = useState<Record<string, boolean>>({});
   const [quickText, setQuickText] = useState("");
   const [quickBusy, setQuickBusy] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -241,6 +294,53 @@ export default function App() {
   ttsRef.current = ttsEnabled;
   const listeningRef = useRef(false);
   listeningRef.current = Boolean(status?.listening);
+  const toggleListeningRef = useRef<() => void>(() => {});
+  const copyTimerRef = useRef<number | undefined>(undefined);
+  const llmDebounceRef = useRef<number | undefined>(undefined);
+  const overlayPopupRef = useRef<Window | null>(null);
+  const activeDownloadsRef = useRef<Set<string>>(new Set());
+  const modelSuccessTimerRef = useRef<number | undefined>(undefined);
+  const justDownloadedTimersRef = useRef<Record<string, number>>({});
+
+  const isMacOs = useMemo(() => {
+    if (status?.platform?.os) return status.platform.os === "Darwin";
+    if (typeof navigator !== "undefined") {
+      return /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
+    }
+    return false;
+  }, [status?.platform?.os]);
+
+  const syncStatusToLocalState = useCallback((h: EngineStatus, syncLlmInputs = false) => {
+    setStatus(h);
+    if (h.config?.source_lang) setSourceLang(h.config.source_lang);
+    if (h.config?.target_lang) setTargetLang(h.config.target_lang);
+    if (h.config?.audio_source) setAudioSource(h.config.audio_source);
+    if (h.config?.input_channel) setInputChannel(h.config.input_channel);
+    if (typeof h.config?.input_gain_db === "number") setInputGainDb(h.config.input_gain_db);
+    if (typeof h.config?.auto_gain === "boolean") setAutoGain(h.config.auto_gain);
+    if (typeof h.config?.loopback_device_id === "number") setSelectedLoopback(h.config.loopback_device_id);
+    if (h.config?.asr_engine) setAsrEngine(h.config.asr_engine);
+    if (h.config?.mt_mode) {
+      setMtMode(h.config.mt_mode);
+      if (h.config.mt_mode !== "cloud-api") {
+        setLastOfflineMtMode(h.config.mt_mode);
+      }
+    }
+    if (h.config?.paragraph_mode) setParagraphMode(h.config.paragraph_mode);
+    if (typeof h.config?.pass2_refine === "boolean") setPass2Refine(h.config.pass2_refine);
+    if (typeof h.config?.eco_mode === "boolean") setEcoMode(h.config.eco_mode);
+    if (typeof h.config?.translate_partials === "boolean") {
+      setTranslatePartials(h.config.translate_partials);
+    }
+    if (typeof h.config?.beam_size === "number") setBeamSize(h.config.beam_size);
+    if (syncLlmInputs) {
+      if (typeof h.config?.llm_url === "string") setLlmUrl(h.config.llm_url);
+      if (typeof h.config?.llm_model === "string") setLlmModel(h.config.llm_model);
+    }
+    if (typeof h.logs?.saved_count === "number") setSavedLogCount(h.logs.saved_count);
+    if (typeof h.audience?.connected_count === "number") setAudienceCount(h.audience.connected_count);
+    if (typeof h.cloud_fallback_notice === "string") setCloudNotice(h.cloud_fallback_notice);
+  }, []);
 
   const fetchInitialData = useCallback(async () => {
     try {
@@ -253,29 +353,18 @@ export default function App() {
       ]);
       if (hRes.ok) {
         const h: EngineStatus = await hRes.json();
-        setStatus(h);
-        if (h.config?.source_lang) setSourceLang(h.config.source_lang);
-        if (h.config?.target_lang) setTargetLang(h.config.target_lang);
-        if (h.config?.audio_source) setAudioSource(h.config.audio_source);
-        if (h.config?.asr_engine) setAsrEngine(h.config.asr_engine);
-        if (h.config?.mt_mode) {
-          setMtMode(h.config.mt_mode);
-          if (h.config.mt_mode !== "cloud-api") {
-            setLastOfflineMtMode(h.config.mt_mode);
-          }
-        }
-        if (h.config?.paragraph_mode) setParagraphMode(h.config.paragraph_mode);
-        if (typeof h.config?.pass2_refine === "boolean") setPass2Refine(h.config.pass2_refine);
-        if (typeof h.config?.eco_mode === "boolean") setEcoMode(h.config.eco_mode);
-        if (typeof h.logs?.saved_count === "number") setSavedLogCount(h.logs.saved_count);
-        if (typeof h.audience?.connected_count === "number") setAudienceCount(h.audience.connected_count);
-        if (typeof h.cloud_fallback_notice === "string") setCloudNotice(h.cloud_fallback_notice);
+        syncStatusToLocalState(h, true);
       }
       if (dRes.ok) {
         const d = await dRes.json();
-        setDevices(d.devices || []);
-        const def = (d.devices || []).find((x: AudioDevice) => x.is_default);
-        if (def) setSelectedDevice((prev) => (prev === null ? def.id : prev));
+        const inList: AudioDevice[] = d.devices || [];
+        const lbList: AudioDevice[] = d.loopback_devices || [];
+        setDevices(inList);
+        setLoopbackDevices(lbList);
+        const def = inList.find((x: AudioDevice) => x.is_default);
+        if (def) setSelectedDevice((prev) => (prev === null || !inList.some((i) => i.id === prev) ? def.id : prev));
+        const defLb = lbList.find((x: AudioDevice) => x.is_default);
+        if (defLb) setSelectedLoopback((prev) => (prev === null || !lbList.some((i) => i.id === prev) ? defLb.id : prev));
       }
       if (lRes.ok) {
         const l = await lRes.json();
@@ -292,7 +381,7 @@ export default function App() {
     } catch {
       setConnected(false);
     }
-  }, []);
+  }, [syncStatusToLocalState]);
 
   // Connect WebSocket with auto-reconnect
   useEffect(() => {
@@ -314,23 +403,25 @@ export default function App() {
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type === "status") {
-            setStatus(msg.data);
-            if (typeof msg.data?.logs?.saved_count === "number") {
-              setSavedLogCount(msg.data.logs.saved_count);
-            }
-            if (typeof msg.data?.audience?.connected_count === "number") {
-              setAudienceCount(msg.data.audience.connected_count);
-            }
+            syncStatusToLocalState(msg.data, false);
             fetch(`${ENGINE_HTTP}/api/models/status`)
-              .then((r) => r.json())
-              .then(setModels)
+              .then((r) => (r.ok ? r.json() : null))
+              .then((d) => {
+                if (d) setModels(d);
+              })
               .catch(() => {});
           } else if (msg.type === "level") {
             setLevel(msg.data.level || 0);
+            if (msg.data.clipping) {
+              setClipping(true);
+              if (clipTimerRef.current) clearTimeout(clipTimerRef.current);
+              clipTimerRef.current = window.setTimeout(() => setClipping(false), 1400);
+            }
           } else if (msg.type === "partial") {
             const d = msg.data;
             setPartial((prev) => ({
               id: d.id,
+              speaker: d.speaker,
               source_text: d.source_text,
               translated_text:
                 prev && prev.id === d.id && prev.target_lang === d.target_lang
@@ -357,7 +448,10 @@ export default function App() {
           } else if (msg.type === "final") {
             const entry: TranscriptEntry = msg.data;
             setPartial((prev) => (prev && prev.id === entry.id ? null : prev));
-            setHistory((prev) => [entry, ...prev].slice(0, 200));
+            setHistory((prev) => {
+              if (prev.some((x) => x.id === entry.id)) return prev;
+              return [entry, ...prev].slice(0, 200);
+            });
             if (typeof entry.log_saved_count === "number") {
               setSavedLogCount(entry.log_saved_count);
             }
@@ -367,6 +461,7 @@ export default function App() {
           } else if (msg.type === "history") {
             const list: TranscriptEntry[] = msg.data || [];
             setHistory([...list].reverse());
+            if (list.length === 0) setPartial(null);
           } else if (msg.type === "audience_count") {
             const cnt = Number(msg.data?.connected_count || 0);
             setAudienceCount(cnt);
@@ -381,24 +476,37 @@ export default function App() {
             );
           } else if (msg.type === "model_progress") {
             const prog: ModelState = msg.data;
-            setModels((prev) => {
-              if (!prev) return prev;
-              if (prog.model_id === "hy-mt2") return { ...prev, mt_hymt2: prog };
-              if (prog.model_id === "nllb-1.3b") return { ...prev, mt_nllb_13b: prog };
-              if (prog.model_id === "nllb-600m") return { ...prev, mt_nllb_600m: prog };
-              if (prog.model_id === "zipformer-30m-streaming")
-                return { ...prev, asr_zipformer_streaming: prog };
-              if (prog.model_id === "zipformer-en-20m")
-                return { ...prev, asr_zipformer_en_20m: prog };
-              if (prog.model_id === "moonshine-en")
-                return { ...prev, asr_moonshine_en: prog };
-              if (prog.model_id === "opus-vi-en") return { ...prev, mt_opus_vi_en: prog };
-              if (prog.model_id === "opus-en-vi") return { ...prev, mt_opus_en_vi: prog };
-              if (prog.model_id === "envit5") return { ...prev, mt_envit5: prog };
-              return prev;
-            });
+            if (prog.status === "downloading") {
+              activeDownloadsRef.current.add(prog.model_id);
+            } else if (prog.status === "ready") {
+              if (activeDownloadsRef.current.has(prog.model_id)) {
+                activeDownloadsRef.current.delete(prog.model_id);
+                const label = MODEL_DISPLAY_NAMES[prog.model_id] || prog.model_id;
+                setModelSuccessNotice(`Đã tải xong "${label}" thành công — sẵn sàng sử dụng!`);
+                if (modelSuccessTimerRef.current) clearTimeout(modelSuccessTimerRef.current);
+                modelSuccessTimerRef.current = window.setTimeout(() => {
+                  setModelSuccessNotice("");
+                }, 9000);
+                setJustDownloadedIds((prev) => ({ ...prev, [prog.model_id]: true }));
+                const oldT = justDownloadedTimersRef.current[prog.model_id];
+                if (oldT) clearTimeout(oldT);
+                justDownloadedTimersRef.current[prog.model_id] = window.setTimeout(() => {
+                  setJustDownloadedIds((prev) => {
+                    if (!prev[prog.model_id]) return prev;
+                    const next = { ...prev };
+                    delete next[prog.model_id];
+                    return next;
+                  });
+                  delete justDownloadedTimersRef.current[prog.model_id];
+                }, 9000);
+              }
+            } else if (prog.status === "error") {
+              activeDownloadsRef.current.delete(prog.model_id);
+            }
+            setModels((prev) => applyModelStateUpdate(prev, prog));
           } else if (msg.type === "file_progress") {
             const fp: FileTranslateProgress = msg.data;
+            lastFileProgKeyRef.current = makeFileProgKey(fp);
             fileProgUpdatedAtRef.current = Date.now();
             setFileProgress(fp);
             if (fp.active) {
@@ -435,7 +543,29 @@ export default function App() {
       if (retryTimer) clearTimeout(retryTimer);
       ws?.close();
     };
-  }, [fetchInitialData]);
+  }, [fetchInitialData, syncStatusToLocalState]);
+
+  const handleRefreshDevices = useCallback(async () => {
+    setRefreshingDevices(true);
+    try {
+      const res = await fetch(`${ENGINE_HTTP}/api/devices`);
+      if (res.ok) {
+        const d = await res.json();
+        const inList: AudioDevice[] = d.devices || [];
+        const lbList: AudioDevice[] = d.loopback_devices || [];
+        setDevices(inList);
+        setLoopbackDevices(lbList);
+        const def = inList.find((x: AudioDevice) => x.is_default);
+        if (def) setSelectedDevice((prev) => (prev === null || !inList.some((i) => i.id === prev) ? def.id : prev));
+        const defLb = lbList.find((x: AudioDevice) => x.is_default);
+        if (defLb) setSelectedLoopback((prev) => (prev === null || !lbList.some((i) => i.id === prev) ? defLb.id : prev));
+      }
+    } catch {
+      // ignore
+    } finally {
+      window.setTimeout(() => setRefreshingDevices(false), 260);
+    }
+  }, []);
 
   const startListening = useCallback(async () => {
     setErrorMsg("");
@@ -445,7 +575,11 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           device_id: selectedDevice,
+          loopback_device_id: selectedLoopback,
           audio_source: audioSource,
+          input_channel: inputChannel,
+          input_gain_db: inputGainDb,
+          auto_gain: autoGain,
           source_lang: sourceLang,
           target_lang: targetLang,
           asr_engine: asrEngine,
@@ -468,7 +602,11 @@ export default function App() {
     }
   }, [
     selectedDevice,
+    selectedLoopback,
     audioSource,
+    inputChannel,
+    inputGainDb,
+    autoGain,
     sourceLang,
     targetLang,
     asrEngine,
@@ -497,29 +635,90 @@ export default function App() {
       startListening();
     }
   }, [startListening, stopListening]);
+  toggleListeningRef.current = toggleListening;
 
-  // Listen for Tauri global hotkey & overlay state sync
+  // Listen for Tauri global hotkey & overlay state sync (mounted once with cancellation guard)
   useEffect(() => {
     if (!isTauriEnv()) return;
+    let cancelled = false;
     let unlistenToggle: (() => void) | undefined;
     let unlistenOverlay: (() => void) | undefined;
-    import("@tauri-apps/api/event").then(({ listen }) => {
-      listen("toggle-listening", () => {
-        toggleListening();
-      }).then((fn) => {
-        unlistenToggle = fn;
-      });
-      listen<boolean>("overlay-visibility", (ev) => {
-        setOverlayOpen(Boolean(ev.payload));
-      }).then((fn) => {
-        unlistenOverlay = fn;
-      });
-    });
+    import("@tauri-apps/api/event")
+      .then(({ listen }) => {
+        listen("toggle-listening", () => {
+          toggleListeningRef.current();
+        })
+          .then((fn) => {
+            if (cancelled) fn();
+            else unlistenToggle = fn;
+          })
+          .catch(() => {});
+        listen<boolean>("overlay-visibility", (ev) => {
+          setOverlayOpen(Boolean(ev.payload));
+        })
+          .then((fn) => {
+            if (cancelled) fn();
+            else unlistenOverlay = fn;
+          })
+          .catch(() => {});
+      })
+      .catch(() => {});
     return () => {
+      cancelled = true;
       unlistenToggle?.();
       unlistenOverlay?.();
     };
-  }, [toggleListening]);
+  }, []);
+
+  // Keyboard shortcuts: Escape closes open modals (when not busy) + browser Cmd/Ctrl+Shift+Space fallback
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (glossaryOpen) setGlossaryOpen(false);
+        else if (qrOpen) setQrOpen(false);
+        else if (summaryOpen) setSummaryOpen(false);
+        else if (cloudOpen) setCloudOpen(false);
+        else if (fileModalOpen && !fileBusy) setFileModalOpen(false);
+        else if (updateModalOpen && !updateInstalling) setUpdateModalOpen(false);
+        return;
+      }
+      if (
+        !isTauriEnv() &&
+        connected &&
+        e.shiftKey &&
+        e.code === "Space" &&
+        (isMacOs ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey)
+      ) {
+        e.preventDefault();
+        toggleListeningRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    glossaryOpen,
+    qrOpen,
+    summaryOpen,
+    cloudOpen,
+    fileModalOpen,
+    fileBusy,
+    updateModalOpen,
+    updateInstalling,
+    connected,
+    isMacOs,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+      if (llmDebounceRef.current) clearTimeout(llmDebounceRef.current);
+      if (modelSuccessTimerRef.current) clearTimeout(modelSuccessTimerRef.current);
+      for (const tid of Object.values(justDownloadedTimersRef.current)) {
+        clearTimeout(tid);
+      }
+      justDownloadedTimersRef.current = {};
+    };
+  }, []);
 
   const hotUpdateConfig = useCallback(async (patch: Record<string, unknown>) => {
     setErrorMsg("");
@@ -538,6 +737,16 @@ export default function App() {
     }
   }, []);
 
+  const scheduleLlmConfigUpdate = useCallback(
+    (patch: Record<string, unknown>) => {
+      if (llmDebounceRef.current) clearTimeout(llmDebounceRef.current);
+      llmDebounceRef.current = window.setTimeout(() => {
+        hotUpdateConfig(patch);
+      }, 400);
+    },
+    [hotUpdateConfig]
+  );
+
   const handleSelectSourceLang = (code: string) => {
     setSourceLang(code);
     // Auto-flip target to Vietnamese if user switches source away from Vietnamese and target was identical
@@ -551,6 +760,14 @@ export default function App() {
   };
 
   const handleSelectTargetLang = (code: string) => {
+    if (code === sourceLang) {
+      const canSwap = sourceLanguages.some((s) => s.code === targetLang && s.code !== code);
+      const nextSrc = canSwap ? targetLang : code === "vie_Latn" ? "eng_Latn" : "vie_Latn";
+      setSourceLang(nextSrc);
+      setTargetLang(code);
+      hotUpdateConfig({ source_lang: nextSrc, target_lang: code });
+      return;
+    }
     setTargetLang(code);
     hotUpdateConfig({ target_lang: code });
   };
@@ -664,12 +881,33 @@ export default function App() {
         setErrorMsg(`Không thể mở Overlay: ${String(e)}`);
       }
     } else {
-      window.open(
+      const existing = overlayPopupRef.current;
+      if (existing && !existing.closed) {
+        existing.close();
+        overlayPopupRef.current = null;
+        setOverlayOpen(false);
+        return;
+      }
+      const win = window.open(
         `${window.location.origin}/#overlay`,
         "voicerecore-overlay",
         "width=1120,height=620,menubar=no,toolbar=no,location=no,status=no"
       );
+      if (!win) {
+        setErrorMsg("Trình duyệt đã chặn cửa sổ bật lên (popup). Hãy cho phép popup để mở Phụ đề nổi.");
+        setOverlayOpen(false);
+        return;
+      }
+      overlayPopupRef.current = win;
       setOverlayOpen(true);
+      try {
+        win.addEventListener("beforeunload", () => {
+          overlayPopupRef.current = null;
+          setOverlayOpen(false);
+        });
+      } catch {
+        // ignore
+      }
     }
   };
 
@@ -712,8 +950,12 @@ export default function App() {
         if (r.ok) {
           const p: FileTranslateProgress = await r.json();
           if (p && p.active) {
-            fileProgUpdatedAtRef.current = Date.now();
-            setFileProgress(p);
+            const key = makeFileProgKey(p);
+            if (key !== lastFileProgKeyRef.current) {
+              lastFileProgKeyRef.current = key;
+              fileProgUpdatedAtRef.current = Date.now();
+              setFileProgress(p);
+            }
           }
         }
       } catch {
@@ -736,7 +978,7 @@ export default function App() {
     setFileCancelling(false);
     setFileResult(null);
     setErrorMsg("");
-    setFileProgress({
+    const initProg: FileTranslateProgress = {
       job_id: jobId,
       filename: file.name,
       active: true,
@@ -751,7 +993,9 @@ export default function App() {
       eta_s: null,
       eta_estimated: true,
       speed_x: 0,
-    });
+    };
+    lastFileProgKeyRef.current = makeFileProgKey(initProg);
+    setFileProgress(initProg);
     try {
       const fd = new FormData();
       fd.append("file", file);
@@ -763,7 +1007,7 @@ export default function App() {
         method: "POST",
         body: fd,
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({ detail: `Lỗi máy chủ (HTTP ${res.status})` }));
       if (!res.ok) {
         setErrorMsg(data.detail || "Không thể dịch file âm thanh/video");
       } else if (data.cancelled) {
@@ -889,12 +1133,23 @@ export default function App() {
         const data: CloudApiStatus = await res.json();
         setCloudStatus(data);
         setCloudKeyInput("");
-        setCloudTestResult({ ok: true, message: "Đã lưu cấu hình API cục bộ an toàn trên máy." });
         if (activateMode) {
+          if (!data.providers[cloudTab]?.has_key) {
+            setCloudTestResult({
+              ok: false,
+              message: "Vui lòng nhập API Key hợp lệ trước khi bật chế độ Cloud API.",
+            });
+            return;
+          }
           setMtMode("cloud-api");
           hotUpdateConfig({ mt_mode: "cloud-api" });
           setCloudOpen(false);
+        } else {
+          setCloudTestResult({ ok: true, message: "Đã lưu cấu hình API cục bộ an toàn trên máy." });
         }
+      } else {
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+        setCloudTestResult({ ok: false, message: `Không thể lưu cấu hình: ${err.detail || res.status}` });
       }
     } catch (e) {
       setCloudTestResult({ ok: false, message: `Lỗi lưu cấu hình: ${String(e)}` });
@@ -916,7 +1171,12 @@ export default function App() {
         setCloudStatus(data);
         setCloudKeyInput("");
         setCloudTestResult({ ok: true, message: "Đã xóa API Key đã lưu." });
+      } else {
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+        setCloudTestResult({ ok: false, message: `Không thể xóa API Key: ${err.detail || res.status}` });
       }
+    } catch (e) {
+      setCloudTestResult({ ok: false, message: `Lỗi xóa API Key: ${String(e)}` });
     } finally {
       setCloudSaving(false);
     }
@@ -1051,10 +1311,18 @@ export default function App() {
     }
     setUpdateInstalling(true);
     setUpdateProgress(0);
-    setUpdateProgressText("Đang chuẩn bị tải bản cập nhật...");
+    setUpdateProgressText("Đang dừng engine cục bộ & chuẩn bị tải bản cập nhật...");
     let totalBytes = 0;
     let downloadedBytes = 0;
     try {
+      if (isTauriEnv()) {
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          await invoke("stop_local_engine").catch(() => {});
+        } catch {
+          // ignore
+        }
+      }
       await updateInfo.nativeUpdate.downloadAndInstall((event) => {
         if (event.event === "Started") {
           totalBytes = event.data?.contentLength || 0;
@@ -1100,14 +1368,80 @@ export default function App() {
       | "envit5"
   ) => {
     setErrorMsg("");
+    activeDownloadsRef.current.add(modelId);
+    setJustDownloadedIds((prev) => {
+      if (!prev[modelId]) return prev;
+      const next = { ...prev };
+      delete next[modelId];
+      return next;
+    });
+    setModels((prev) =>
+      applyModelStateUpdate(prev, {
+        model_id: modelId,
+        status: "downloading",
+        progress: 0,
+        downloaded_mb: 0,
+        total_mb: 0,
+        message: "Đang kết nối máy chủ tải...",
+      })
+    );
     try {
-      await fetch(`${ENGINE_HTTP}/api/models/download/${modelId}`, { method: "POST" });
+      const res = await fetch(`${ENGINE_HTTP}/api/models/download/${modelId}`, { method: "POST" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+        const msg = err.detail || `HTTP ${res.status}`;
+        activeDownloadsRef.current.delete(modelId);
+        setModels((prev) =>
+          applyModelStateUpdate(prev, {
+            model_id: modelId,
+            status: "error",
+            progress: 0,
+            downloaded_mb: 0,
+            total_mb: 0,
+            message: `Lỗi tải: ${msg}`,
+          })
+        );
+        setErrorMsg(`Lỗi tải model ${modelId}: ${msg}`);
+      }
     } catch (e) {
+      activeDownloadsRef.current.delete(modelId);
+      setModels((prev) =>
+        applyModelStateUpdate(prev, {
+          model_id: modelId,
+          status: "error",
+          progress: 0,
+          downloaded_mb: 0,
+          total_mb: 0,
+          message: `Lỗi kết nối: ${String(e)}`,
+        })
+      );
       setErrorMsg(`Lỗi tải model: ${String(e)}`);
     }
   };
 
+  const handleDownloadCoreModels = async () => {
+    setErrorMsg("");
+    setShowAdvanced(true);
+    const missingIds: Array<"zipformer-30m-streaming" | "envit5"> = [];
+    if (models?.asr_zipformer_streaming?.status !== "ready" && models?.asr_zipformer_streaming?.status !== "downloading") {
+      missingIds.push("zipformer-30m-streaming");
+    }
+    if (models?.mt_envit5?.status !== "ready" && models?.mt_envit5?.status !== "downloading") {
+      missingIds.push("envit5");
+    }
+    for (const id of missingIds) {
+      await handleDownloadModel(id);
+    }
+  };
+
   const handleDeleteModel = async (modelId: "hy-mt2" | "moonshine-en" | "zipformer-en-20m" | "nllb-600m") => {
+    if (
+      modelId === "hy-mt2" &&
+      typeof window !== "undefined" &&
+      !window.confirm("Xóa mô hình Hy-MT2 (~1.1 GB) khỏi ổ cứng? Bạn có thể tải lại bất cứ lúc nào.")
+    ) {
+      return;
+    }
     setErrorMsg("");
     try {
       const res = await fetch(`${ENGINE_HTTP}/api/models/${modelId}`, { method: "DELETE" });
@@ -1182,10 +1516,37 @@ export default function App() {
     }
   };
 
-  const handleCopy = (id: string, text: string) => {
-    navigator.clipboard.writeText(text);
+  const handleCopy = async (id: string, text: string) => {
+    let ok = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      }
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch {
+        ok = false;
+      }
+    }
+    if (!ok) {
+      setErrorMsg("Không thể sao chép vào bộ nhớ tạm trên trình duyệt này.");
+      return;
+    }
     setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 1300);
+    if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+    copyTimerRef.current = window.setTimeout(() => setCopiedId(null), 1300);
   };
 
   const handleExport = (format: "txt" | "srt") => {
@@ -1328,10 +1689,12 @@ export default function App() {
               title={`Engine đang chạy: ${status?.active_asr_label || "auto"}`}
             >
               <span className="dot pulse" />
-              {audioSource === "dual"
+              {audioSource === "mix"
+                ? "Gộp hội trường"
+                : audioSource === "dual"
                 ? "Họp 2 chiều"
                 : audioSource === "system"
-                ? "Thu âm máy tính"
+                ? "Âm thanh máy"
                 : "Đang lắng nghe"}
             </span>
           ) : (
@@ -1458,9 +1821,9 @@ export default function App() {
               <button
                 className={`seg-btn ${audioSource === "mic" ? "active" : ""}`}
                 onClick={() => handleAudioSourceChange("mic")}
-                title="Thu giọng nói từ Micro"
+                title="Thu giọng nói từ Micro, Amply, Bàn Mixer hoặc USB Soundcard"
               >
-                <Mic size={12} /> Micro
+                <Mic size={12} /> Micro/Mixer
               </button>
               <button
                 className={`seg-btn ${audioSource === "system" ? "active" : ""}`}
@@ -1468,42 +1831,78 @@ export default function App() {
                 disabled={!(status?.system_audio_ready ?? status?.mac_helper_ready)}
                 title={
                   (status?.system_audio_ready ?? status?.mac_helper_ready)
-                    ? "Thu trực tiếp âm thanh YouTube / Zoom / Meet (macOS ScreenCaptureKit & Windows WASAPI Loopback)"
+                    ? "Thu trực tiếp âm thanh máy tính: YouTube / Zoom / Meet / Livestream (macOS ScreenCaptureKit & Windows WASAPI Loopback)"
                     : "Cần macOS ScreenCaptureKit hoặc Windows WASAPI Loopback / Stereo Mix"
                 }
               >
-                <MonitorSpeaker size={12} /> YouTube
+                <MonitorSpeaker size={12} /> Âm thanh máy
               </button>
               <button
-                className={`seg-btn ${audioSource === "dual" ? "active" : ""}`}
-                onClick={() => handleAudioSourceChange("dual")}
+                className={`seg-btn ${audioSource === "dual" || audioSource === "mix" ? "active" : ""}`}
+                onClick={() => {
+                  if (audioSource !== "dual" && audioSource !== "mix") {
+                    handleAudioSourceChange("dual");
+                  }
+                }}
                 disabled={!(status?.system_audio_ready ?? status?.mac_helper_ready)}
-                title="Thu đồng thời Micro [Bạn] (Nói → Dịch) và Loa Zoom/Meet [Đối tác] (Dịch ngược lại) trên cả macOS & Windows!"
+                title="Kết hợp đồng thời Micro/Mixer và Âm thanh máy (Họp 2 chiều A⇄B hoặc Gộp hội trường A→B)"
               >
-                <Headphones size={12} /> 2 Chiều
+                <Headphones size={12} /> 2 Nguồn
               </button>
             </div>
 
-            <div className="vu-row" aria-label="Âm lượng đầu vào">
-              {Array.from({ length: VU_BARS }).map((_, idx) => {
-                const isLit = idx < litBars;
-                const isPeak = isLit && idx >= VU_BARS - 3;
-                return (
-                  <div
-                    key={idx}
-                    className={`vu-bar ${isPeak ? "peak" : isLit ? "lit" : ""}`}
-                  />
-                );
-              })}
+            {(audioSource === "dual" || audioSource === "mix") && (
+              <div className="sub-segmented" role="group" aria-label="Chế độ kết hợp 2 nguồn">
+                <button
+                  className={`sub-seg-btn ${audioSource === "dual" ? "active" : ""}`}
+                  onClick={() => handleAudioSourceChange("dual")}
+                  title="Micro dịch xuôi (A→B), Loa Zoom/Meet dịch ngược (B→A)"
+                >
+                  Đàm thoại 2 chiều (A⇄B)
+                </button>
+                <button
+                  className={`sub-seg-btn ${audioSource === "mix" ? "active" : ""}`}
+                  onClick={() => handleAudioSourceChange("mix")}
+                  title="Gộp tiếng Micro/Mixer + Video/Zoom trên máy vào chung 1 luồng dịch xuôi (A→B)"
+                >
+                  Gộp hội trường (A→B)
+                </button>
+              </div>
+            )}
+
+            <div className="vu-wrap">
+              <div className="vu-row" aria-label="Âm lượng đầu vào">
+                {Array.from({ length: VU_BARS }).map((_, idx) => {
+                  const isLit = idx < litBars;
+                  const isPeak = isLit && idx >= VU_BARS - 3;
+                  return (
+                    <div
+                      key={idx}
+                      className={`vu-bar ${isPeak ? "peak" : isLit ? "lit" : ""}`}
+                    />
+                  );
+                })}
+              </div>
+              {clipping && (
+                <div className="clip-alert">
+                  <AlertTriangle size={11} /> Quá tải tiếng (Clip) — hãy giảm Gain hoặc bật Auto-Gain
+                </div>
+              )}
             </div>
 
-            {audioSource !== "system" && (
+            {audioSource !== "system" ? (
               <div className="row">
                 <select
                   className="select"
                   value={selectedDevice ?? ""}
-                  onChange={(e) => setSelectedDevice(e.target.value ? Number(e.target.value) : null)}
-                  disabled={status?.listening}
+                  onChange={(e) => {
+                    const id = e.target.value ? Number(e.target.value) : null;
+                    setSelectedDevice(id);
+                    if (status?.listening && id !== null) {
+                      hotUpdateConfig({ device_id: id });
+                    }
+                  }}
+                  title="Chọn Micro, Line-In, USB Soundcard hoặc Bàn Mixer"
                 >
                   {devices.length === 0 && <option value="">Micro mặc định hệ thống</option>}
                   {devices.map((d) => (
@@ -1513,16 +1912,169 @@ export default function App() {
                     </option>
                   ))}
                 </select>
-                <button className="btn sm icon-only" onClick={fetchInitialData} title="Làm mới danh sách micro">
-                  <RefreshCw size={12.5} />
+                <button
+                  className="btn sm icon-only"
+                  onClick={handleRefreshDevices}
+                  title="Làm mới danh sách thiết bị âm thanh cắm nóng"
+                >
+                  <RefreshCw size={12.5} className={refreshingDevices ? "spin" : ""} />
                 </button>
+                <button
+                  className={`btn sm icon-only ${
+                    showMixerPanel || inputGainDb !== 0 || autoGain || inputChannel !== "mix"
+                      ? "info-active"
+                      : ""
+                  }`}
+                  onClick={() => setShowMixerPanel((v) => !v)}
+                  title="Chỉnh Gain dB, Auto-Gain chống vỡ tiếng & chọn kênh Trái/Phải cho Mixer/Soundcard"
+                >
+                  <SlidersHorizontal size={12.5} />
+                </button>
+              </div>
+            ) : (
+              <div className="row">
+                {!isMacOs && loopbackDevices.length > 0 ? (
+                  <select
+                    className="select"
+                    value={selectedLoopback ?? ""}
+                    onChange={(e) => {
+                      const id = e.target.value ? Number(e.target.value) : null;
+                      setSelectedLoopback(id);
+                      if (status?.listening && id !== null) {
+                        hotUpdateConfig({ loopback_device_id: id });
+                      }
+                    }}
+                    title="Chọn thiết bị Loa / Cổng âm thanh Windows cần bắt tiếng (WASAPI Loopback)"
+                  >
+                    {loopbackDevices.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.is_default ? "★ " : ""}
+                        {d.name}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <div className="sys-audio-chip">
+                    <MonitorSpeaker size={12} />
+                    <span>{isMacOs ? "ScreenCaptureKit (Toàn máy)" : "WASAPI Loopback mặc định"}</span>
+                  </div>
+                )}
+                <button
+                  className="btn sm icon-only"
+                  onClick={handleRefreshDevices}
+                  title="Làm mới danh sách thiết bị âm thanh"
+                >
+                  <RefreshCw size={12.5} className={refreshingDevices ? "spin" : ""} />
+                </button>
+                <button
+                  className={`btn sm icon-only ${
+                    showMixerPanel || inputGainDb !== 0 || autoGain ? "info-active" : ""
+                  }`}
+                  onClick={() => setShowMixerPanel((v) => !v)}
+                  title="Chỉnh Gain dB & Auto-Gain cho âm thanh hệ thống"
+                >
+                  <SlidersHorizontal size={12.5} />
+                </button>
+              </div>
+            )}
+
+            {!isMacOs && (audioSource === "dual" || audioSource === "mix") && loopbackDevices.length > 0 && (
+              <div className="row">
+                <select
+                  className="select"
+                  value={selectedLoopback ?? ""}
+                  onChange={(e) => {
+                    const id = e.target.value ? Number(e.target.value) : null;
+                    setSelectedLoopback(id);
+                    if (status?.listening && id !== null) {
+                      hotUpdateConfig({ loopback_device_id: id });
+                    }
+                  }}
+                  title="Chọn loa Windows để bắt âm thanh hệ thống (WASAPI Loopback)"
+                >
+                  {loopbackDevices.map((d) => (
+                    <option key={d.id} value={d.id}>
+                      Loa: {d.is_default ? "★ " : ""}
+                      {d.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {showMixerPanel && (
+              <div className="mixer-panel">
+                <div className="mixer-row">
+                  <span className="mixer-label">Gain</span>
+                  <input
+                    className="mixer-slider"
+                    type="range"
+                    min={-12}
+                    max={24}
+                    step={1}
+                    value={inputGainDb}
+                    onChange={(e) => {
+                      const val = Number(e.target.value);
+                      setInputGainDb(val);
+                      hotUpdateConfig({ input_gain_db: val });
+                    }}
+                  />
+                  <button
+                    className="mixer-db-tag"
+                    onClick={() => {
+                      setInputGainDb(0);
+                      hotUpdateConfig({ input_gain_db: 0 });
+                    }}
+                    title="Bấm để đặt lại 0 dB"
+                  >
+                    {inputGainDb > 0 ? `+${inputGainDb}` : inputGainDb} dB
+                  </button>
+                  <button
+                    className={`btn sm ${autoGain ? "info-active" : ""}`}
+                    style={{ padding: "3px 7px", fontSize: 10.5 }}
+                    onClick={() => {
+                      const next = !autoGain;
+                      setAutoGain(next);
+                      hotUpdateConfig({ auto_gain: next });
+                    }}
+                    title="Tự cân bằng âm lượng (AGC + chống vỡ tiếng Limiter) cho Amply/Mixer hội trường"
+                  >
+                    Auto
+                  </button>
+                </div>
+
+                {audioSource !== "system" && (
+                  <div className="mixer-row">
+                    <span className="mixer-label">Kênh</span>
+                    <div className="sub-segmented" style={{ flex: 1 }}>
+                      {(
+                        [
+                          ["mix", "L+R (Trộn)"],
+                          ["left", "Trái (Ch 1)"],
+                          ["right", "Phải (Ch 2)"],
+                        ] as const
+                      ).map(([chId, lbl]) => (
+                        <button
+                          key={chId}
+                          className={`sub-seg-btn ${inputChannel === chId ? "active" : ""}`}
+                          onClick={() => {
+                            setInputChannel(chId);
+                            hotUpdateConfig({ input_channel: chId });
+                          }}
+                        >
+                          {lbl}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
             <div className="hint">
               <span>Phím tắt bật/tắt:</span>
               <span>
-                <kbd>⌘/Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd>
+                <kbd>{isMacOs ? "⌘" : "Ctrl"}</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd>
               </span>
             </div>
           </div>
@@ -1836,7 +2388,12 @@ export default function App() {
                 <Settings2 size={12.5} /> Mô hình Offline
               </span>
               <span className="row" style={{ gap: 4, textTransform: "none", letterSpacing: 0 }}>
-                <span style={{ color: "var(--green-text)", fontWeight: 600 }}>
+                <span
+                  style={{
+                    color: readyCoreCount === 0 ? "var(--amber)" : "var(--green-text)",
+                    fontWeight: 600,
+                  }}
+                >
                   {readyCoreCount}/{coreModelRows.length} cốt lõi
                 </span>
                 {showAdvanced ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
@@ -1883,8 +2440,9 @@ export default function App() {
                       className="input"
                       value={llmUrl}
                       onChange={(e) => {
-                        setLlmUrl(e.target.value);
-                        hotUpdateConfig({ llm_url: e.target.value });
+                        const val = e.target.value;
+                        setLlmUrl(val);
+                        scheduleLlmConfigUpdate({ llm_url: val });
                       }}
                       placeholder="http://127.0.0.1:11434/v1"
                     />
@@ -1892,8 +2450,9 @@ export default function App() {
                       className="input"
                       value={llmModel}
                       onChange={(e) => {
-                        setLlmModel(e.target.value);
-                        hotUpdateConfig({ llm_model: e.target.value });
+                        const val = e.target.value;
+                        setLlmModel(val);
+                        scheduleLlmConfigUpdate({ llm_model: val });
                       }}
                       placeholder="translategemma:4b hoặc hy-mt:1.8b"
                     />
@@ -1905,59 +2464,131 @@ export default function App() {
                   <span style={{ color: "var(--text-2)", fontWeight: 500 }}>5 model tinh gọn</span>
                 </div>
 
-                {coreModelRows.map(([label, st, id, sz]) => (
-                  <div className="model-row" key={id}>
-                    <div className="model-top">
-                      <span>{label}</span>
-                      {st?.status === "ready" ? (
-                        <span style={{ color: "var(--green-text)", fontSize: 11, whiteSpace: "nowrap" }}>
-                          ✓ {sz}
-                        </span>
-                      ) : (
-                        <button
-                          className="btn primary sm"
-                          onClick={() => handleDownloadModel(id)}
-                        >
-                          <Download size={11.5} /> {sz}
-                        </button>
+                {coreModelRows.map(([label, st, id, sz]) => {
+                  const isDownloading = st?.status === "downloading";
+                  const isError = st?.status === "error";
+                  const isJustDone = st?.status === "ready" && Boolean(justDownloadedIds[id]);
+                  const pct = Math.max(0, Math.min(100, Math.round(st?.progress ?? 0)));
+                  return (
+                    <div className={`model-row ${isJustDone ? "success" : ""}`} key={id}>
+                      <div className="model-top">
+                        <span>{label}</span>
+                        {st?.status === "ready" ? (
+                          isJustDone ? (
+                            <span className="model-done-badge">
+                              <CheckCircle2 size={12} /> Tải thành công
+                            </span>
+                          ) : (
+                            <span style={{ color: "var(--green-text)", fontSize: 11, whiteSpace: "nowrap" }}>
+                              ✓ {sz}
+                            </span>
+                          )
+                        ) : isDownloading ? (
+                          <button className="btn sm downloading" disabled>
+                            <Loader2 size={11.5} className="spin" /> {pct}%
+                          </button>
+                        ) : (
+                          <button
+                            className="btn primary sm"
+                            onClick={() => handleDownloadModel(id)}
+                          >
+                            <Download size={11.5} /> {isError ? "Thử lại" : sz}
+                          </button>
+                        )}
+                      </div>
+                      {isDownloading && (
+                        <>
+                          <div className="progress-track">
+                            <div className="progress-fill" style={{ width: `${Math.max(3, pct)}%` }} />
+                          </div>
+                          <div className="model-progress-meta">
+                            <span>{st.message || "Đang tải..."}</span>
+                            <span>
+                              {st.total_mb > 0
+                                ? `${st.downloaded_mb.toFixed(1)} / ${st.total_mb.toFixed(0)} MB`
+                                : `${pct}%`}
+                            </span>
+                          </div>
+                        </>
+                      )}
+                      {isError && st?.message && (
+                        <div className="model-error-msg" title={st.message}>
+                          {st.message}
+                        </div>
                       )}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
 
                 <div className="hint" style={{ marginTop: 4, fontWeight: 700, color: "var(--text-1)" }}>
                   <span>Mở rộng Tiếng Thái Offline (Tùy chọn)</span>
                 </div>
 
-                {optionalModelRows.map(([label, st, id, sz]) => (
-                  <div className="model-row" key={id}>
-                    <div className="model-top">
-                      <span>{label}</span>
-                      {st?.status === "ready" ? (
-                        <div className="row" style={{ gap: 5 }}>
-                          <span style={{ color: "var(--green-text)", fontSize: 11, whiteSpace: "nowrap" }}>
-                            ✓ {sz}
-                          </span>
-                          <button
-                            className="btn sm icon-only"
-                            style={{ width: 22, height: 22, minWidth: 22, padding: 3 }}
-                            onClick={() => handleDeleteModel(id)}
-                            title="Xóa model này để giảm tổng ổ cứng xuống chỉ còn 1.18 GB"
-                          >
-                            <Trash2 size={11} />
+                {optionalModelRows.map(([label, st, id, sz]) => {
+                  const isDownloading = st?.status === "downloading";
+                  const isError = st?.status === "error";
+                  const isJustDone = st?.status === "ready" && Boolean(justDownloadedIds[id]);
+                  const pct = Math.max(0, Math.min(100, Math.round(st?.progress ?? 0)));
+                  return (
+                    <div className={`model-row ${isJustDone ? "success" : ""}`} key={id}>
+                      <div className="model-top">
+                        <span>{label}</span>
+                        {st?.status === "ready" ? (
+                          <div className="row" style={{ gap: 5 }}>
+                            {isJustDone ? (
+                              <span className="model-done-badge">
+                                <CheckCircle2 size={12} /> Tải thành công
+                              </span>
+                            ) : (
+                              <span style={{ color: "var(--green-text)", fontSize: 11, whiteSpace: "nowrap" }}>
+                                ✓ {sz}
+                              </span>
+                            )}
+                            <button
+                              className="btn sm icon-only"
+                              style={{ width: 22, height: 22, minWidth: 22, padding: 3 }}
+                              onClick={() => handleDeleteModel(id)}
+                              title="Xóa model này để giảm tổng ổ cứng xuống chỉ còn 1.18 GB"
+                            >
+                              <Trash2 size={11} />
+                            </button>
+                          </div>
+                        ) : isDownloading ? (
+                          <button className="btn sm downloading" disabled>
+                            <Loader2 size={11.5} className="spin" /> {pct}%
                           </button>
+                        ) : (
+                          <button
+                            className="btn primary sm"
+                            onClick={() => handleDownloadModel(id)}
+                          >
+                            <Download size={11.5} /> {isError ? "Thử lại" : sz}
+                          </button>
+                        )}
+                      </div>
+                      {isDownloading && (
+                        <>
+                          <div className="progress-track">
+                            <div className="progress-fill" style={{ width: `${Math.max(3, pct)}%` }} />
+                          </div>
+                          <div className="model-progress-meta">
+                            <span>{st.message || "Đang tải..."}</span>
+                            <span>
+                              {st.total_mb > 0
+                                ? `${st.downloaded_mb.toFixed(1)} / ${st.total_mb.toFixed(0)} MB`
+                                : `${pct}%`}
+                            </span>
+                          </div>
+                        </>
+                      )}
+                      {isError && st?.message && (
+                        <div className="model-error-msg" title={st.message}>
+                          {st.message}
                         </div>
-                      ) : (
-                        <button
-                          className="btn primary sm"
-                          onClick={() => handleDownloadModel(id)}
-                        >
-                          <Download size={11.5} /> {sz}
-                        </button>
                       )}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
 
                 {/* App Version & Manual Auto-Update Check */}
                 <div className="update-footer-row">
@@ -2016,6 +2647,93 @@ export default function App() {
               </div>
             </div>
           )}
+
+          {modelSuccessNotice && (
+            <div className="banner-success" role="status">
+              <span className="row" style={{ gap: 7, minWidth: 0 }}>
+                <CheckCircle2 size={15} style={{ flexShrink: 0 }} />
+                <span>{modelSuccessNotice}</span>
+              </span>
+              <button
+                className="btn sm icon-only"
+                onClick={() => setModelSuccessNotice("")}
+                title="Đóng thông báo"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          )}
+
+          {connected &&
+            models !== null &&
+            !setupBannerDismissed &&
+            mtMode !== "cloud-api" &&
+            (models.mt_envit5?.status !== "ready" ||
+              models.asr_zipformer_streaming?.status !== "ready") &&
+            (() => {
+              const coreDownloading =
+                models.mt_envit5?.status === "downloading" ||
+                models.asr_zipformer_streaming?.status === "downloading";
+              const activeDl =
+                models.mt_envit5?.status === "downloading"
+                  ? models.mt_envit5
+                  : models.asr_zipformer_streaming?.status === "downloading"
+                  ? models.asr_zipformer_streaming
+                  : null;
+              const activePct = Math.max(0, Math.min(100, Math.round(activeDl?.progress ?? 0)));
+              return (
+                <div className="banner-setup">
+                  <div className="row" style={{ gap: 8, minWidth: 0, flex: 1 }}>
+                    {coreDownloading ? (
+                      <Loader2 size={15} className="spin" style={{ flexShrink: 0 }} />
+                    ) : (
+                      <Download size={15} style={{ flexShrink: 0 }} />
+                    )}
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div style={{ fontWeight: 700, fontSize: 12.5 }}>
+                        {coreDownloading
+                          ? `Đang tải bộ mô hình lõi Offline (${activePct}%)...`
+                          : "Thiết lập lần đầu: Chưa tải bộ mô hình dịch Offline lõi (~315 MB)"}
+                      </div>
+                      <div style={{ fontSize: 11.5, color: "var(--text-2)", marginTop: 1 }}>
+                        {coreDownloading
+                          ? activeDl?.message || "Đang tải về thư mục mô hình cục bộ..."
+                          : "Tải 1 lần (Zipformer-30M Việt + EnViT5 Việt ⇄ Anh) để dịch 100% không cần Internet."}
+                      </div>
+                      {coreDownloading && (
+                        <div className="progress-track" style={{ marginTop: 6 }}>
+                          <div className="progress-fill" style={{ width: `${Math.max(3, activePct)}%` }} />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="row" style={{ gap: 6, flexShrink: 0 }}>
+                    <button
+                      className={`btn sm ${coreDownloading ? "downloading" : "primary"}`}
+                      disabled={coreDownloading}
+                      onClick={handleDownloadCoreModels}
+                    >
+                      {coreDownloading ? (
+                        <>
+                          <Loader2 size={12} className="spin" /> {activePct}%
+                        </>
+                      ) : (
+                        <>
+                          <Download size={12} /> Tải bộ mô hình lõi
+                        </>
+                      )}
+                    </button>
+                    <button
+                      className="btn sm icon-only"
+                      onClick={() => setSetupBannerDismissed(true)}
+                      title="Ẩn gợi ý thiết lập"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
 
           {/* Live Spotlight */}
           <section className={`spotlight ${status?.listening ? "live" : ""}`}>
@@ -2696,13 +3414,17 @@ export default function App() {
                     <div className="row">
                       <button
                         className="btn primary sm"
-                        onClick={() => handleDownloadBlob(`${fileResult.filename}.srt`, fileResult.srt_content)}
+                        onClick={() =>
+                          handleDownloadBlob(`${stripFileExtension(fileResult.filename)}.srt`, fileResult.srt_content)
+                        }
                       >
                         <Download size={12} /> Tải .SRT
                       </button>
                       <button
                         className="btn sm"
-                        onClick={() => handleDownloadBlob(`${fileResult.filename}.txt`, fileResult.txt_content)}
+                        onClick={() =>
+                          handleDownloadBlob(`${stripFileExtension(fileResult.filename)}.txt`, fileResult.txt_content)
+                        }
                       >
                         <FileText size={12} /> Tải .TXT
                       </button>

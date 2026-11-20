@@ -43,9 +43,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Build macOS native ScreenCaptureKit + ANE Swift helper
+      - name: Build & verify macOS native ScreenCaptureKit + ANE Swift helper
         if: matrix.platform == 'macos-latest'
-        run: bash native-macos/build.sh
+        run: |
+          bash native-macos/build.sh
+          otool -l native-macos/voicerecore-macos-helper | grep -A4 LC_BUILD_VERSION
+          otool -l native-macos/voicerecore-macos-helper | grep -q "minos 13.0"
 
       - name: Build standalone AI Engine sidecar (Windows .exe)
         if: matrix.platform == 'windows-latest'
@@ -56,6 +59,65 @@ jobs:
           uv pip install --python .venv/Scripts/python.exe pyinstaller pyaudiowpatch
           uv run --no-sync python build_sidecar.py
 
+      - name: Smoke-test Windows standalone AI Engine sidecar
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          @'
+          import json, os, subprocess, tempfile, time, urllib.request
+          from pathlib import Path
+
+          bin_path = Path("src-tauri/resources/engine-bin/voicerecore-engine/voicerecore-engine.exe").resolve()
+          assert bin_path.exists(), f"Missing sidecar: {bin_path}"
+
+          sherpa_ort = bin_path.parent / "_internal" / "sherpa_onnx" / "lib" / "onnxruntime.dll"
+          viet_ort = bin_path.parent / "_internal" / "vietasr" / "_native" / "onnxruntime.dll"
+          root_ort = bin_path.parent / "_internal" / "onnxruntime.dll"
+          assert sherpa_ort.exists(), "Missing sherpa_onnx/lib/onnxruntime.dll"
+          if viet_ort.exists():
+              assert sherpa_ort.stat().st_size == viet_ort.stat().st_size, "vietasr onnxruntime.dll mismatch!"
+          if root_ort.exists():
+              assert sherpa_ort.stat().st_size == root_ort.stat().st_size, "root onnxruntime.dll mismatch!"
+
+          with tempfile.TemporaryDirectory(prefix="pv_win_smoke_") as td:
+              env = os.environ.copy()
+              env["VOICERECORE_MODEL_DIR"] = str(Path(td) / "models")
+              env["VOICERECORE_CACHE_DIR"] = str(Path(td) / "cache")
+              env["VOICERECORE_GLOSSARY_PATH"] = str(Path(td) / "glossary.json")
+              env["VOICERECORE_LOG_DIR"] = str(Path(td) / "logs")
+              proc = subprocess.Popen(
+                  [str(bin_path), "--host", "127.0.0.1", "--port", "18799"],
+                  cwd=str(bin_path.parent),
+                  env=env,
+              )
+              try:
+                  health = None
+                  deadline = time.time() + 45.0
+                  while time.time() < deadline:
+                      assert proc.poll() is None, f"Windows sidecar exited early: rc={proc.returncode}"
+                      try:
+                          with urllib.request.urlopen("http://127.0.0.1:18799/api/health", timeout=2.0) as r:
+                              data = json.loads(r.read().decode("utf-8"))
+                              if data.get("ok") and data.get("asr_loaded"):
+                                  health = data
+                                  break
+                      except Exception:
+                          pass
+                      time.sleep(0.5)
+                  assert health is not None, "Windows sidecar failed to load ASR within 45s"
+                  assert not health.get("boot_error"), f"boot_error: {health.get('boot_error')}"
+                  assert health.get("system_audio_ready"), "Expected Windows WASAPI loopback ready"
+                  print("Windows sidecar smoke OK:", health["platform"], "asr_loaded=", health["asr_loaded"])
+                  req = urllib.request.Request("http://127.0.0.1:18799/api/shutdown", method="POST")
+                  with urllib.request.urlopen(req, timeout=5.0) as r:
+                      assert r.status == 200
+                  proc.wait(timeout=10.0)
+              finally:
+                  if proc.poll() is None:
+                      proc.kill()
+                      proc.wait(timeout=5.0)
+          '@ | uv run --project engine --no-sync python -
+
       - name: Build standalone AI Engine sidecar (macOS)
         if: matrix.platform == 'macos-latest'
         run: |
@@ -64,15 +126,71 @@ jobs:
           uv pip install --python .venv/bin/python pyinstaller
           uv run --no-sync python build_sidecar.py
 
+      - name: Smoke-test macOS standalone AI Engine sidecar
+        if: matrix.platform == 'macos-latest'
+        run: |
+          uv run --project engine --no-sync python - <<'PY'
+          import json, os, subprocess, tempfile, time, urllib.request
+          from pathlib import Path
+
+          bin_path = Path("src-tauri/resources/engine-bin/voicerecore-engine/voicerecore-engine").resolve()
+          assert bin_path.exists(), f"Missing sidecar: {bin_path}"
+
+          with tempfile.TemporaryDirectory(prefix="pv_mac_smoke_") as td:
+              env = os.environ.copy()
+              env["VOICERECORE_MODEL_DIR"] = str(Path(td) / "models")
+              env["VOICERECORE_CACHE_DIR"] = str(Path(td) / "cache")
+              env["VOICERECORE_GLOSSARY_PATH"] = str(Path(td) / "glossary.json")
+              env["VOICERECORE_LOG_DIR"] = str(Path(td) / "logs")
+              proc = subprocess.Popen(
+                  [str(bin_path), "--host", "127.0.0.1", "--port", "18799"],
+                  cwd=str(bin_path.parent),
+                  env=env,
+              )
+              try:
+                  health = None
+                  deadline = time.time() + 45.0
+                  while time.time() < deadline:
+                      assert proc.poll() is None, f"macOS sidecar exited early: rc={proc.returncode}"
+                      try:
+                          with urllib.request.urlopen("http://127.0.0.1:18799/api/health", timeout=2.0) as r:
+                              data = json.loads(r.read().decode("utf-8"))
+                              if data.get("ok") and data.get("asr_loaded"):
+                                  health = data
+                                  break
+                      except Exception:
+                          pass
+                      time.sleep(0.5)
+                  assert health is not None, "macOS sidecar failed to load ASR within 45s"
+                  assert not health.get("boot_error"), f"boot_error: {health.get('boot_error')}"
+                  assert health.get("mac_helper_ready"), "Expected mac_helper_ready=True"
+                  assert health.get("system_audio_ready"), "Expected system_audio_ready=True"
+                  print("macOS sidecar smoke OK:", health["platform"], "asr_loaded=", health["asr_loaded"])
+                  req = urllib.request.Request("http://127.0.0.1:18799/api/shutdown", method="POST")
+                  with urllib.request.urlopen(req, timeout=5.0) as r:
+                      assert r.status == 200
+                  proc.wait(timeout=10.0)
+              finally:
+                  if proc.poll() is None:
+                      proc.kill()
+                      proc.wait(timeout=5.0)
+          PY
+
       - name: Install frontend dependencies
         run: pnpm install
 
-      - name: Build & Publish Signed Installer + Auto-Update Manifest (latest.json)
+      - name: Build & Upload Signed Installer to Draft Release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: v__VERSION__
           releaseName: "PolyVoice Pro v__VERSION__"
@@ -81,6 +199,100 @@ jobs:
 
             Bản phát hành chính thức cho **Windows (`.exe`/`.msi`)** và **macOS (`.dmg`)** tích hợp sẵn AI Engine (không cần cài Python).
             Người dùng đang cài đặt bản cũ chỉ cần mở app lên để **tự động cập nhật 1 chạm** (giữ nguyên toàn bộ model offline, từ điển và API Key).
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  publish-release:
+    needs: publish-tauri
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble & verify canonical latest.json then publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          conf = json.loads(Path("src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+          version = conf["version"]
+          tag = f"v{version}"
+
+          rel_raw = subprocess.check_output(
+              ["gh", "release", "view", tag, "--json", "assets,body,isDraft"],
+              text=True,
+          )
+          rel = json.loads(rel_raw)
+          assets = {a["name"]: a for a in rel.get("assets", [])}
+          print("Release assets:", sorted(assets.keys()))
+
+          def find_asset(suffix: str) -> dict:
+              matches = [a for name, a in assets.items() if name.endswith(suffix)]
+              if not matches:
+                  raise SystemExit(f"Missing required release asset ending with '{suffix}'")
+              return matches[0]
+
+          mac_tar = find_asset("aarch64.app.tar.gz")
+          mac_sig_asset = find_asset("aarch64.app.tar.gz.sig")
+          win_msi = find_asset(".msi")
+          win_msi_sig_asset = find_asset(".msi.sig")
+          win_nsis = find_asset("-setup.exe")
+          win_nsis_sig_asset = find_asset("-setup.exe.sig")
+
+          with tempfile.TemporaryDirectory() as td:
+              td_path = Path(td)
+              def fetch_sig(asset_name: str) -> str:
+                  subprocess.run(
+                      ["gh", "release", "download", tag, "-p", asset_name, "-D", str(td_path)],
+                      check=True,
+                  )
+                  sig = (td_path / asset_name).read_text(encoding="utf-8").strip()
+                  assert sig, f"Empty signature in {asset_name}"
+                  return sig
+
+              mac_sig = fetch_sig(mac_sig_asset["name"])
+              msi_sig = fetch_sig(win_msi_sig_asset["name"])
+              nsis_sig = fetch_sig(win_nsis_sig_asset["name"])
+
+              manifest = {
+                  "version": version,
+                  "notes": rel.get("body") or f"PolyVoice Pro v{version}",
+                  "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                  "platforms": {
+                      "darwin-aarch64": {"signature": mac_sig, "url": mac_tar["url"]},
+                      "darwin-aarch64-app": {"signature": mac_sig, "url": mac_tar["url"]},
+                      "windows-x86_64": {"signature": msi_sig, "url": win_msi["url"]},
+                      "windows-x86_64-msi": {"signature": msi_sig, "url": win_msi["url"]},
+                      "windows-x86_64-nsis": {"signature": nsis_sig, "url": win_nsis["url"]},
+                  },
+              }
+              required_keys = {
+                  "darwin-aarch64",
+                  "darwin-aarch64-app",
+                  "windows-x86_64",
+                  "windows-x86_64-msi",
+                  "windows-x86_64-nsis",
+              }
+              assert required_keys.issubset(manifest["platforms"].keys())
+
+              out_path = td_path / "latest.json"
+              out_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+              subprocess.run(
+                  ["gh", "release", "upload", tag, str(out_path), "--clobber"],
+                  check=True,
+              )
+              subprocess.run(
+                  ["gh", "release", "edit", tag, "--draft=false", "--latest"],
+                  check=True,
+              )
+              print(f"Published {tag} with verified latest.json platforms:", sorted(manifest["platforms"].keys()))
+          PY

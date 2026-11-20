@@ -31,6 +31,103 @@ def _has_module(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
+def _unify_windows_onnxruntime(target_bundle: Path) -> None:
+    """
+    Prevent Windows DLL collision between `viet-asr` (ONNX Runtime 1.20.1, API v20)
+    and `sherpa-onnx` (ONNX Runtime 1.28.2, API v28). Both ship a DLL named `onnxruntime.dll`.
+    Because Windows can only load one `onnxruntime.dll` per process, unify on `sherpa-onnx`'s
+    newer backwards-compatible DLL across `_internal/onnxruntime.dll` and
+    `_internal/vietasr/_native/onnxruntime.dll`.
+    """
+    internal = target_bundle / "_internal"
+    sherpa_ort = internal / "sherpa_onnx" / "lib" / "onnxruntime.dll"
+    if not sherpa_ort.exists():
+        print("[build_sidecar] WARNING: sherpa_onnx/lib/onnxruntime.dll not found; skipping ORT unification")
+        return
+
+    src_size = sherpa_ort.stat().st_size
+    for dst in (
+        internal / "onnxruntime.dll",
+        internal / "vietasr" / "_native" / "onnxruntime.dll",
+    ):
+        if dst.exists():
+            old_size = dst.stat().st_size
+            if old_size != src_size:
+                shutil.copy2(sherpa_ort, dst)
+                print(
+                    f"[build_sidecar] Unified {dst.relative_to(target_bundle)} "
+                    f"({old_size:,} -> {src_size:,} bytes, sherpa-onnx ORT)"
+                )
+
+
+def _prune_bundle_bloat(target_bundle: Path, is_win: bool, is_mac: bool) -> None:
+    """Safely prune non-runtime headers, static libs, and cross-OS PortAudio binaries."""
+    internal = target_bundle / "_internal"
+    pruned_bytes = 0
+
+    def _rm(p: Path) -> None:
+        nonlocal pruned_bytes
+        if not p.exists():
+            return
+        if p.is_dir():
+            for f in p.rglob("*"):
+                if f.is_file():
+                    try:
+                        pruned_bytes += f.stat().st_size
+                    except OSError:
+                        pass
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            try:
+                pruned_bytes += p.stat().st_size
+            except OSError:
+                pass
+            p.unlink(missing_ok=True)
+
+    # C++ headers and static linker libs are never needed at runtime
+    for rel in (
+        "vietasr/_native/include",
+        "vietasr/_native/lib",
+        "sherpa_onnx/include",
+    ):
+        _rm(internal / rel)
+
+    sherpa_lib = internal / "sherpa_onnx" / "lib"
+    if sherpa_lib.exists():
+        for f in sherpa_lib.glob("*.lib"):
+            _rm(f)
+
+    pa_dir = internal / "_sounddevice_data" / "portaudio-binaries"
+    if pa_dir.exists():
+        _rm(pa_dir / ".github")
+        _rm(pa_dir / "README.md")
+        if is_mac:
+            for f in pa_dir.glob("*.dll"):
+                _rm(f)
+        elif is_win:
+            for f in pa_dir.glob("*.dylib"):
+                _rm(f)
+            for pat in ("*32bit*.dll", "*arm64*.dll"):
+                for f in pa_dir.glob(pat):
+                    _rm(f)
+
+    if pruned_bytes > 0:
+        print(f"[build_sidecar] Pruned {pruned_bytes / (1024 * 1024):.1f} MB of non-runtime bloat")
+
+
+def _is_portable_mac_binary(bin_path: Path) -> bool:
+    """Return True if a macOS binary does not link /opt/homebrew or /usr/local dynamic libs."""
+    try:
+        out = subprocess.check_output(["otool", "-L", str(bin_path)], text=True)
+        for line in out.splitlines()[1:]:
+            dep = line.strip().split(" ", 1)[0]
+            if dep.startswith(("/opt/homebrew/", "/usr/local/", "@rpath/")):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def build() -> Path:
     if not _has_module("PyInstaller"):
         raise SystemExit(
@@ -58,8 +155,12 @@ def build() -> Path:
         "segno",
         "multipart",
     ]
+    if _has_module("certifi"):
+        collect_pkgs.append("certifi")
     if _has_module("_sounddevice_data"):
         collect_pkgs.append("_sounddevice_data")
+    if _has_module("imageio_ffmpeg"):
+        collect_pkgs.append("imageio_ffmpeg")
     if is_win and _has_module("pyaudiowpatch"):
         collect_pkgs.append("pyaudiowpatch")
 
@@ -78,6 +179,7 @@ def build() -> Path:
         "starlette",
         "websockets",
         "httpx",
+        "certifi",
         "huggingface_hub",
         "numpy",
         "python_multipart",
@@ -92,6 +194,8 @@ def build() -> Path:
         "session_logger",
         "translator",
     ]
+    if _has_module("imageio_ffmpeg"):
+        hidden_imports.append("imageio_ffmpeg")
     if is_win and _has_module("pyaudiowpatch"):
         hidden_imports.append("pyaudiowpatch")
 
@@ -126,6 +230,10 @@ def build() -> Path:
     print("[build_sidecar] Running:", " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=str(ENGINE_DIR))
 
+    if is_win:
+        _unify_windows_onnxruntime(target_bundle)
+    _prune_bundle_bloat(target_bundle, is_win=is_win, is_mac=is_mac)
+
     # Bundle macOS ScreenCaptureKit + Apple Neural Engine Swift helper if compiled
     if is_mac:
         mac_helper = ROOT / "native-macos" / "voicerecore-macos-helper"
@@ -141,17 +249,23 @@ def build() -> Path:
         shutil.copy2(school_logo, target_bundle / "school_logo.png")
         print(f"[build_sidecar] Bundled school logo -> {target_bundle / 'school_logo.png'}")
 
-    # Copy llama-server next to sidecar if present on build machine (enables Hy-MT2-1.8B out of the box)
+    # Copy llama-server next to sidecar ONLY if it is portable/self-contained (avoid broken Homebrew dylib links)
     llama_name = "llama-server.exe" if is_win else "llama-server"
     llama_found = shutil.which("llama-server")
     if llama_found:
-        llama_src = Path(llama_found)
+        llama_src = Path(llama_found).resolve()
         if llama_src.exists():
-            llama_dst = target_bundle / llama_name
-            shutil.copy2(llama_src, llama_dst)
-            if not is_win:
-                llama_dst.chmod(0o755)
-            print(f"[build_sidecar] Bundled llama-server -> {llama_dst}")
+            if is_mac and not _is_portable_mac_binary(llama_src):
+                print(
+                    f"[build_sidecar] Skipping non-portable Homebrew llama-server ({llama_src}) "
+                    "to avoid broken /opt/homebrew dylib links on end-user Macs."
+                )
+            else:
+                llama_dst = target_bundle / llama_name
+                shutil.copy2(llama_src, llama_dst)
+                if not is_win:
+                    llama_dst.chmod(0o755)
+                print(f"[build_sidecar] Bundled llama-server -> {llama_dst}")
 
     exe_path = target_bundle / ("voicerecore-engine.exe" if is_win else "voicerecore-engine")
     if not exe_path.exists():

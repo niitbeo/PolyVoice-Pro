@@ -742,6 +742,7 @@ AUDIENCE_HTML = (
     let partial = null;
     let pinnedBottom = true;
     let ws = null;
+    let reconnectTimer = null;
 
     function groupByParagraph(list) {
       const out = [];
@@ -819,20 +820,42 @@ AUDIENCE_HTML = (
       entries = [];
       partial = null;
       render();
-      if (ws) ws.close();
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (ws) {
+        ws.onclose = null;
+        ws.close();
+        ws = null;
+      }
+      connect();
     });
 
     function connect() {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.onclose = null;
+        ws.close();
+      }
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      ws = new WebSocket(`${proto}//${location.host}/ws/audience?lang=${encodeURIComponent(selectedLang)}`);
-      ws.onopen = () => setConnState("ready");
-      ws.onmessage = (ev) => {
+      const sock = new WebSocket(`${proto}//${location.host}/ws/audience?lang=${encodeURIComponent(selectedLang)}`);
+      ws = sock;
+      sock.onopen = () => {
+        if (ws === sock) setConnState("ready");
+      };
+      sock.onmessage = (ev) => {
+        if (ws !== sock) return;
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type === "status") {
             setConnState(msg.data && msg.data.listening ? "live" : "ready");
           } else if (msg.type === "history") {
             entries = (msg.data || []).slice(-120);
+            if (entries.length === 0) partial = null;
             render();
           } else if (msg.type === "partial") {
             const d = msg.data;
@@ -858,9 +881,10 @@ AUDIENCE_HTML = (
           }
         } catch {}
       };
-      ws.onclose = () => {
+      sock.onclose = () => {
+        if (ws !== sock) return;
         setConnState("warn");
-        setTimeout(connect, 1200);
+        reconnectTimer = setTimeout(connect, 1200);
       };
     }
     connect();
@@ -939,8 +963,9 @@ OBS_HTML = (
         try {
           const m = JSON.parse(ev.data);
           if (m.type === "partial") {
+            const same = m.data.id === activeId;
             activeId = m.data.id;
-            show(m.data.source_text, tgtEl.textContent === "..." ? "..." : tgtEl.textContent, true);
+            show(m.data.source_text, same ? tgtEl.textContent : "...", true);
           } else if (m.type === "partial_mt" && m.data.id === activeId) {
             show(srcEl.textContent, m.data.translated_text, true);
           } else if (m.type === "final") {

@@ -48,6 +48,9 @@
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    },
     "resources": {
       "resources/engine-bin/": "engine-bin/"
     },

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -114,19 +115,41 @@ class CloudQuotaManager:
                 pass
         return base
 
-    def _save_config_unlocked(self) -> None:
+    @staticmethod
+    def _atomic_write_json(path: Path, data: dict[str, Any], *, private: bool = False) -> None:
+        tmp_path: Path | None = None
         try:
-            self.config_path.write_text(
-                json.dumps(self._config, ensure_ascii=False, indent=2),
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(data, ensure_ascii=False, indent=2)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
                 encoding="utf-8",
-            )
-            if os.name != "nt":
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tf:
+                tmp_path = Path(tf.name)
+                if private and os.name != "nt":
+                    try:
+                        os.chmod(tmp_path, 0o600)
+                    except Exception:
+                        pass
+                tf.write(payload)
+                tf.flush()
+                os.fsync(tf.fileno())
+            os.replace(tmp_path, path)
+            if private and os.name != "nt":
                 try:
-                    os.chmod(self.config_path, 0o600)
+                    os.chmod(path, 0o600)
                 except Exception:
                     pass
         except Exception:
-            pass
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+
+    def _save_config_unlocked(self) -> None:
+        self._atomic_write_json(self.config_path, self._config, private=True)
 
     def _load_quota(self) -> dict[str, Any]:
         month = _current_month()
@@ -150,13 +173,7 @@ class CloudQuotaManager:
             self._save_quota_unlocked()
 
     def _save_quota_unlocked(self) -> None:
-        try:
-            self.quota_path.write_text(
-                json.dumps(self._quota, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
+        self._atomic_write_json(self.quota_path, self._quota, private=False)
 
     def get_public_status(self) -> dict[str, Any]:
         """Return safe status for UI (keys are masked, never plaintext)."""
@@ -251,6 +268,39 @@ class CloudQuotaManager:
             used = int(self._quota["usage"].get(provider, 0))
             limit = max(1, int(pcfg.get("monthly_limit", PROVIDER_DEFAULTS[provider]["monthly_limit"])))
             return (used + max(0, int(n_chars))) <= limit
+
+    def try_reserve(self, provider: str, n_chars: int) -> bool:
+        """Atomically verify quota and reserve `n_chars` under a single lock (prevents concurrent TOCTOU overshoot)."""
+        chars = max(0, int(n_chars))
+        with self._lock:
+            self._ensure_month_unlocked()
+            if provider not in PROVIDER_DEFAULTS:
+                return False
+            pcfg = self._config["providers"][provider]
+            if not str(pcfg.get("api_key", "")).strip():
+                return False
+            used = int(self._quota["usage"].get(provider, 0))
+            if self._config.get("hard_cap_enabled", True):
+                limit = max(1, int(pcfg.get("monthly_limit", PROVIDER_DEFAULTS[provider]["monthly_limit"])))
+                if (used + chars) > limit:
+                    return False
+            if chars > 0:
+                self._quota["usage"][provider] = used + chars
+                self._save_quota_unlocked()
+            return True
+
+    def refund_usage(self, provider: str, n_chars: int) -> int:
+        """Refund previously reserved chars (e.g. on cache hit or failed API call)."""
+        chars = max(0, int(n_chars))
+        with self._lock:
+            self._ensure_month_unlocked()
+            if provider not in PROVIDER_DEFAULTS or chars <= 0:
+                return 0
+            cur = int(self._quota["usage"].get(provider, 0))
+            nxt = max(0, cur - chars)
+            self._quota["usage"][provider] = nxt
+            self._save_quota_unlocked()
+            return nxt
 
     def record_usage(self, provider: str, n_chars: int) -> int:
         with self._lock:

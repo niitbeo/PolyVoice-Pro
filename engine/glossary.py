@@ -14,7 +14,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -119,16 +122,37 @@ class GlossaryManager:
                         ],
                     }
             except Exception:
-                pass
+                # Preserve corrupted user glossary as a timestamped backup before resetting to defaults
+                try:
+                    backup = self.path.with_name(f"{self.path.stem}.corrupt.{int(time.time())}{self.path.suffix}")
+                    shutil.copy2(self.path, backup)
+                except Exception:
+                    pass
         data = json.loads(json.dumps(DEFAULT_DATA))
         self._save_unlocked(data)
         return data
 
     def _save_unlocked(self, data: dict[str, Any]) -> None:
+        tmp_path: Path | None = None
         try:
-            self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(data, ensure_ascii=False, indent=2)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tf:
+                tmp_path = Path(tf.name)
+                tf.write(payload)
+                tf.flush()
+                os.fsync(tf.fileno())
+            os.replace(tmp_path, self.path)
         except Exception:
-            pass
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
 
     def get(self) -> dict[str, Any]:
         with self._lock:
@@ -196,13 +220,14 @@ class GlossaryManager:
         out = text
         for rule in rules:
             pat = _word_boundary_pattern(rule["wrong"])
-            out = pat.sub(rule["correct"], out)
+            out = pat.sub(lambda _m, c=rule["correct"]: c, out)
         return out
 
     def protect_terms(self, text: str) -> tuple[str, list[tuple[str, str]]]:
         """
-        Replace locked source terms with opaque proper-noun tokens (`QTERM0`, `QTERM1`...)
-        that neural MT models preserve verbatim, returning `(masked_text, restore_pairs)`.
+        Replace locked source terms with opaque proper-noun tokens (`XTermA0X`, `XTermB1X`...)
+        that neural MT models preserve verbatim without `no_repeat_ngram_size` or prefix collisions,
+        returning `(masked_text, restore_pairs)`.
         """
         if not text:
             return text, []
@@ -217,9 +242,9 @@ class GlossaryManager:
         for rule in rules:
             pat = _word_boundary_pattern(rule["source"])
             if pat.search(masked):
-                # Proper-noun-like Latin code token preserved cleanly by T5 & NLLB
-                token = f"XTerm{chr(65 + (idx % 26))}{idx}"
-                masked = pat.sub(token, masked)
+                # Varying letter avoids CT2 no_repeat_ngram_size=6 drops; trailing 'X' prevents prefix collisions (e.g. C2X vs C28X)
+                token = f"XTerm{chr(65 + (idx % 26))}{idx}X"
+                masked = pat.sub(lambda _m, tok=token: tok, masked)
                 restore_pairs.append((token, rule["target"]))
                 idx += 1
         return masked, restore_pairs
@@ -229,7 +254,7 @@ class GlossaryManager:
         if not translated or not restore_pairs:
             return translated
         out = translated
-        for token, target in restore_pairs:
+        for token, target in sorted(restore_pairs, key=lambda p: len(p[0]), reverse=True):
             # Case-insensitive replacement in case MT lowercased the placeholder
             out = re.sub(re.escape(token), lambda _m, t=target: t, out, flags=re.IGNORECASE)
         return out

@@ -106,9 +106,14 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private let queue = DispatchQueue(label: "voicerecore.sck.audio")
     private let converter = PCM16kConverter()
     private let onBuffer: (AVAudioPCMBuffer, Data, Float) -> Void
+    private let onError: ((Error) -> Void)?
 
-    init(onBuffer: @escaping (AVAudioPCMBuffer, Data, Float) -> Void) {
+    init(
+        onBuffer: @escaping (AVAudioPCMBuffer, Data, Float) -> Void,
+        onError: ((Error) -> Void)? = nil
+    ) {
         self.onBuffer = onBuffer
+        self.onError = onError
     }
 
     func start() async throws {
@@ -149,7 +154,11 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        emitError("Luồng thu âm hệ thống dừng: \(error.localizedDescription)")
+        if let onError = onError {
+            onError(error)
+        } else {
+            emitError("Luồng thu âm hệ thống dừng: \(error.localizedDescription)")
+        }
     }
 }
 
@@ -419,9 +428,17 @@ struct MacHelperMain {
 
         if mode == "system-pcm" {
             // Stream raw 16kHz mono int16 PCM from ScreenCaptureKit directly to stdout!
-            let capture = SystemAudioCapture { _, pcmData, _ in
-                FileHandle.standardOutput.write(pcmData)
-            }
+            // IMPORTANT: Never write JSON/text to stdout in raw PCM mode; send errors to stderr and exit.
+            let capture = SystemAudioCapture(
+                onBuffer: { _, pcmData, _ in
+                    FileHandle.standardOutput.write(pcmData)
+                },
+                onError: { err in
+                    fputs("ERROR: Luồng thu âm hệ thống dừng: \(err.localizedDescription)\n", stderr)
+                    fflush(stderr)
+                    exit(1)
+                }
+            )
             do {
                 try await capture.start()
                 while true {
@@ -429,6 +446,7 @@ struct MacHelperMain {
                 }
             } catch {
                 fputs("ERROR: \(error.localizedDescription)\n", stderr)
+                fflush(stderr)
                 exit(1)
             }
         }

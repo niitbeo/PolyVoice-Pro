@@ -1,3 +1,7 @@
+declare global {
+  const __APP_VERSION__: string;
+}
+
 export interface AudioDevice {
   id: number;
   name: string;
@@ -47,7 +51,8 @@ export interface ModelsStatus {
   mt_nllb_600m: ModelState;
 }
 
-export type AudioSourceId = "mic" | "system" | "dual";
+export type AudioSourceId = "mic" | "system" | "dual" | "mix";
+export type InputChannelId = "mix" | "left" | "right";
 export type AsrEngineId =
   | "auto"
   | "apple-native"
@@ -122,7 +127,11 @@ export interface LogsStatus {
 
 export interface SessionConfig {
   device_id: number | null;
+  loopback_device_id?: number | null;
   audio_source: AudioSourceId;
+  input_channel?: InputChannelId;
+  input_gain_db?: number;
+  auto_gain?: boolean;
   source_lang: string;
   target_lang: string;
   asr_engine: AsrEngineId;

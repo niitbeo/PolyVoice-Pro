@@ -13,6 +13,11 @@ if [[ -z "$NEW_VER" ]]; then
 fi
 
 NEW_VER="${NEW_VER#v}"
+if [[ ! "$NEW_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+  echo "Phiên bản không hợp lệ (cần định dạng semver, VD: 0.8.1): $NEW_VER" >&2
+  exit 1
+fi
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
@@ -36,10 +41,20 @@ cargo_p = Path("src-tauri/Cargo.toml")
 cargo_txt = cargo_p.read_text(encoding="utf-8")
 cargo_txt = re.sub(r'(?m)^version\s*=\s*"[^"]+"', f'version = "{ver}"', cargo_txt, count=1)
 cargo_p.write_text(cargo_txt, encoding="utf-8")
-print(f"Updated package.json, tauri.conf.json, Cargo.toml -> v{ver}")
+
+print(f"Updated package.json, src-tauri/tauri.conf.json, src-tauri/Cargo.toml -> v{ver}")
 PY
 
+# Keep src-tauri/Cargo.lock in sync when cargo is installed locally
+if command -v cargo >/dev/null 2>&1; then
+  (cd src-tauri && cargo update -p voicerecore --offline >/dev/null 2>&1 || true)
+fi
+
 git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
+if git diff --name-only -- src-tauri/Cargo.lock | grep -q "Cargo.lock"; then
+  git add src-tauri/Cargo.lock
+fi
+
 git commit -m "release: v${NEW_VER} — ${NOTES}"
 git tag -a "v${NEW_VER}" -m "PolyVoice Pro v${NEW_VER}: ${NOTES}"
 git push origin main --follow-tags

@@ -9,6 +9,7 @@ segments speech at natural pauses, runs offline ASR (`VietASR` with punctuation/
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -30,22 +31,149 @@ class FileTranslateCancelled(RuntimeError):
     """Raised when the user cancels an active batch file translation job."""
 
 
-def decode_media_to_pcm16(file_path: Path) -> np.ndarray:
-    """Decode any audio/video file to 16 kHz mono int16 numpy array."""
-    p = Path(file_path)
-    # Fast path: native 16kHz mono 16-bit WAV
-    if p.suffix.lower() == ".wav":
-        try:
-            with wave.open(str(p), "rb") as wf:
-                if wf.getframerate() == SAMPLE_RATE and wf.getnchannels() == 1 and wf.getsampwidth() == 2:
-                    raw = wf.readframes(wf.getnframes())
-                    return np.frombuffer(raw, dtype=np.int16).copy()
-        except Exception:
-            pass
+def _find_ffmpeg() -> str | None:
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
 
-    ffmpeg = shutil.which("ffmpeg")
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and Path(bundled).is_file():
+            return bundled
+    except Exception:
+        pass
+    return None
+
+
+def _decode_wav_numpy(p: Path) -> np.ndarray | None:
+    """Decode any PCM WAV (arbitrary rate/channels/bit-depth) to 16 kHz mono int16 with pure NumPy."""
+    try:
+        with wave.open(str(p), "rb") as wf:
+            sr = wf.getframerate()
+            ch = wf.getnchannels()
+            sw = wf.getsampwidth()
+            n_frames = wf.getnframes()
+            if sr <= 0 or ch <= 0 or n_frames <= 0:
+                return None
+            raw = wf.readframes(n_frames)
+            if sr == SAMPLE_RATE and ch == 1 and sw == 2:
+                return np.frombuffer(raw, dtype=np.int16).copy()
+
+            if sw == 1:
+                samples = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+            elif sw == 2:
+                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sw == 3:
+                b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+                signed = (
+                    b[:, 0].astype(np.int32)
+                    | (b[:, 1].astype(np.int32) << 8)
+                    | (b[:, 2].astype(np.int32) << 16)
+                )
+                signed = np.where(signed >= 0x800000, signed - 0x1000000, signed)
+                samples = signed.astype(np.float32) / 8388608.0
+            elif sw == 4:
+                samples = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+            else:
+                return None
+
+            if ch > 1:
+                usable = (len(samples) // ch) * ch
+                samples = samples[:usable].reshape(-1, ch).mean(axis=1)
+
+            if sr != SAMPLE_RATE and len(samples) > 1:
+                out_len = max(1, int(round(len(samples) * SAMPLE_RATE / sr)))
+                x_old = np.linspace(0.0, 1.0, len(samples), endpoint=False)
+                x_new = np.linspace(0.0, 1.0, out_len, endpoint=False)
+                samples = np.interp(x_new, x_old, samples).astype(np.float32)
+
+            return np.clip(samples * 32768.0, -32768.0, 32767.0).astype(np.int16)
+    except Exception:
+        return None
+
+
+def _run_cancellable_proc(
+    cmd: list[str],
+    *,
+    capture_stdout: bool,
+    timeout_s: float,
+    cancel_event: threading.Event | None = None,
+) -> tuple[int, bytes]:
+    kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE if capture_stdout else subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+
+    proc = subprocess.Popen(cmd, **kwargs)
+    chunks: list[bytes] = []
+    reader_thread: threading.Thread | None = None
+    if capture_stdout and proc.stdout is not None:
+        stream = proc.stdout
+
+        def _drain() -> None:
+            try:
+                while True:
+                    block = stream.read(65536)
+                    if not block:
+                        break
+                    chunks.append(block)
+            except Exception:
+                pass
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        reader_thread = threading.Thread(target=_drain, daemon=True, name="file-decode-stdout")
+        reader_thread.start()
+
+    deadline = time.monotonic() + timeout_s
+    try:
+        while proc.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.5)
+                except Exception:
+                    proc.kill()
+                raise FileTranslateCancelled("Đã hủy dịch file.")
+            if time.monotonic() > deadline:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.5)
+                except Exception:
+                    proc.kill()
+                raise RuntimeError("Giải mã âm thanh quá thời gian chờ.")
+            time.sleep(0.05)
+    finally:
+        if reader_thread is not None:
+            reader_thread.join(timeout=2.0)
+
+    return proc.returncode or 0, b"".join(chunks)
+
+
+def decode_media_to_pcm16(
+    file_path: Path,
+    cancel_event: threading.Event | None = None,
+) -> np.ndarray:
+    """Decode any audio/video file to 16 kHz mono int16 numpy array."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise FileTranslateCancelled("Đã hủy dịch file.")
+
+    p = Path(file_path)
+    # Fast & zero-dependency path: pure-NumPy PCM WAV decode (handles any rate/channels/bit-depth)
+    if p.suffix.lower() == ".wav":
+        decoded = _decode_wav_numpy(p)
+        if decoded is not None and len(decoded) > 0:
+            return decoded
+
+    ffmpeg = _find_ffmpeg()
     if ffmpeg:
-        proc = subprocess.run(
+        rc, stdout_bytes = _run_cancellable_proc(
             [
                 ffmpeg,
                 "-hide_banner",
@@ -62,31 +190,34 @@ def decode_media_to_pcm16(file_path: Path) -> np.ndarray:
                 "s16le",
                 "pipe:1",
             ],
-            capture_output=True,
-            timeout=300,
+            capture_stdout=True,
+            timeout_s=300.0,
+            cancel_event=cancel_event,
         )
-        if proc.returncode == 0 and proc.stdout:
-            return np.frombuffer(proc.stdout, dtype=np.int16).copy()
+        if rc == 0 and stdout_bytes:
+            usable = (len(stdout_bytes) // 2) * 2
+            return np.frombuffer(stdout_bytes[:usable], dtype=np.int16).copy()
 
     afconvert = shutil.which("afconvert")
     if afconvert:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
             tmp_wav = Path(tf.name)
         try:
-            proc = subprocess.run(
+            rc, _ = _run_cancellable_proc(
                 [afconvert, "-f", "WAVE", "-d", f"LEI16@{SAMPLE_RATE}", "-c", "1", str(p), str(tmp_wav)],
-                capture_output=True,
-                timeout=180,
+                capture_stdout=False,
+                timeout_s=180.0,
+                cancel_event=cancel_event,
             )
-            if proc.returncode == 0 and tmp_wav.exists():
-                with wave.open(str(tmp_wav), "rb") as wf:
-                    raw = wf.readframes(wf.getnframes())
-                    return np.frombuffer(raw, dtype=np.int16).copy()
+            if rc == 0 and tmp_wav.exists():
+                decoded = _decode_wav_numpy(tmp_wav)
+                if decoded is not None and len(decoded) > 0:
+                    return decoded
         finally:
             tmp_wav.unlink(missing_ok=True)
 
     raise RuntimeError(
-        "Không thể giải mã định dạng file này. Hãy cài `ffmpeg` (hoặc tải lên file .WAV 16kHz mono)."
+        "Không thể giải mã định dạng file này. Hãy cài `ffmpeg` (hoặc tải lên file .WAV PCM)."
     )
 
 
@@ -201,7 +332,7 @@ def translate_media_file(
             )
 
     _emit("decoding", 3.0, "Đang giải mã âm thanh 16kHz...")
-    pcm = decode_media_to_pcm16(file_path)
+    pcm = decode_media_to_pcm16(file_path, cancel_event=cancel_event)
     duration_s = round(len(pcm) / SAMPLE_RATE, 1)
     if duration_s < 0.3:
         raise RuntimeError("File âm thanh quá ngắn hoặc không có dữ liệu tiếng nói.")
@@ -264,32 +395,14 @@ def translate_media_file(
         if use_vi_batch and refiner is not None:
             p1_fallback = ""
             if zf_vi is not None and protected_terms:
-                zf_vi.reset()
-                p1_parts: list[str] = []
-                for pos in range(0, len(seg_pcm), 1600):
-                    o = zf_vi.accept_pcm(seg_pcm[pos : pos + 1600])
-                    if o.kind == "final" and o.text:
-                        p1_parts.append(o.text)
-                fl = zf_vi.flush_final()
-                if fl.kind == "final" and fl.text:
-                    p1_parts.append(fl.text)
-                p1_fallback = runtime.glossary.apply_asr_fixes(" ".join(p1_parts).strip())
+                p1_raw = zf_vi.transcribe_pcm_isolated(seg_pcm)
+                p1_fallback = runtime.glossary.apply_asr_fixes(p1_raw)
             text, _ = refiner.refine(seg_pcm, p1_fallback, protected_terms=protected_terms)
         elif en_moonshine is not None:
             text, _ = en_moonshine.refine(seg_pcm, "")
         else:
             assert zf_en is not None
-            zf_en.reset()
-            parts: list[str] = []
-            step = 1600
-            for pos in range(0, len(seg_pcm), step):
-                o = zf_en.accept_pcm(seg_pcm[pos : pos + step])
-                if o.kind == "final" and o.text:
-                    parts.append(o.text)
-            fl = zf_en.flush_final()
-            if fl.kind == "final" and fl.text:
-                parts.append(fl.text)
-            text = " ".join(parts).strip()
+            text = zf_en.transcribe_pcm_isolated(seg_pcm)
 
         text = runtime.glossary.apply_asr_fixes(text.strip())
         if text:

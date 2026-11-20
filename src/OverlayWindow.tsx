@@ -56,8 +56,17 @@ export default function OverlayWindow() {
         setTheme(e.newValue);
       }
     };
+    const onFullscreenChange = () => {
+      if (!isTauriEnv()) {
+        setFilledMonitor(Boolean(document.fullscreenElement));
+      }
+    };
     window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      document.removeEventListener("fullscreenchange", onFullscreenChange);
+    };
   }, []);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -92,6 +101,7 @@ export default function OverlayWindow() {
             const d = msg.data;
             setPartial((prev) => ({
               id: d.id,
+              speaker: d.speaker,
               source_text: d.source_text,
               translated_text:
                 prev && prev.id === d.id && prev.target_lang === d.target_lang
@@ -123,6 +133,7 @@ export default function OverlayWindow() {
             });
           } else if (msg.type === "history" && Array.isArray(msg.data)) {
             setEntries(msg.data.slice(-200));
+            if (msg.data.length === 0) setPartial(null);
           }
         } catch {
           // ignore
@@ -202,8 +213,12 @@ export default function OverlayWindow() {
 
   const handleClose = async () => {
     if (isTauriEnv()) {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("toggle_overlay");
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("toggle_overlay");
+      } catch {
+        // ignore
+      }
     } else {
       window.close();
     }

@@ -21,11 +21,13 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
-from collections import OrderedDict
+import weakref
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -80,12 +82,34 @@ _ABBREV_SET = {
 }
 
 
+def _adaptive_mt_threads(requested: int = 0) -> int:
+    """Choose optimal CTranslate2/llama CPU thread budget without oversubscribing low-core CPUs."""
+    cpu_count = os.cpu_count() or 4
+    auto_budget = max(2, min(4, cpu_count // 2))
+    if requested <= 0:
+        return auto_budget
+    return max(1, min(requested, auto_budget))
+
+
+def _load_sentencepiece(sp_path: Path) -> spm.SentencePieceProcessor:
+    """Load SentencePiece via in-memory proto bytes (immune to Windows non-ASCII paths in C++ std::ifstream)."""
+    return spm.SentencePieceProcessor(model_proto=sp_path.read_bytes())
+
+
 def _clean_punctuation(text: str) -> str:
-    """Fix minor SentencePiece spacing artifacts (e.g. \"did n't\" -> \"didn't\", \"don 't\" -> \"don't\", \"a. m.\" -> \"a.m.\")."""
+    """Fix minor SentencePiece spacing artifacts (e.g. \"did n't\" -> \"didn't\", \"don 't\" -> \"don't\", \"a. m.\" -> \"a.m.\", \"9: 30\" -> \"9:30\")."""
     s = re.sub(r"\s+(n['’]t\b)", r"\1", text, flags=re.IGNORECASE)
-    s = re.sub(r"\s+(['’](?:t|s|m|re|ve|ll|d)\b)", r"\1", s)
+    s = re.sub(r"\s+(['’](?:t|s|m|re|ve|ll|d)\b)", r"\1", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+([,.;:!?])", r"\1", s)
     s = re.sub(r"\b([ap])\.\s+m\.", r"\1.m.", s, flags=re.IGNORECASE)
+    # Fix spaced times ("9: 30" -> "9:30") and short decimals ("9. 30" -> "9.30") without merging 4-digit years
+    s = re.sub(r"(?<=\d):\s+(?=\d)", ":", s)
+    s = re.sub(r"(?<!\d)(\d{1,3})\.\s+(\d{1,3})(?!\d)", r"\1.\2", s)
+    # Remove spaces immediately inside parentheses/brackets and matched quotes
+    s = re.sub(r"([(\[{])\s+", r"\1", s)
+    s = re.sub(r"\s+([)\]}])", r"\1", s)
+    s = re.sub(r'(?<!\S)"\s+([^"]+?)\s+"(?=$|[\s,.;:!?)\]])', r'"\1"', s)
+    s = re.sub(r"“\s+([^”]+?)\s+”", r"“\1”", s)
     s = re.sub(r"\s{2,}", " ", s)
     return s.strip()
 
@@ -213,13 +237,13 @@ class OpusMTTranslator:
         self.tgt_lang = tgt_lang
         self.engine_name = engine_name
         self.src_prefix = src_prefix
-        self._sp_src = spm.SentencePieceProcessor(model_file=str(self.model_dir / "source.spm"))
-        self._sp_tgt = spm.SentencePieceProcessor(model_file=str(self.model_dir / "target.spm"))
+        self._sp_src = _load_sentencepiece(self.model_dir / "source.spm")
+        self._sp_tgt = _load_sentencepiece(self.model_dir / "target.spm")
         self._translator = ctranslate2.Translator(
             str(self.model_dir),
             device="cpu",
             compute_type="default",
-            intra_threads=max(1, intra_threads),
+            intra_threads=_adaptive_mt_threads(intra_threads),
             inter_threads=1,
         )
         self._lock = threading.Lock()
@@ -271,16 +295,18 @@ class EnViT5Translator:
     for high-accuracy Vietnamese <-> English offline translation (OpenRAIL commercial license).
     """
 
-    def __init__(self, model_dir: Path, intra_threads: int = 4) -> None:
+    def __init__(self, model_dir: Path, intra_threads: int = 0) -> None:
         self.model_dir = Path(model_dir)
         sp_path = self.model_dir / "spiece.model"
         if not sp_path.exists():
             raise FileNotFoundError(f"Missing EnViT5 SentencePiece model: {sp_path}")
-        self._sp = spm.SentencePieceProcessor(model_file=str(sp_path))
+        self._sp = _load_sentencepiece(sp_path)
         self.device = "cpu"
         translator = None
-        # Apple Silicon GPU offload (MPS): ~2-10x faster under heavy CPU load & zero contention with ASR!
-        if platform.system() == "Darwin" and platform.machine() == "arm64":
+        # Default to CPU (empirically 3.0-3.8x faster than experimental CT2 MPS on Apple Silicon,
+        # even under live RT Zipformer ASR). Keep opt-in override via VOICERECORE_ENVIT5_DEVICE=mps.
+        want_mps = os.environ.get("VOICERECORE_ENVIT5_DEVICE", "").strip().lower() == "mps"
+        if want_mps and platform.system() == "Darwin" and platform.machine() == "arm64":
             try:
                 translator = ctranslate2.Translator(
                     str(self.model_dir),
@@ -297,7 +323,7 @@ class EnViT5Translator:
                 str(self.model_dir),
                 device="cpu",
                 compute_type="default",
-                intra_threads=max(2, min(4, intra_threads)),
+                intra_threads=_adaptive_mt_threads(intra_threads),
                 inter_threads=1,
             )
             self.device = "cpu"
@@ -372,12 +398,9 @@ class NLLBTranslator:
         if not sp_path.exists():
             raise FileNotFoundError(f"Missing SentencePiece model: {sp_path}")
 
-        cpu_count = os.cpu_count() or 4
-        if intra_threads <= 0:
-            intra_threads = max(2, min(4, cpu_count // 2))
+        intra_threads = _adaptive_mt_threads(intra_threads)
 
-        self._sp = spm.SentencePieceProcessor()
-        self._sp.Load(str(sp_path))
+        self._sp = _load_sentencepiece(sp_path)
 
         compute_type = "default" if device == "cpu" else "auto"
         self._translator = ctranslate2.Translator(
@@ -504,11 +527,28 @@ class FastOnlineTranslator:
     """
 
     def __init__(self, timeout_s: float = 4.0) -> None:
+        self._timeout_s = timeout_s
+        self._client_lock = threading.Lock()
         self._client = httpx.Client(
             timeout=timeout_s,
             headers={"User-Agent": "Mozilla/5.0"},
         )
         self._cache = LRUCache(maxsize=1024)
+
+    def _get_client(self) -> httpx.Client:
+        if self._client.is_closed:
+            self._client = httpx.Client(
+                timeout=self._timeout_s,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+        return self._client
+
+    def close(self) -> None:
+        with self._client_lock:
+            try:
+                self._client.close()
+            except Exception:
+                pass
 
     def translate(self, text: str, src_lang: str = "vie_Latn", tgt_lang: str = "eng_Latn") -> TranslationResult:
         clean = text.strip()
@@ -528,10 +568,11 @@ class FastOnlineTranslator:
             return TranslationResult(clean, cached, src_lang, tgt_lang, 0.0, "fast-online", True)
 
         t0 = time.perf_counter()
-        resp = self._client.get(
-            "https://translate.googleapis.com/translate_a/single",
-            params={"client": "gtx", "sl": sl, "tl": tl, "dt": "t", "q": clean},
-        )
+        with self._client_lock:
+            resp = self._get_client().get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={"client": "gtx", "sl": sl, "tl": tl, "dt": "t", "q": clean},
+            )
         resp.raise_for_status()
         data = resp.json()
         translated = "".join(part[0] for part in (data[0] or []) if part and part[0]).strip()
@@ -553,8 +594,22 @@ class LocalLLMTranslator:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
+        self._timeout_s = timeout_s
+        self._client_lock = threading.Lock()
         self._client = httpx.Client(timeout=timeout_s)
         self._cache = LRUCache(maxsize=512)
+
+    def _get_client(self) -> httpx.Client:
+        if self._client.is_closed:
+            self._client = httpx.Client(timeout=self._timeout_s)
+        return self._client
+
+    def close(self) -> None:
+        with self._client_lock:
+            try:
+                self._client.close()
+            except Exception:
+                pass
 
     def translate(
         self,
@@ -597,16 +652,17 @@ class LocalLLMTranslator:
         messages.append({"role": "user", "content": clean})
 
         t0 = time.perf_counter()
-        resp = self._client.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json={
-                "model": self.model,
-                "temperature": 0.0,
-                "max_tokens": 256,
-                "messages": messages,
-            },
-        )
+        with self._client_lock:
+            resp = self._get_client().post(
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json={
+                    "model": self.model,
+                    "temperature": 0.0,
+                    "max_tokens": 256,
+                    "messages": messages,
+                },
+            )
         resp.raise_for_status()
         data = resp.json()
         translated = data["choices"][0]["message"]["content"].strip()
@@ -645,6 +701,35 @@ def find_llama_server() -> Optional[Path]:
     return None
 
 
+def _is_local_port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _pick_free_local_port(preferred: int) -> int:
+    if _is_local_port_free(preferred):
+        return preferred
+    for candidate in range(preferred + 1, preferred + 20):
+        if _is_local_port_free(candidate):
+            return candidate
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _make_weak_stop(ref: "weakref.ReferenceType[HyMT2Translator]") -> Callable[[], None]:
+    def _cleanup() -> None:
+        inst = ref()
+        if inst is not None:
+            inst.stop()
+    return _cleanup
+
+
 class HyMT2Translator:
     """
     Tencent Hy-MT2-1.8B (GGUF Q4_K_M, ~1.05 GB, Apache 2.0) — SOTA 2026 Offline Translator.
@@ -657,16 +742,62 @@ class HyMT2Translator:
       (Apple Metal GPU on macOS, multi-thread CPU on Windows).
     """
 
-    def __init__(self, gguf_path: Path, port: int = 18766, threads: int = 4) -> None:
+    def __init__(self, gguf_path: Path, port: int = 18766, threads: int = 0) -> None:
         self.gguf_path = Path(gguf_path)
         self.port = port
-        self.threads = max(2, min(6, threads))
+        self.threads = _adaptive_mt_threads(threads)
         self.base_url = f"http://127.0.0.1:{port}"
         self._proc: Optional[subprocess.Popen] = None
+        self._stderr_ring: deque[str] = deque()
+        self._stderr_bytes: int = 0
+        self._stderr_lock = threading.Lock()
         self._lock = threading.Lock()
+        self._client_lock = threading.Lock()
         self._client = httpx.Client(timeout=25.0)
         self._cache = LRUCache(maxsize=1024)
-        atexit.register(self.stop)
+        self._atexit_cb = _make_weak_stop(weakref.ref(self))
+        atexit.register(self._atexit_cb)
+
+    def _get_client(self) -> httpx.Client:
+        if self._client.is_closed:
+            self._client = httpx.Client(timeout=25.0)
+        return self._client
+
+    def _start_stderr_drainer(self, proc: subprocess.Popen) -> None:
+        """Continuously drain llama-server stderr into a bounded 4 KB ring buffer to prevent pipe deadlocks."""
+        stream = proc.stderr
+        if stream is None:
+            return
+        with self._stderr_lock:
+            self._stderr_ring.clear()
+            self._stderr_bytes = 0
+
+        def _drain() -> None:
+            try:
+                while True:
+                    chunk = stream.readline()
+                    if not chunk:
+                        break
+                    text = chunk.decode("utf-8", errors="ignore")
+                    with self._stderr_lock:
+                        self._stderr_ring.append(text)
+                        self._stderr_bytes += len(text)
+                        while self._stderr_bytes > 4096 and self._stderr_ring:
+                            dropped = self._stderr_ring.popleft()
+                            self._stderr_bytes -= len(dropped)
+            except Exception:
+                pass
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_drain, daemon=True, name="hymt2-stderr-drain").start()
+
+    def _get_recent_stderr(self) -> str:
+        with self._stderr_lock:
+            return "".join(self._stderr_ring).strip()
 
     @property
     def is_running(self) -> bool:
@@ -682,6 +813,12 @@ class HyMT2Translator:
             if not self.gguf_path.exists():
                 raise FileNotFoundError(f"Chưa tải file model Hy-MT2: {self.gguf_path}")
 
+            # Probe preferred port; if occupied by a stale/foreign process, switch cleanly to a free local port
+            chosen_port = _pick_free_local_port(self.port)
+            if chosen_port != self.port:
+                self.port = chosen_port
+                self.base_url = f"http://127.0.0.1:{chosen_port}"
+
             cmd = [
                 str(llama_bin),
                 "-m", str(self.gguf_path),
@@ -690,9 +827,17 @@ class HyMT2Translator:
                 "--jinja",
                 "--reasoning", "off",
                 "-c", "2048",
-                "-ngl", "99",
+                "-np", "1",
+                "--log-disable",
                 "-t", str(self.threads),
             ]
+            use_gpu = (
+                (platform.system() == "Darwin" and platform.machine() == "arm64")
+                or os.environ.get("VOICERECORE_LLAMA_GPU", "").strip().lower() in ("1", "true", "yes")
+            )
+            if use_gpu:
+                cmd.extend(["-ngl", "99"])
+
             kwargs: dict = {
                 "stdout": subprocess.DEVNULL,
                 "stderr": subprocess.PIPE,
@@ -700,27 +845,28 @@ class HyMT2Translator:
             if os.name == "nt":
                 kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
 
-            self._proc = subprocess.Popen(cmd, **kwargs)
-            deadline = time.monotonic() + 25.0
+            proc = subprocess.Popen(cmd, **kwargs)
+            self._proc = proc
+            self._start_stderr_drainer(proc)
+
+            deadline = time.monotonic() + 45.0
             while time.monotonic() < deadline:
-                if self._proc.poll() is not None:
-                    err = ""
-                    try:
-                        err = self._proc.stderr.read().decode("utf-8", errors="ignore") if self._proc.stderr else ""
-                    except Exception:
-                        pass
+                if proc.poll() is not None:
+                    time.sleep(0.05)
+                    err = self._get_recent_stderr()
                     self._proc = None
                     raise RuntimeError(f"Hy-MT2 llama-server khởi động thất bại: {err[:400]}")
                 try:
-                    r = self._client.get(f"{self.base_url}/health", timeout=1.0)
+                    with self._client_lock:
+                        r = self._get_client().get(f"{self.base_url}/health", timeout=1.0)
                     if r.status_code == 200:
                         return
                 except Exception:
                     pass
-                time.sleep(0.2)
+                time.sleep(0.15)
 
             self.stop()
-            raise RuntimeError("Hy-MT2 llama-server khởi động quá thời gian chờ (25s).")
+            raise RuntimeError("Hy-MT2 llama-server khởi động quá thời gian chờ (45s).")
 
     def stop(self) -> None:
         proc = self._proc
@@ -732,8 +878,21 @@ class HyMT2Translator:
             except Exception:
                 try:
                     proc.kill()
+                    proc.wait(timeout=1.0)
                 except Exception:
                     pass
+
+    def close(self) -> None:
+        try:
+            atexit.unregister(self._atexit_cb)
+        except Exception:
+            pass
+        self.stop()
+        with self._client_lock:
+            try:
+                self._client.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _clean_output(raw: str) -> str:
@@ -801,16 +960,17 @@ class HyMT2Translator:
         prompt = "\n\n".join(blocks)
 
         t0 = time.perf_counter()
-        resp = self._client.post(
-            f"{self.base_url}/v1/chat/completions",
-            json={
-                "model": "hy-mt2-1.8b",
-                "temperature": 0.0,
-                "top_p": 0.6,
-                "max_tokens": min(384, max(96, len(clean.split()) * 6)),
-                "messages": [{"role": "user", "content": prompt}],
-            },
-        )
+        with self._client_lock:
+            resp = self._get_client().post(
+                f"{self.base_url}/v1/chat/completions",
+                json={
+                    "model": "hy-mt2-1.8b",
+                    "temperature": 0.0,
+                    "top_p": 0.6,
+                    "max_tokens": min(384, max(96, len(clean.split()) * 6)),
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            )
         resp.raise_for_status()
         data = resp.json()
         raw_out = data["choices"][0]["message"]["content"]
@@ -841,8 +1001,22 @@ class GoogleCloudTranslator:
 
     def __init__(self, api_key: str, timeout_s: float = 8.0) -> None:
         self.api_key = api_key.strip()
+        self._timeout_s = timeout_s
+        self._client_lock = threading.Lock()
         self._client = httpx.Client(timeout=timeout_s)
         self._cache = LRUCache(maxsize=2048)
+
+    def _get_client(self) -> httpx.Client:
+        if self._client.is_closed:
+            self._client = httpx.Client(timeout=self._timeout_s)
+        return self._client
+
+    def close(self) -> None:
+        with self._client_lock:
+            try:
+                self._client.close()
+            except Exception:
+                pass
 
     def translate(self, text: str, src_lang: str = "vie_Latn", tgt_lang: str = "eng_Latn") -> TranslationResult:
         clean = text.strip()
@@ -867,11 +1041,12 @@ class GoogleCloudTranslator:
         payload: dict = {"q": clean, "target": tl, "format": "text"}
         if sl:
             payload["source"] = sl
-        resp = self._client.post(
-            "https://translation.googleapis.com/language/translate/v2",
-            headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
-            json=payload,
-        )
+        with self._client_lock:
+            resp = self._get_client().post(
+                "https://translation.googleapis.com/language/translate/v2",
+                headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
+                json=payload,
+            )
         if resp.status_code >= 400:
             err_msg = ""
             try:
@@ -904,8 +1079,22 @@ class AzureTranslator:
         self.api_key = api_key.strip()
         self.region = region.strip()
         self.endpoint = (endpoint or "https://api.cognitive.microsofttranslator.com").rstrip("/")
+        self._timeout_s = timeout_s
+        self._client_lock = threading.Lock()
         self._client = httpx.Client(timeout=timeout_s)
         self._cache = LRUCache(maxsize=2048)
+
+    def _get_client(self) -> httpx.Client:
+        if self._client.is_closed:
+            self._client = httpx.Client(timeout=self._timeout_s)
+        return self._client
+
+    def close(self) -> None:
+        with self._client_lock:
+            try:
+                self._client.close()
+            except Exception:
+                pass
 
     def translate(self, text: str, src_lang: str = "vie_Latn", tgt_lang: str = "eng_Latn") -> TranslationResult:
         clean = text.strip()
@@ -937,12 +1126,13 @@ class AzureTranslator:
         if sl:
             params["from"] = sl
 
-        resp = self._client.post(
-            f"{self.endpoint}/translate",
-            params=params,
-            headers=headers,
-            json=[{"Text": clean}],
-        )
+        with self._client_lock:
+            resp = self._get_client().post(
+                f"{self.endpoint}/translate",
+                params=params,
+                headers=headers,
+                json=[{"Text": clean}],
+            )
         if resp.status_code >= 400:
             err_msg = ""
             try:
@@ -973,8 +1163,22 @@ class GeminiCloudTranslator:
         if m in self._DEPRECATED_MODELS:
             m = "gemini-2.5-flash"
         self.model = m
+        self._timeout_s = timeout_s
+        self._client_lock = threading.Lock()
         self._client = httpx.Client(timeout=timeout_s)
         self._cache = LRUCache(maxsize=2048)
+
+    def _get_client(self) -> httpx.Client:
+        if self._client.is_closed:
+            self._client = httpx.Client(timeout=self._timeout_s)
+        return self._client
+
+    def close(self) -> None:
+        with self._client_lock:
+            try:
+                self._client.close()
+            except Exception:
+                pass
 
     def translate(
         self,
@@ -1029,14 +1233,15 @@ class GeminiCloudTranslator:
 
         t0 = time.perf_counter()
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
-        resp = self._client.post(
-            url,
-            headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
-            json={
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": gen_cfg,
-            },
-        )
+        with self._client_lock:
+            resp = self._get_client().post(
+                url,
+                headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
+                json={
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": gen_cfg,
+                },
+            )
         if resp.status_code >= 400:
             err_msg = ""
             try:
@@ -1058,6 +1263,11 @@ _ACTION_KEYWORDS = (
     "action", "plan", "budget", "deploy", "agree", "decide", "must", "will", "schedule", "follow up",
 )
 
+_ACTION_PATTERNS = tuple(
+    re.compile(rf"(?<!\w){re.escape(k)}(?!\w)", re.IGNORECASE | re.UNICODE)
+    for k in _ACTION_KEYWORDS
+)
+
 
 def summarize_meeting_entries(
     entries: list[dict],
@@ -1071,11 +1281,13 @@ def summarize_meeting_entries(
     and ensures every bullet has both original + translated text.
     """
     if not entries:
+        empty_vi = "Chưa có nội dung hội thoại để tóm tắt."
+        empty_en = "No transcript entries available to summarize."
         return {
             "total_sentences": 0,
             "total_words": 0,
-            "overview_src": "Chưa có nội dung hội thoại để tóm tắt.",
-            "overview_tgt": "No transcript entries available to summarize.",
+            "overview_src": empty_en if source_lang == "eng_Latn" else empty_vi,
+            "overview_tgt": empty_vi if source_lang == "eng_Latn" else empty_en,
             "key_points": [],
             "action_items": [],
         }
@@ -1095,13 +1307,13 @@ def summarize_meeting_entries(
         # Boost sentences with concrete numbers, times, dates, currencies
         if re.search(r"\d+", src):
             score += 6.0
-        # Boost decision / planning keywords
-        kw_hits = sum(1 for k in _ACTION_KEYWORDS if k in low)
+        # Boost decision / planning keywords (strict Unicode word boundaries — no "hạnh phúc" / "planet" false hits)
+        kw_hits = sum(1 for pat in _ACTION_PATTERNS if pat.search(low))
         score += kw_hits * 4.5
         if idx == 0 or idx == len(entries) - 1:
             score += 2.5
         scored.append((score, idx, e))
-        if kw_hits >= 1 or re.search(r"\b(\d+\s*(?:giờ|triệu|tỷ|ngày|tuần|tháng|%|million|am|pm))\b", low):
+        if kw_hits >= 1 or re.search(r"(?<!\w)\d+\s*(?:giờ|triệu|tỷ|tỉ|ngày|tuần|tháng|%|million|am|pm)(?!\w)", low, flags=re.UNICODE):
             actions.append(
                 {
                     "timestamp": e.get("timestamp", ""),
@@ -1126,21 +1338,35 @@ def summarize_meeting_entries(
 
     first_ts = entries[0].get("timestamp", "")
     last_ts = entries[-1].get("timestamp", "")
-    overview_src = (
+    vi_overview = (
         f"Phiên họp ghi nhận {len(entries)} câu ({total_words} từ) từ {first_ts} đến {last_ts}, "
         f"trích xuất {len(key_points)} ý chính và {min(len(actions), 6)} mục hành động / số liệu quan trọng."
     )
-    overview_tgt = (
+    en_overview = (
         f"Session recorded {len(entries)} sentences ({total_words} words) from {first_ts} to {last_ts}, "
         f"with {len(key_points)} key highlights and {min(len(actions), 6)} action items / key figures."
     )
-    if translate_fn is not None and target_lang not in ("eng_Latn", "vie_Latn"):
-        try:
-            tr_ov = translate_fn(overview_src, "vie_Latn", target_lang)
-            if tr_ov.translated_text:
-                overview_tgt = tr_ov.translated_text
-        except Exception:
-            pass
+
+    if source_lang == "eng_Latn":
+        overview_src = en_overview
+        overview_tgt = vi_overview if target_lang == "vie_Latn" else en_overview
+        if translate_fn is not None and target_lang not in ("eng_Latn", "vie_Latn"):
+            try:
+                tr_ov = translate_fn(en_overview, "eng_Latn", target_lang)
+                if tr_ov.translated_text:
+                    overview_tgt = tr_ov.translated_text
+            except Exception:
+                pass
+    else:
+        overview_src = vi_overview
+        overview_tgt = en_overview if target_lang == "eng_Latn" else vi_overview
+        if translate_fn is not None and target_lang not in ("eng_Latn", "vie_Latn"):
+            try:
+                tr_ov = translate_fn(vi_overview, "vie_Latn", target_lang)
+                if tr_ov.translated_text:
+                    overview_tgt = tr_ov.translated_text
+            except Exception:
+                pass
 
     return {
         "total_sentences": len(entries),

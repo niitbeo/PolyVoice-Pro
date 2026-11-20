@@ -2,15 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleIdentifier</key>
-    <string>com.voicerecore.macos-helper</string>
-    <key>CFBundleName</key>
-    <string>VOICERECORE Audio Helper</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>VOICERECORE cần quyền Micro để nhận dạng giọng nói và dịch theo thời gian thực.</string>
+    <string>PolyVoice Pro cần quyền Micro để nhận dạng giọng nói và phiên dịch theo thời gian thực.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
-    <string>VOICERECORE sử dụng nhận dạng giọng nói offline của macOS trên Apple Neural Engine để đạt tốc độ cao và tiết kiệm CPU.</string>
+    <string>PolyVoice Pro sử dụng nhận dạng giọng nói offline của macOS trên Apple Neural Engine để đạt tốc độ cao và tiết kiệm CPU.</string>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>VOICERECORE cần quyền ghi âm thanh hệ thống (ScreenCaptureKit) để thu trực tiếp tiếng YouTube, Zoom, Google Meet.</string>
+    <string>PolyVoice Pro cần quyền ghi âm thanh hệ thống (ScreenCaptureKit) để thu trực tiếp tiếng YouTube, Zoom, Google Meet.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>PolyVoice Pro sử dụng mạng nội bộ (Wi-Fi / LAN) để phát phụ đề đa ngôn ngữ qua mã QR cho điện thoại khán giả trong hội trường.</string>
 </dict>
 </plist>
