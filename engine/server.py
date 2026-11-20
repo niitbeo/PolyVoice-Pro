@@ -57,6 +57,11 @@ elif hasattr(sys.stderr, "reconfigure"):
         pass
 
 os.environ.setdefault("PYTHONUTF8", "1")
+# Prevent OpenMP / CTranslate2 / ONNX Runtime worker threads from busy-spinning at 200%+ CPU on laptops
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+os.environ.setdefault("KMP_BLOCKTIME", "0")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -520,6 +525,7 @@ class EngineRuntime:
         self._stable_prefix = StablePrefixTracker()
         self._mt_wakeup = threading.Event()
         self._draft_wakeup = threading.Event()
+        self._final_mt_busy: bool = False
 
         # Primary channel semantic sentence buffer + PCM ring buffer for Pass-2 Vietnamese refinement
         self._para_lock = threading.Lock()
@@ -980,9 +986,10 @@ class EngineRuntime:
     def ensure_envit5_loaded(self) -> Optional[EnViT5Translator]:
         with self._model_lock:
             if self._envit5 is None and self.model_manager.is_envit5_ready():
+                # 2 intra-threads is empirically 4-6x faster than 4 under concurrent ASR/Pass-2 load on laptops
                 self._envit5 = EnViT5Translator(
                     self.model_manager.envit5_dir,
-                    intra_threads=_adaptive_mt_threads(),
+                    intra_threads=2,
                 )
             return self._envit5
 
@@ -1034,7 +1041,7 @@ class EngineRuntime:
                 self._nllb = NLLBTranslator(
                     self.model_manager.nllb_600m_dir,
                     device="cpu",
-                    intra_threads=_adaptive_mt_threads(),
+                    intra_threads=2,
                     engine_name="nllb-200-600m-int8",
                 )
             if self._nllb is not None:
@@ -1293,8 +1300,9 @@ class EngineRuntime:
                 cached=res.cached,
             )
 
-        # Use fast greedy beam=1 for live drafts and faithful beam=2 for final committed sentences
-        eff_beam = 1 if is_draft else max(2, beam_size)
+        # Keep greedy beam=1 by default (5x faster & 3x cooler CPU than beam=2 under live ASR/Pass-2 load);
+        # finals use gentle repetition_penalty=1.05 in EnViT5Translator for maximum word faithfulness.
+        eff_beam = 1 if is_draft else max(1, beam_size)
 
         # 1) Fast online (0% CPU, ~80-160ms) — drafts stay Offline to prevent rapid-fire 429 throttling!
         if mt_mode == "fast-online" and not is_draft:
@@ -1315,7 +1323,9 @@ class EngineRuntime:
         if mt_mode in ("auto-offline", "light-offline", "cloud-api", "hy-mt2", "fast-online", "local-llm") and is_vi_en_pair:
             envit5 = self.ensure_envit5_loaded()
             if envit5 is not None:
-                return _finish(envit5.translate(masked, source_lang, target_lang, beam_size=eff_beam))
+                return _finish(
+                    envit5.translate(masked, source_lang, target_lang, beam_size=eff_beam, is_draft=is_draft)
+                )
 
         if mt_mode in ("opus", "auto-offline", "light-offline", "cloud-api", "hy-mt2", "fast-online", "local-llm") and is_vi_en_pair:
             if source_lang == "vie_Latn" and target_lang == "eng_Latn":
@@ -3221,6 +3231,7 @@ class EngineRuntime:
                 translated = ""
                 mt_ms = 0.0
                 mt_engine = cfg.mt_mode
+                self._final_mt_busy = True
                 try:
                     res = self.translate_text(
                         source_text,
@@ -3239,6 +3250,8 @@ class EngineRuntime:
                     mt_engine = res.engine
                 except Exception as exc:
                     self.broadcast_threadsafe({"type": "error", "data": {"message": f"Lỗi dịch: {exc}"}})
+                finally:
+                    self._final_mt_busy = False
 
                 if source_text and translated:
                     self._recent_context.append((source_text, translated))
@@ -3307,18 +3320,14 @@ class EngineRuntime:
                 if seg_id in self._committed_seg_ids:
                     continue
 
-            # If on a CPU-shared non-VI/EN light-offline pair while finals are queued, yield briefly
-            is_vi_en_pair = {partial_job["source_lang"], partial_job["target_lang"]} == {"vie_Latn", "eng_Latn"}
-            if not is_vi_en_pair and cfg.mt_mode == "light-offline" and not self._final_mt_queue.empty():
+            # When Finals also run on CPU CTranslate2 (default auto-offline), yield briefly while a Final
+            # sentence is actively translating so drafts never pile onto the same lock or spike CPU!
+            if cfg.mt_mode != "hy-mt2" and (self._final_mt_busy or not self._final_mt_queue.empty()):
                 with self._partial_lock:
                     if self._pending_partial is None and seg_id not in self._committed_seg_ids:
                         self._pending_partial = partial_job
-                self._draft_wakeup.wait(timeout=0.15)
+                self._draft_wakeup.wait(timeout=0.08)
                 self._draft_wakeup.clear()
-                continue
-
-            # Adaptive throttle based strictly on DRAFT latency (never polluted by Hy-MT2 final latency!)
-            if last_draft_mt_ms > 2800.0:
                 continue
 
             draft_src = self._trim_dangling_tail_for_draft(partial_job["source_text"])
@@ -3333,12 +3342,15 @@ class EngineRuntime:
             )
             now = time.perf_counter()
             same_seg = seg_id == last_partial_seg_id
+            if not same_seg:
+                # Never carry an old latency spike into a brand-new sentence
+                last_draft_mt_ms = min(last_draft_mt_ms, 450.0)
             elapsed_s = now - last_partial_time
 
-            # Calm, readable YouTube cadence: ~0.45s normal (0.75s Eco), 2-word delta on same segment
+            # Calm, readable YouTube cadence: ~0.45s normal (0.75s Eco), gracefully capped at 1.1s under load
             base_debounce = 0.75 if cfg.eco_mode else 0.45
             if last_draft_mt_ms > 550.0:
-                base_debounce = max(base_debounce, (last_draft_mt_ms / 1000.0) * 0.9)
+                base_debounce = min(1.10, max(base_debounce, (last_draft_mt_ms / 1000.0) * 0.85))
 
             if not same_seg:
                 min_first_wc = 2 if partial_job["source_lang"].startswith(_NON_SPACED_SCRIPT_PREFIXES) else 3

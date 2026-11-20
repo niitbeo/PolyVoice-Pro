@@ -346,6 +346,7 @@ class EnViT5Translator:
         src_lang: str = "vie_Latn",
         tgt_lang: str = "eng_Latn",
         beam_size: int = 1,
+        is_draft: bool = False,
     ) -> TranslationResult:
         clean = text.strip()
         if not clean:
@@ -354,23 +355,23 @@ class EnViT5Translator:
             return TranslationResult(clean, clean, src_lang, tgt_lang, 0.0, "passthrough")
 
         prefix = "vi" if src_lang == "vie_Latn" else "en"
-        cache_key = (clean, src_lang, tgt_lang, beam_size)
+        cache_key = (clean, src_lang, tgt_lang, beam_size, is_draft)
         cached = self._cache.get(cache_key)
         if cached is not None:
             return TranslationResult(clean, cached, src_lang, tgt_lang, 0.0, "vietai-envit5", True)
 
-        t0 = time.perf_counter()
         chunks = _split_semantic_sentences(clean, max_words=32)
         batch_tokens = [self._sp.encode(f"{prefix}: {c}", out_type=str) + ["</s>"] for c in chunks]
         max_src_len = max(len(toks) for toks in batch_tokens)
         is_short_src = len(clean.split()) <= 6
         eff_beam = max(1, beam_size)
         max_dec = min(256, max(16, int(max_src_len * 2.5) + 6))
-        # Beam>=2 (final sentences): length_penalty=1.15 + gentle rep_penalty=1.05 prevents early-EOS
-        # clause truncation and keeps 100% of numbers/modifiers faithful!
-        rep_pen = 1.18 if is_short_src else (1.05 if eff_beam >= 2 else 1.12)
+        # Finals use gentle rep_penalty=1.05 (preserves every word faithfully without beam=2 5x CPU spike);
+        # Short live drafts use rep_penalty=1.18 to block prefix echoing!
+        rep_pen = 1.18 if (is_draft and is_short_src) else (1.05 if not is_draft else 1.10)
         len_pen = 1.15 if (eff_beam >= 2 and not is_short_src) else 1.0
         with self._lock:
+            t0 = time.perf_counter()
             results = self._translator.translate_batch(
                 batch_tokens,
                 beam_size=eff_beam,
@@ -379,6 +380,7 @@ class EnViT5Translator:
                 repetition_penalty=rep_pen,
                 no_repeat_ngram_size=3 if is_short_src else 4,
             )
+            ms = round((time.perf_counter() - t0) * 1000.0, 1)
 
         decoded_parts: list[str] = []
         for res in results:
@@ -411,7 +413,6 @@ class EnViT5Translator:
                 decoded_parts.append(part)
 
         translated = _clean_punctuation(" ".join(decoded_parts))
-        ms = round((time.perf_counter() - t0) * 1000.0, 1)
         self._cache.set(cache_key, translated)
         return TranslationResult(clean, translated, src_lang, tgt_lang, ms, "vietai-envit5")
 
@@ -469,7 +470,6 @@ class NLLBTranslator:
         if cached is not None:
             return TranslationResult(clean, cached, src_lang, tgt_lang, 0.0, self.engine_name, True)
 
-        t0 = time.perf_counter()
         chunks = _split_semantic_sentences(clean, max_words=32)
         batch_tokens = [[src_lang, *self._sp.encode(c, out_type=str), "</s>"] for c in chunks]
         max_src_len = max(len(toks) for toks in batch_tokens)
@@ -478,6 +478,7 @@ class NLLBTranslator:
         min_dec = max(2, int(min_src_len * 0.58)) if min_src_len >= 12 else 1
 
         with self._lock:
+            t0 = time.perf_counter()
             results = self._translator.translate_batch(
                 batch_tokens,
                 target_prefix=[[tgt_lang]] * len(batch_tokens),
@@ -488,6 +489,7 @@ class NLLBTranslator:
                 repetition_penalty=1.08,
                 no_repeat_ngram_size=6,
             )
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
 
         decoded_parts: list[str] = []
         for res in results:
@@ -498,7 +500,6 @@ class NLLBTranslator:
                 decoded_parts.append(part)
 
         translated = _clean_punctuation(" ".join(decoded_parts))
-        latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
 
         self._cache.set(cache_key, translated)
         return TranslationResult(clean, translated, src_lang, tgt_lang, latency_ms, self.engine_name)
