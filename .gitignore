@@ -4,6 +4,7 @@ src-tauri/target/
 engine/.venv/
 engine/__pycache__/
 engine/build_sidecar_tmp/
+engine/vendor/
 src-tauri/resources/engine-bin/voicerecore-engine/
 native-macos/voicerecore-macos-helper
 *.key

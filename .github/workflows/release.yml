@@ -87,6 +87,7 @@ jobs:
           cd engine
           uv sync
           uv pip install --python .venv/Scripts/python.exe pyinstaller pyaudiowpatch
+          uv run --no-sync python ../scripts/fetch_llama_server.py
           uv run --no-sync python build_sidecar.py
 
       - name: Smoke-test Windows standalone AI Engine sidecar
@@ -99,6 +100,9 @@ jobs:
 
           bin_path = Path("src-tauri/resources/engine-bin/voicerecore-engine/voicerecore-engine.exe").resolve()
           assert bin_path.exists(), f"Missing sidecar: {bin_path}"
+          llama_exe = bin_path.parent / "llama" / "llama-server.exe"
+          assert llama_exe.exists(), f"Missing bundled portable llama-server.exe: {llama_exe}"
+          subprocess.run([str(llama_exe), "--version"], cwd=str(llama_exe.parent), check=True, timeout=20)
 
           sherpa_ort = bin_path.parent / "_internal" / "sherpa_onnx" / "lib" / "onnxruntime.dll"
           viet_ort = bin_path.parent / "_internal" / "vietasr" / "_native" / "onnxruntime.dll"
@@ -137,7 +141,8 @@ jobs:
                   assert health is not None, "Windows sidecar failed to load ASR within 45s"
                   assert not health.get("boot_error"), f"boot_error: {health.get('boot_error')}"
                   assert health.get("system_audio_ready"), "Expected Windows WASAPI loopback ready"
-                  print("Windows sidecar smoke OK:", health["platform"], "asr_loaded=", health["asr_loaded"])
+                  assert health.get("llama_server_ready"), "Expected bundled portable llama_server_ready=True"
+                  print("Windows sidecar smoke OK:", health["platform"], "asr_loaded=", health["asr_loaded"], "llama_ready=", health["llama_server_ready"])
                   req = urllib.request.Request("http://127.0.0.1:18799/api/shutdown", method="POST")
                   with urllib.request.urlopen(req, timeout=5.0) as r:
                       assert r.status == 200
@@ -154,6 +159,7 @@ jobs:
           cd engine
           uv sync
           uv pip install --python .venv/bin/python pyinstaller
+          uv run --no-sync python ../scripts/fetch_llama_server.py
           uv run --no-sync python build_sidecar.py
 
       - name: Smoke-test macOS standalone AI Engine sidecar
@@ -165,6 +171,9 @@ jobs:
 
           bin_path = Path("src-tauri/resources/engine-bin/voicerecore-engine/voicerecore-engine").resolve()
           assert bin_path.exists(), f"Missing sidecar: {bin_path}"
+          llama_bin = bin_path.parent / "llama" / "llama-server"
+          assert llama_bin.exists(), f"Missing bundled portable llama-server: {llama_bin}"
+          subprocess.run([str(llama_bin), "--version"], cwd=str(llama_bin.parent), check=True, timeout=20)
 
           with tempfile.TemporaryDirectory(prefix="pv_mac_smoke_") as td:
               env = os.environ.copy()
@@ -195,7 +204,8 @@ jobs:
                   assert not health.get("boot_error"), f"boot_error: {health.get('boot_error')}"
                   assert health.get("mac_helper_ready"), "Expected mac_helper_ready=True"
                   assert health.get("system_audio_ready"), "Expected system_audio_ready=True"
-                  print("macOS sidecar smoke OK:", health["platform"], "asr_loaded=", health["asr_loaded"])
+                  assert health.get("llama_server_ready"), "Expected bundled portable llama_server_ready=True"
+                  print("macOS sidecar smoke OK:", health["platform"], "asr_loaded=", health["asr_loaded"], "llama_ready=", health["llama_server_ready"])
                   req = urllib.request.Request("http://127.0.0.1:18799/api/shutdown", method="POST")
                   with urllib.request.urlopen(req, timeout=5.0) as r:
                       assert r.status == 200

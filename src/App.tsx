@@ -1426,12 +1426,15 @@ export default function App() {
   const handleDownloadCoreModels = async () => {
     setErrorMsg("");
     setShowAdvanced(true);
-    const missingIds: Array<"zipformer-30m-streaming" | "envit5"> = [];
+    const missingIds: Array<"zipformer-30m-streaming" | "envit5" | "hy-mt2"> = [];
     if (models?.asr_zipformer_streaming?.status !== "ready" && models?.asr_zipformer_streaming?.status !== "downloading") {
       missingIds.push("zipformer-30m-streaming");
     }
     if (models?.mt_envit5?.status !== "ready" && models?.mt_envit5?.status !== "downloading") {
       missingIds.push("envit5");
+    }
+    if (models?.mt_hymt2?.status !== "ready" && models?.mt_hymt2?.status !== "downloading") {
+      missingIds.push("hy-mt2");
     }
     for (const id of missingIds) {
       await handleDownloadModel(id);
@@ -1442,7 +1445,7 @@ export default function App() {
     if (
       modelId === "hy-mt2" &&
       typeof window !== "undefined" &&
-      !window.confirm("Xóa mô hình Hy-MT2 (~1.1 GB) khỏi ổ cứng? Bạn có thể tải lại bất cứ lúc nào.")
+      !window.confirm("Xóa mô hình Hy-MT2 (~1.05 GB) khỏi ổ cứng? App sẽ tự dùng EnViT5 cho Việt ⇄ Anh và bạn có thể tải lại bất cứ lúc nào.")
     ) {
       return;
     }
@@ -1611,8 +1614,8 @@ export default function App() {
         ["Nghe Tiếng Việt (+Hotwords)", models?.asr_zipformer_streaming, "zipformer-30m-streaming", "49 MB"],
         ["Nghe Tiếng Anh (Nháp live)", models?.asr_zipformer_en_20m, "zipformer-en-20m", "130 MB"],
         ["Nghe Tiếng Anh (Chuẩn 0.6%)", models?.asr_moonshine_en, "moonshine-en", "135 MB"],
-        ["Dịch Việt ⇄ Anh (EnViT5)", models?.mt_envit5, "envit5", "266 MB"],
-        ["Dịch Lào & 202 NN (NLLB-600M)", models?.mt_nllb_600m, "nllb-600m", "604 MB"],
+        ["Dịch Nháp Việt ⇄ Anh (EnViT5)", models?.mt_envit5, "envit5", "266 MB"],
+        ["Dịch Chuẩn 38 NN (Hy-MT2)", models?.mt_hymt2, "hy-mt2", "1.05 GB"],
       ] as const,
     [models]
   );
@@ -1620,7 +1623,7 @@ export default function App() {
   const optionalModelRows = useMemo(
     () =>
       [
-        ["Dịch Thái / 38 NN chuẩn (Hy-MT2)", models?.mt_hymt2, "hy-mt2", "1.1 GB"],
+        ["Dịch Tiếng Lào & 202 NN (NLLB-600M)", models?.mt_nllb_600m, "nllb-600m", "604 MB"],
       ] as const,
     [models]
   );
@@ -2199,7 +2202,11 @@ export default function App() {
                   color: mtMode === "cloud-api" ? "var(--green-text)" : "var(--accent-text)",
                 }}
               >
-                {mtMode === "cloud-api" ? "● Đang dùng Cloud" : "● 100% Offline"}
+                {mtMode === "cloud-api"
+                  ? "● Đang dùng Cloud"
+                  : status?.hymt2_loaded && status?.hymt2_backend
+                  ? `● Offline • ${status.hymt2_backend.toUpperCase()}`
+                  : "● 100% Offline"}
               </span>
             </div>
 
@@ -2290,10 +2297,10 @@ export default function App() {
                   }}
                 >
                   <option value="auto-offline">
-                    Tự động Chuẩn (EnViT5 • Hy-MT2 Thái • NLLB-600M Lào)
+                    2 Tầng Chuẩn cao (Nháp EnViT5 + Chốt Hy-MT2 • 38 NN)
                   </option>
                   <option value="light-offline">
-                    Siêu nhẹ Tiết kiệm RAM (Chỉ EnViT5 + NLLB-600M • 202 NN)
+                    Siêu nhẹ &amp; Nhanh (Chỉ EnViT5 + NLLB-600M • 202 NN)
                   </option>
                   <option value="local-llm">Local LLM nâng cao (Ollama / llama.cpp)</option>
                 </select>
@@ -2464,8 +2471,8 @@ export default function App() {
                 )}
 
                 <div className="hint" style={{ marginTop: 2, fontWeight: 700, color: "var(--text-1)" }}>
-                  <span>Gói Cốt lõi (~1.18 GB)</span>
-                  <span style={{ color: "var(--text-2)", fontWeight: 500 }}>5 model tinh gọn</span>
+                  <span>Gói Cốt lõi (~1.6 GB)</span>
+                  <span style={{ color: "var(--text-2)", fontWeight: 500 }}>5 model chuẩn 2 tầng</span>
                 </div>
 
                 {coreModelRows.map(([label, st, id, sz]) => {
@@ -2478,15 +2485,27 @@ export default function App() {
                       <div className="model-top">
                         <span>{label}</span>
                         {st?.status === "ready" ? (
-                          isJustDone ? (
-                            <span className="model-done-badge">
-                              <CheckCircle2 size={12} /> Tải thành công
-                            </span>
-                          ) : (
-                            <span style={{ color: "var(--green-text)", fontSize: 11, whiteSpace: "nowrap" }}>
-                              ✓ {sz}
-                            </span>
-                          )
+                          <div className="row" style={{ gap: 5 }}>
+                            {isJustDone ? (
+                              <span className="model-done-badge">
+                                <CheckCircle2 size={12} /> Tải thành công
+                              </span>
+                            ) : (
+                              <span style={{ color: "var(--green-text)", fontSize: 11, whiteSpace: "nowrap" }}>
+                                ✓ {sz}
+                              </span>
+                            )}
+                            {id === "hy-mt2" && (
+                              <button
+                                className="btn sm icon-only"
+                                style={{ width: 22, height: 22, minWidth: 22, padding: 3 }}
+                                onClick={() => handleDeleteModel("hy-mt2")}
+                                title="Xóa Hy-MT2 (1.05 GB) nếu dùng máy cấu hình nhẹ — app tự chạy bằng EnViT5"
+                              >
+                                <Trash2 size={11} />
+                              </button>
+                            )}
+                          </div>
                         ) : isDownloading ? (
                           <button className="btn sm downloading" disabled>
                             <Loader2 size={11.5} className="spin" /> {pct}%
@@ -2525,7 +2544,7 @@ export default function App() {
                 })}
 
                 <div className="hint" style={{ marginTop: 4, fontWeight: 700, color: "var(--text-1)" }}>
-                  <span>Mở rộng Tiếng Thái Offline (Tùy chọn)</span>
+                  <span>Mở rộng Tiếng Lào &amp; 202 Ngôn ngữ (Tùy chọn)</span>
                 </div>
 
                 {optionalModelRows.map(([label, st, id, sz]) => {

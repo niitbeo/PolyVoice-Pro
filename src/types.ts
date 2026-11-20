@@ -217,6 +217,7 @@ export interface EngineStatus {
   moonshine_en_ready?: boolean;
   hymt2_ready?: boolean;
   hymt2_loaded?: boolean;
+  hymt2_backend?: string;
   llama_server_ready?: boolean;
   envit5_ready: boolean;
   opus_en_ready: boolean;

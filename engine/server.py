@@ -1166,12 +1166,15 @@ class EngineRuntime:
                         # Record friendly status + enter cooldown, then fall back seamlessly to Offline SOTA!
                         self._record_cloud_error(pid, exc)
 
-        # Native Hy-MT2-1.8B path (uses direct Terminology Intervention + Context-Aware Background — no placeholders!)
-        # 1) Always used when user selects `hy-mt2` (except ultra-fast VI<->EN drafts, where EnViT5 keeps latency <200ms)
-        # 2) In `auto-offline` (and as offline fallback for `cloud-api` on non-VI/EN pairs among Hy-MT2's 38 languages)
+        # 2-Tier Smart Offline Architecture (v0.8.6):
+        # - Live Drafts (`is_draft=True`) on VI <-> EN: ALWAYS stay on ultra-fast EnViT5 (176-341ms on any CPU)!
+        # - Final Committed Sentences (`is_draft=False`) across ALL 38 Hy-MT2 languages (INCLUDING VI <-> EN!):
+        #   Route directly to Hy-MT2-1.8B (9.1-9.3/10 VI->EN, 8.7/10 EN->VI, native Context + Glossary) in
+        #   `auto-offline`, `hy-mt2`, and as offline fallback for `cloud-api`.
+        # - `light-offline` skips Hy-MT2 completely (EnViT5 + NLLB-600M only for low-RAM PCs).
         use_hymt2 = can_hymt2 and (
-            (mt_mode == "hy-mt2" and (not is_draft or not is_vi_en_pair))
-            or (mt_mode in ("auto-offline", "cloud-api") and not is_vi_en_pair and not is_draft)
+            (mt_mode in ("auto-offline", "hy-mt2", "cloud-api") and not is_draft)
+            or (mt_mode == "hy-mt2" and not is_vi_en_pair)
         )
         if use_hymt2:
             try:
@@ -1296,6 +1299,7 @@ class EngineRuntime:
             "moonshine_en_ready": self.model_manager.is_moonshine_en_ready(),
             "hymt2_ready": self.model_manager.is_hymt2_ready() and self._llama_server_ready,
             "hymt2_loaded": self._hymt2 is not None and self._hymt2.is_running,
+            "hymt2_backend": self._hymt2.active_backend if (self._hymt2 is not None and self._hymt2.is_running) else "",
             "llama_server_ready": self._llama_server_ready,
             "envit5_ready": self.model_manager.is_envit5_ready(),
             "opus_en_ready": self.model_manager.is_opus_vi_en_ready(),
@@ -1560,6 +1564,25 @@ class EngineRuntime:
 
         self._mt_thread = threading.Thread(target=self._mt_worker_loop, daemon=True, name="mt-worker")
         self._mt_thread.start()
+
+        # Pre-warm Hy-MT2 llama-server in the background so Sentence #1 has zero cold-start delay
+        if (
+            self.config.mt_mode in ("auto-offline", "hy-mt2")
+            and self._llama_server_ready
+            and self.model_manager.is_hymt2_ready()
+            and bool(get_hymt2_lang_name(self.config.source_lang))
+            and bool(get_hymt2_lang_name(self.config.target_lang))
+        ):
+            def _warmup_hymt2() -> None:
+                try:
+                    h = self.ensure_hymt2_loaded()
+                    if h is not None:
+                        h.ensure_started()
+                        self.broadcast_threadsafe({"type": "status", "data": self.get_status_payload()})
+                except Exception:
+                    pass
+
+            threading.Thread(target=_warmup_hymt2, daemon=True, name="hymt2-warmup").start()
 
         # Primary audio channel: "mic" in mic/dual mode, "system" in system mode, "mix" in hall-mixer mode
         primary_source = (

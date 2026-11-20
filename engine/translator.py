@@ -681,32 +681,44 @@ class LocalLLMTranslator:
 
 
 def find_llama_server() -> Optional[Path]:
-    """Locate local `llama-server` binary (Homebrew macOS, PATH, or bundled sidecar on Win/Mac)."""
+    """Locate portable bundled `llama-server` (Win Vulkan/CPU or Mac Metal) or system PATH/Homebrew."""
     env_bin = os.environ.get("VOICERECORE_LLAMA_SERVER")
     if env_bin and Path(env_bin).is_file():
         return Path(env_bin)
+
+    here = Path(__file__).resolve().parent
+    exe_dir = Path(sys.executable).resolve().parent
+    candidates = [
+        # Bundled portable llama-server inside packaged sidecar (highest priority)
+        exe_dir / "llama" / "llama-server.exe",
+        exe_dir / "llama" / "llama-server",
+        exe_dir / "llama-server.exe",
+        exe_dir / "llama-server",
+        exe_dir.parent / "llama" / "llama-server.exe",
+        exe_dir.parent / "llama" / "llama-server",
+        exe_dir.parent / "llama-server.exe",
+        exe_dir.parent / "llama-server",
+        # Local repo vendor directory (dev / CI build staging)
+        here / "vendor" / "llama-bin" / "llama-server.exe",
+        here / "vendor" / "llama-bin" / "llama-server",
+        here / "llama" / "llama-server.exe",
+        here / "llama" / "llama-server",
+        here / "llama-server.exe",
+        here / "llama-server",
+        here.parent / "llama-server.exe",
+        here.parent / "llama-server",
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p
 
     which = shutil.which("llama-server")
     if which:
         return Path(which)
 
-    here = Path(__file__).resolve().parent
-    exe_dir = Path(sys.executable).resolve().parent
-    candidates = [
-        exe_dir / "llama-server",
-        exe_dir / "llama-server.exe",
-        exe_dir.parent / "llama-server",
-        exe_dir.parent / "llama-server.exe",
-        here / "llama-server",
-        here / "llama-server.exe",
-        here.parent / "llama-server",
-        here.parent / "llama-server.exe",
-        Path("/opt/homebrew/bin/llama-server"),
-        Path("/usr/local/bin/llama-server"),
-    ]
-    for p in candidates:
-        if p.exists() and p.is_file():
-            return p
+    for sys_p in (Path("/opt/homebrew/bin/llama-server"), Path("/usr/local/bin/llama-server")):
+        if sys_p.exists() and sys_p.is_file():
+            return sys_p
     return None
 
 
@@ -756,6 +768,7 @@ class HyMT2Translator:
         self.port = port
         self.threads = _adaptive_mt_threads(threads)
         self.base_url = f"http://127.0.0.1:{port}"
+        self.active_backend: str = ""
         self._proc: Optional[subprocess.Popen] = None
         self._stderr_ring: deque[str] = deque()
         self._stderr_bytes: int = 0
@@ -818,7 +831,9 @@ class HyMT2Translator:
                 return
             llama_bin = find_llama_server()
             if llama_bin is None:
-                raise RuntimeError("Không tìm thấy `llama-server` để chạy Hy-MT2-1.8B (cài bằng `brew install llama.cpp`).")
+                raise RuntimeError(
+                    "Không tìm thấy `llama-server` để chạy Hy-MT2-1.8B. Hãy cập nhật bản cài đặt mới nhất hoặc cài `llama.cpp`."
+                )
             if not self.gguf_path.exists():
                 raise FileNotFoundError(f"Chưa tải file model Hy-MT2: {self.gguf_path}")
 
@@ -828,54 +843,72 @@ class HyMT2Translator:
                 self.port = chosen_port
                 self.base_url = f"http://127.0.0.1:{chosen_port}"
 
-            cmd = [
-                str(llama_bin),
-                "-m", str(self.gguf_path),
-                "--host", "127.0.0.1",
-                "--port", str(self.port),
-                "--jinja",
-                "--reasoning", "off",
-                "-c", "2048",
-                "-np", "1",
-                "--log-disable",
-                "-t", str(self.threads),
-            ]
-            use_gpu = (
-                (platform.system() == "Darwin" and platform.machine() == "arm64")
-                or os.environ.get("VOICERECORE_LLAMA_GPU", "").strip().lower() in ("1", "true", "yes")
-            )
-            if use_gpu:
-                cmd.extend(["-ngl", "99"])
+            gpu_env = os.environ.get("VOICERECORE_LLAMA_GPU", "").strip().lower()
+            is_mac_arm = platform.system() == "Darwin" and platform.machine() == "arm64"
+            has_win_vulkan = os.name == "nt" and (llama_bin.parent / "ggml-vulkan.dll").is_file()
 
-            kwargs: dict = {
-                "stdout": subprocess.DEVNULL,
-                "stderr": subprocess.PIPE,
-            }
-            if os.name == "nt":
-                kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+            # Build ordered launch profiles: prefer hardware GPU (Apple Metal / Windows Vulkan),
+            # with guaranteed zero-crash automatic fallback to pure CPU (`-ngl 0`).
+            attempts: list[tuple[str, list[str]]] = []
+            if gpu_env not in ("0", "false", "no", "off"):
+                if is_mac_arm:
+                    attempts.append(("metal", ["-ngl", "99"]))
+                elif has_win_vulkan or gpu_env in ("1", "true", "yes", "on"):
+                    attempts.append(("vulkan" if has_win_vulkan else "gpu", ["-ngl", "99"]))
+            attempts.append(("cpu", ["-ngl", "0"]))
 
-            proc = subprocess.Popen(cmd, **kwargs)
-            self._proc = proc
-            self._start_stderr_drainer(proc)
+            last_err = ""
+            for backend_label, extra_flags in attempts:
+                cmd = [
+                    str(llama_bin),
+                    "-m", str(self.gguf_path),
+                    "--host", "127.0.0.1",
+                    "--port", str(self.port),
+                    "--jinja",
+                    "--reasoning", "off",
+                    "-c", "2048",
+                    "-np", "1",
+                    "--log-disable",
+                    "-t", str(self.threads),
+                    *extra_flags,
+                ]
+                kwargs: dict = {
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.PIPE,
+                    "cwd": str(llama_bin.parent),
+                }
+                if os.name == "nt":
+                    kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
 
-            deadline = time.monotonic() + 45.0
-            while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    time.sleep(0.05)
-                    err = self._get_recent_stderr()
-                    self._proc = None
-                    raise RuntimeError(f"Hy-MT2 llama-server khởi động thất bại: {err[:400]}")
-                try:
-                    with self._client_lock:
-                        r = self._get_client().get(f"{self.base_url}/health", timeout=1.0)
-                    if r.status_code == 200:
-                        return
-                except Exception:
-                    pass
-                time.sleep(0.15)
+                proc = subprocess.Popen(cmd, **kwargs)
+                self._proc = proc
+                self._start_stderr_drainer(proc)
 
-            self.stop()
-            raise RuntimeError("Hy-MT2 llama-server khởi động quá thời gian chờ (45s).")
+                deadline = time.monotonic() + (20.0 if len(attempts) > 1 and backend_label != "cpu" else 45.0)
+                started = False
+                while time.monotonic() < deadline:
+                    if proc.poll() is not None:
+                        time.sleep(0.05)
+                        last_err = self._get_recent_stderr()
+                        self._proc = None
+                        break
+                    try:
+                        with self._client_lock:
+                            r = self._get_client().get(f"{self.base_url}/health", timeout=1.0)
+                        if r.status_code == 200:
+                            started = True
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.15)
+
+                if started:
+                    self.active_backend = backend_label
+                    return
+                self.stop()
+
+            self.active_backend = ""
+            raise RuntimeError(f"Hy-MT2 llama-server khởi động thất bại: {last_err[:400] or 'quá thời gian chờ'}")
 
     def stop(self) -> None:
         proc = self._proc

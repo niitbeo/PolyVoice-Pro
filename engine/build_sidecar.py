@@ -249,23 +249,37 @@ def build() -> Path:
         shutil.copy2(school_logo, target_bundle / "school_logo.png")
         print(f"[build_sidecar] Bundled school logo -> {target_bundle / 'school_logo.png'}")
 
-    # Copy llama-server next to sidecar ONLY if it is portable/self-contained (avoid broken Homebrew dylib links)
+    # Bundle portable llama-server + runtime libs (Mac Metal / Win Vulkan+CPU) staged by scripts/fetch_llama_server.py
     llama_name = "llama-server.exe" if is_win else "llama-server"
-    llama_found = shutil.which("llama-server")
-    if llama_found:
-        llama_src = Path(llama_found).resolve()
-        if llama_src.exists():
-            if is_mac and not _is_portable_mac_binary(llama_src):
-                print(
-                    f"[build_sidecar] Skipping non-portable Homebrew llama-server ({llama_src}) "
-                    "to avoid broken /opt/homebrew dylib links on end-user Macs."
-                )
-            else:
-                llama_dst = target_bundle / llama_name
-                shutil.copy2(llama_src, llama_dst)
-                if not is_win:
-                    llama_dst.chmod(0o755)
-                print(f"[build_sidecar] Bundled llama-server -> {llama_dst}")
+    vendor_llama = ENGINE_DIR / "vendor" / "llama-bin"
+    if (vendor_llama / llama_name).is_file():
+        llama_dst_dir = target_bundle / "llama"
+        if llama_dst_dir.exists():
+            shutil.rmtree(llama_dst_dir)
+        shutil.copytree(vendor_llama, llama_dst_dir)
+        if not is_win:
+            for p in llama_dst_dir.iterdir():
+                if p.is_file() and (p.name == "llama-server" or p.name.endswith(".dylib")):
+                    p.chmod(0o755)
+        bundled_mb = sum(p.stat().st_size for p in llama_dst_dir.rglob("*") if p.is_file()) / 1048576.0
+        print(f"[build_sidecar] Bundled portable llama-server runtime ({bundled_mb:.1f} MB) -> {llama_dst_dir}")
+    else:
+        # Fallback: copy llama-server from PATH only if self-contained (avoid broken Homebrew dylib links)
+        llama_found = shutil.which("llama-server")
+        if llama_found:
+            llama_src = Path(llama_found).resolve()
+            if llama_src.exists():
+                if is_mac and not _is_portable_mac_binary(llama_src):
+                    print(
+                        f"[build_sidecar] Skipping non-portable Homebrew llama-server ({llama_src}) "
+                        "to avoid broken /opt/homebrew dylib links on end-user Macs."
+                    )
+                else:
+                    llama_dst = target_bundle / llama_name
+                    shutil.copy2(llama_src, llama_dst)
+                    if not is_win:
+                        llama_dst.chmod(0o755)
+                    print(f"[build_sidecar] Bundled llama-server -> {llama_dst}")
 
     exe_path = target_bundle / ("voicerecore-engine.exe" if is_win else "voicerecore-engine")
     if not exe_path.exists():
