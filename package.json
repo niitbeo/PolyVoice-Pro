@@ -1,7 +1,7 @@
 {
   "name": "polyvoice-pro",
   "private": true,
-  "version": "0.9.1",
+  "version": "0.9.2",
   "type": "module",
   "description": "Real-time Vietnamese Speech Recognition & 200-Language Local Translator (Windows & macOS)",
   "scripts": {
