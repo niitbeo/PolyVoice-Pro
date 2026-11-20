@@ -6,6 +6,7 @@ Models managed:
    - `zipformer-30m-streaming`: hynt/Zipformer-30M-RNNT-Streaming-6000h (~51MB, Vietnamese O(1) streaming)
    - `zipformer-en-20m`: sherpa-onnx-streaming-zipformer-en-20M-2023-02-17 (~128MB archive, English O(1) streaming)
    - `moonshine-en`: sherpa-onnx-moonshine-base-en-quantized-2026-02-27 (~106MB, English Pass-2 refiner)
+   - `whisper-turbo`: sherpa-onnx-whisper-turbo (~538MB INT8) + Silero VAD v5 (~2.2MB) — 99-language offline ASR (TH/LO/JA/ZH/KO/KM/FR/DE...)
    - `viet-asr`: embedded 78MB INT8 Zipformer2 + Silero VAD + Punctuation/ITN (zero download)
 2. MT (Translation):
    - `envit5`: luigi000/envit5-translation-ct2-int8 (~266MB, VietAI EnViT5 VI <-> EN)
@@ -173,6 +174,16 @@ MOONSHINE_EN_URL = (
 )
 MOONSHINE_EN_DIRNAME = "sherpa-onnx-moonshine-base-en-quantized-2026-02-27"
 
+WHISPER_TURBO_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "sherpa-onnx-whisper-turbo.tar.bz2"
+)
+WHISPER_TURBO_DIRNAME = "sherpa-onnx-whisper-turbo"
+SILERO_VAD_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "silero_vad_v5.onnx"
+)
+
 OPUS_VI_EN_REPO = "dekthedev/opus-mt-vi-en-ct2-int8"
 OPUS_EN_VI_REPO = "dekthedev/opus-mt-en-vi-ct2-int8"
 ENVIT5_REPO = "luigi000/envit5-translation-ct2-int8"
@@ -242,6 +253,14 @@ class ModelManager:
     @property
     def moonshine_en_dir(self) -> Path:
         return self.models_dir / MOONSHINE_EN_DIRNAME
+
+    @property
+    def whisper_turbo_dir(self) -> Path:
+        return self.models_dir / WHISPER_TURBO_DIRNAME
+
+    @property
+    def silero_vad_path(self) -> Path:
+        return self.whisper_turbo_dir / "silero_vad_v5.onnx"
 
     @property
     def opus_vi_en_dir(self) -> Path:
@@ -327,6 +346,24 @@ class ModelManager:
             and _file_ok(d / "tokens.txt", 100)
         )
 
+    def _whisper_turbo_has_weights(self) -> bool:
+        d = self.whisper_turbo_dir
+        if not _dir_not_downloading(d):
+            return False
+        enc = d / "turbo-encoder.int8.onnx"
+        dec = d / "turbo-decoder.int8.onnx"
+        tok = d / "turbo-tokens.txt"
+        if not enc.exists():
+            enc = next(d.glob("*-encoder.int8.onnx"), enc)
+        if not dec.exists():
+            dec = next(d.glob("*-decoder.int8.onnx"), dec)
+        if not tok.exists():
+            tok = next(d.glob("*-tokens.txt"), tok)
+        return _file_ok(enc, 100_000_000) and _file_ok(dec, 50_000_000) and _file_ok(tok, 100_000)
+
+    def is_whisper_turbo_ready(self) -> bool:
+        return self._whisper_turbo_has_weights() and _file_ok(self.silero_vad_path, 500_000)
+
     def is_opus_vi_en_ready(self) -> bool:
         d = self.opus_vi_en_dir
         if not _dir_not_downloading(d):
@@ -411,6 +448,19 @@ class ModelManager:
                     else "Chưa tải (~106 MB)",
                 ),
             )
+            whisper_turbo_state = self._states.get(
+                "whisper-turbo",
+                DownloadState(
+                    model_id="whisper-turbo",
+                    status="ready" if self.is_whisper_turbo_ready() else "missing",
+                    progress=100.0 if self.is_whisper_turbo_ready() else 0.0,
+                    total_mb=540.0,
+                    downloaded_mb=540.0 if self.is_whisper_turbo_ready() else 0.0,
+                    message="Sẵn sàng (Whisper Large-v3-Turbo + Silero VAD • 99 NN Offline)"
+                    if self.is_whisper_turbo_ready()
+                    else "Chưa tải (~540 MB)",
+                ),
+            )
             opus_ve_state = self._states.get(
                 "opus-vi-en",
                 DownloadState(
@@ -481,6 +531,7 @@ class ModelManager:
                 "asr_zipformer_streaming": asdict(zf_state),
                 "asr_zipformer_en_20m": asdict(zf_en_state),
                 "asr_moonshine_en": asdict(moonshine_en_state),
+                "asr_whisper_turbo": asdict(whisper_turbo_state),
                 "asr_vietasr": {
                     "model_id": "viet-asr",
                     "status": "ready",
@@ -682,6 +733,7 @@ class ModelManager:
         start_msg: str,
         ready_msg: str,
         on_progress: Optional[Callable[[dict], None]] = None,
+        extra_files: Optional[list[tuple[str, str, int]]] = None,
     ) -> Path:
         archive_path = self.models_dir / f".{dirname}.tar.bz2"
         staging_dir = self.models_dir / f".{dirname}.staging"
@@ -758,6 +810,26 @@ class ModelManager:
                     extracted = subdirs[0]
                 else:
                     raise RuntimeError(f"Không tìm thấy thư mục mô hình sau giải nén: {dirname}")
+
+            if extra_files:
+                with self._make_http_client() as client:
+                    for extra_name, extra_url, extra_bytes in extra_files:
+                        self._update_state(
+                            model_id,
+                            on_progress,
+                            status="downloading",
+                            progress=96.0,
+                            downloaded_mb=total_mb,
+                            total_mb=round(total_mb + extra_bytes / (1024 * 1024), 1),
+                            message=f"Đang tải thành phần phụ {extra_name}...",
+                        )
+                        got_extra = self._download_file_resumable(
+                            client,
+                            extra_url,
+                            extracted / extra_name,
+                            expected_bytes=extra_bytes,
+                        )
+                        total_mb = round(total_mb + got_extra / (1024 * 1024), 1)
 
             _mark_ready(extracted)
             _safe_replace(extracted, dest_dir)
@@ -856,6 +928,57 @@ class ModelManager:
             start_msg="Đang tải Moonshine-v2 Base Tiếng Anh (~106 MB • 1.8% WER)...",
             ready_msg="Sẵn sàng (Moonshine-v2 EN • 1.8% WER • Dấu câu • 44× RT)",
             on_progress=on_progress,
+        )
+
+    def ensure_whisper_turbo(self, on_progress: Optional[Callable[[dict], None]] = None) -> Path:
+        if self.is_whisper_turbo_ready():
+            self._update_state("whisper-turbo", on_progress, status="ready", progress=100.0)
+            return self.whisper_turbo_dir
+
+        # If Whisper weights already exist and only Silero VAD v5 is missing, fetch VAD alone
+        if self._whisper_turbo_has_weights() and not _file_ok(self.silero_vad_path, 500_000):
+            self._update_state(
+                "whisper-turbo",
+                on_progress,
+                status="downloading",
+                progress=90.0,
+                downloaded_mb=538.0,
+                total_mb=540.0,
+                message="Đang tải Silero VAD v5 (~2.2 MB)...",
+            )
+            try:
+                with self._make_http_client() as client:
+                    self._download_file_resumable(
+                        client,
+                        SILERO_VAD_URL,
+                        self.silero_vad_path,
+                        expected_bytes=2_313_101,
+                    )
+                _mark_ready(self.whisper_turbo_dir)
+                self._update_state(
+                    "whisper-turbo",
+                    on_progress,
+                    status="ready",
+                    progress=100.0,
+                    downloaded_mb=540.0,
+                    total_mb=540.0,
+                    message="Sẵn sàng (Whisper Large-v3-Turbo + Silero VAD • 99 NN Offline)",
+                )
+                return self.whisper_turbo_dir
+            except Exception as exc:
+                self._update_state("whisper-turbo", on_progress, status="error", message=f"Lỗi tải Silero VAD: {exc}")
+                raise
+
+        return self._download_and_extract_tar_bz2(
+            model_id="whisper-turbo",
+            url=WHISPER_TURBO_URL,
+            dirname=WHISPER_TURBO_DIRNAME,
+            dest_dir=self.whisper_turbo_dir,
+            expected_mb=537.7,
+            start_msg="Đang tải Whisper Large-v3-Turbo INT8 + Silero VAD (~540 MB • 99 NN)...",
+            ready_msg="Sẵn sàng (Whisper Large-v3-Turbo + Silero VAD • 99 NN Offline)",
+            on_progress=on_progress,
+            extra_files=[("silero_vad_v5.onnx", SILERO_VAD_URL, 2_313_101)],
         )
 
     def ensure_opus(self, direction: str, on_progress: Optional[Callable[[dict], None]] = None) -> Path:
@@ -1110,6 +1233,7 @@ class ModelManager:
             "opus-vi-en": self.opus_vi_en_dir,
             "opus-en-vi": self.opus_en_vi_dir,
             "envit5": self.envit5_dir,
+            "whisper-turbo": self.whisper_turbo_dir,
             "moonshine-en": self.moonshine_en_dir,
             "zipformer-en-20m": self.zipformer_en_20m_dir,
             "zipformer-30m-streaming": self.zipformer_streaming_dir,

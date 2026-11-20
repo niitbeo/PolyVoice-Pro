@@ -82,6 +82,7 @@ from asr_engine import (
     MoonshineV2EnRefiner,
     VietASRBatchRefiner,
     VietASRStreamingEngine,
+    WhisperTurboStreamingEngine,
     ZipformerStreamingEnEngine,
     ZipformerStreamingViEngine,
     restore_vietnamese_casing,
@@ -104,6 +105,7 @@ from languages import (
     get_hymt2_lang_name,
     get_language,
     get_source_language,
+    get_whisper_lang_code,
     list_languages,
     list_source_languages,
 )
@@ -473,6 +475,8 @@ class EngineRuntime:
         self._asr_zf_vi: Optional[ZipformerStreamingViEngine] = None
         self._asr_zf_en: Optional[ZipformerStreamingEnEngine] = None
         self._asr_viet: Optional[VietASRStreamingEngine] = None
+        self._asr_whisper: Optional[WhisperTurboStreamingEngine] = None
+        self._asr_whisper_remote: Optional[WhisperTurboStreamingEngine] = None
         self._pass2_refiner: Optional[VietASRBatchRefiner] = None
         self._en_pass2_refiner: Optional[MoonshineV2EnRefiner] = None
         self._hymt2: Optional[HyMT2Translator] = None
@@ -857,7 +861,7 @@ class EngineRuntime:
             return self._asr_zf_vi.update_hotwords(self._get_glossary_hotwords())
         return 0
 
-    def ensure_onnx_asr_loaded(self, engine_name: str):
+    def ensure_onnx_asr_loaded(self, engine_name: str, lang_code: str = "", remote: bool = False):
         with self._model_lock:
             if engine_name == "zipformer-30m-streaming":
                 if self._asr_zf_vi is None:
@@ -877,6 +881,31 @@ class EngineRuntime:
                         raise RuntimeError("Model tiếng Anh Zipformer-20M chưa được tải. Hãy bấm tải hoặc chọn Apple Neural Engine.")
                     self._asr_zf_en = ZipformerStreamingEnEngine(self.model_manager.zipformer_en_20m_dir)
                 return self._asr_zf_en
+
+            if engine_name == "whisper-turbo":
+                if not self.model_manager.is_whisper_turbo_ready():
+                    raise RuntimeError(
+                        "Model nghe đa ngôn ngữ Whisper-Turbo chưa được tải. "
+                        "Hãy mở mục 'Mô hình Offline' và bấm tải 'Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)' (~540 MB)."
+                    )
+                iso = get_whisper_lang_code(lang_code) if lang_code else ""
+                use_remote_slot = remote and self._active_asr_label == "whisper-turbo"
+                slot = self._asr_whisper_remote if use_remote_slot else self._asr_whisper
+                if slot is None:
+                    slot = WhisperTurboStreamingEngine(
+                        self.model_manager.whisper_turbo_dir,
+                        vad_model=self.model_manager.silero_vad_path,
+                        language=iso,
+                        sample_rate=SAMPLE_RATE,
+                        num_threads=_adaptive_mt_threads(),
+                    )
+                    if use_remote_slot:
+                        self._asr_whisper_remote = slot
+                    else:
+                        self._asr_whisper = slot
+                else:
+                    slot.set_language(iso)
+                return slot
 
             if self._asr_viet is None:
                 self._asr_viet = VietASRStreamingEngine(provider="cpu", sample_rate=float(SAMPLE_RATE))
@@ -1261,15 +1290,22 @@ class EngineRuntime:
         if lang_code == "eng_Latn":
             if self.model_manager.is_zipformer_en_20m_ready():
                 return "zipformer-en-20m"
+            if self.model_manager.is_whisper_turbo_ready():
+                return "whisper-turbo"
             if self.mac_helper is not None:
                 return "apple-native"
-            raise RuntimeError("Chưa có model nhận dạng tiếng Anh (hãy tải Zipformer-20M EN).")
+            raise RuntimeError("Chưa có model nhận dạng tiếng Anh (hãy tải Zipformer-20M EN hoặc Whisper-Turbo).")
 
-        # For Thai, Japanese, Korean, Chinese, French, German, etc. -> macOS Native Apple ASR
-        if self.mac_helper is not None:
+        # For Lao, Thai, Japanese, Chinese, Korean, Khmer, French, German, etc.:
+        # Prefer cross-platform Whisper Large-v3-Turbo + Silero VAD v5 when downloaded (100% offline Win & Mac, incl. Lao!)
+        if self.model_manager.is_whisper_turbo_ready():
+            return "whisper-turbo"
+        if self.mac_helper is not None and lang_code not in ("lao_Laoo", "khm_Khmr"):
             return "apple-native"
+        src_meta = get_source_language(lang_code)
+        lang_label = src_meta.name_vi if src_meta else lang_code
         raise RuntimeError(
-            f"Ngôn ngữ đầu vào '{lang_code}' cần Apple Native ASR trên macOS. Trên Windows hiện hỗ trợ offline Tiếng Việt & Tiếng Anh."
+            f"Để nhận dạng giọng nói {lang_label} offline (Windows & macOS), hãy mở 'Mô hình Offline' và tải 'Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)' (~540 MB)."
         )
 
     def _resolve_asr_choice(self, cfg: SessionConfig) -> str:
@@ -1291,12 +1327,13 @@ class EngineRuntime:
             "listening": self._listening,
             "active_asr_label": self._active_asr_label,
             "remote_asr_label": self._remote_asr_label,
-            "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_en is not None),
+            "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_en is not None) or (self._asr_whisper is not None),
             "pass2_loaded": self._pass2_refiner is not None,
             "hotwords_active": self._asr_zf_vi._hotwords_count if self._asr_zf_vi is not None else 0,
             "zipformer_ready": self.model_manager.is_zipformer_streaming_ready(),
             "zipformer_en_ready": self.model_manager.is_zipformer_en_20m_ready(),
             "moonshine_en_ready": self.model_manager.is_moonshine_en_ready(),
+            "whisper_turbo_ready": self.model_manager.is_whisper_turbo_ready(),
             "hymt2_ready": self.model_manager.is_hymt2_ready() and self._llama_server_ready,
             "hymt2_loaded": self._hymt2 is not None and self._hymt2.is_running,
             "hymt2_backend": self._hymt2.active_backend if (self._hymt2 is not None and self._hymt2.is_running) else "",
@@ -1349,6 +1386,15 @@ class EngineRuntime:
                 self._opus_ev = None
             elif model_id == "moonshine-en":
                 self._en_pass2_refiner = None
+            elif model_id == "whisper-turbo":
+                for w in (self._asr_whisper, self._asr_whisper_remote):
+                    if w is not None:
+                        try:
+                            w.close()
+                        except Exception:
+                            pass
+                self._asr_whisper = None
+                self._asr_whisper_remote = None
             elif model_id == "zipformer-30m-streaming":
                 self._asr_zf_vi = None
             elif model_id == "zipformer-en-20m":
@@ -1410,6 +1456,8 @@ class EngineRuntime:
                 elif model_id == "moonshine-en":
                     self.model_manager.ensure_moonshine_en(on_progress=_on_progress)
                     _try_warm_load(self.ensure_en_pass2_refiner)
+                elif model_id == "whisper-turbo":
+                    self.model_manager.ensure_whisper_turbo(on_progress=_on_progress)
                 elif model_id == "opus-vi-en":
                     self.model_manager.ensure_opus("vi-en", on_progress=_on_progress)
                     _try_warm_load(lambda: self.ensure_opus_loaded("vi-en"))
@@ -1472,6 +1520,8 @@ class EngineRuntime:
                 chosen_asr = "zipformer-30m-streaming"
             elif self.config.source_lang == "eng_Latn" and self.model_manager.is_zipformer_en_20m_ready():
                 chosen_asr = "zipformer-en-20m"
+            elif self.model_manager.is_whisper_turbo_ready():
+                chosen_asr = "whisper-turbo"
         self._active_asr_label = chosen_asr
         self._remote_asr_label = ""
 
@@ -1503,7 +1553,7 @@ class EngineRuntime:
                 self.config.source_lang != self.config.target_lang
                 and (
                     self.config.mt_mode in ("nllb", "nllb-1.3b")
-                    or (not is_vi_en_pair and self.config.mt_mode in ("auto-offline", "hy-mt2", "opus"))
+                    or (not is_vi_en_pair and self.config.mt_mode in ("auto-offline", "light-offline", "hy-mt2", "opus"))
                 )
             )
             if need_nllb and (self.model_manager.is_nllb_13b_ready() or self.model_manager.is_nllb_ready()):
@@ -1622,7 +1672,7 @@ class EngineRuntime:
             )
             self._asr_thread.start()
         else:
-            asr = self.ensure_onnx_asr_loaded(chosen_asr)
+            asr = self.ensure_onnx_asr_loaded(chosen_asr, lang_code=self.config.source_lang)
             asr.reset()
 
             def _on_meter(level: float, clipping: bool) -> None:
@@ -1733,7 +1783,11 @@ class EngineRuntime:
                         )
                         self._remote_asr_thread.start()
                     else:
-                        remote_asr = self.ensure_onnx_asr_loaded(remote_asr_choice)
+                        remote_asr = self.ensure_onnx_asr_loaded(
+                            remote_asr_choice,
+                            lang_code=remote_lang,
+                            remote=True,
+                        )
                         remote_asr.reset()
                         if self.mac_helper is not None:
                             self._remote_audio_stream = MacSystemAudioStream(
@@ -1843,6 +1897,8 @@ class EngineRuntime:
             self._asr_viet = None
             self._asr_zf_vi = None
             self._asr_zf_en = None
+            self._asr_whisper = None
+            self._asr_whisper_remote = None
 
     def update_config(self, req: UpdateConfigRequest) -> dict[str, Any]:
         need_restart = False
@@ -1986,6 +2042,8 @@ class EngineRuntime:
         raw = " ".join((text or "").strip().split())
         if not raw:
             return ""
+        if source_lang.startswith(_NON_SPACED_SCRIPT_PREFIXES):
+            return raw
 
         had_leading_cap = raw[0].isupper()
         prot_lower = {p.lower() for p in (protected_terms or set()) if p}
@@ -2363,6 +2421,19 @@ class EngineRuntime:
                 self._para_has_active_partial = False
                 self._para_parts.append(out.text)
                 combined = self._join_fragments(self._para_parts, preserve_case=self._get_capitalized_glossary_words())
+                is_whisper = out.provider.startswith("whisper-turbo")
+                is_non_spaced = src_lang.startswith(_NON_SPACED_SCRIPT_PREFIXES)
+                if is_whisper:
+                    # Silero VAD + Whisper-Turbo already emits complete punctuated sentences -> commit immediately!
+                    self._flush_paragraph_locked(allow_carry_over=False)
+                    return
+
+                if is_non_spaced:
+                    stripped = combined.strip()
+                    if len(stripped) >= 14 or stripped.endswith(("。", "！", "？", ".", "!", "?")):
+                        self._flush_paragraph_locked(allow_carry_over=False)
+                        return
+
                 wc = len(combined.split())
                 min_words, target_words, _ = self._paragraph_thresholds()
 
@@ -2377,7 +2448,7 @@ class EngineRuntime:
                 )
 
                 if should_commit:
-                    self._flush_paragraph_locked(allow_carry_over=True)
+                    self._flush_paragraph_locked(allow_carry_over=not is_non_spaced)
                 else:
                     seg_id = self._current_segment_id
                     parts_snapshot = list(self._para_parts)
@@ -2485,6 +2556,8 @@ class EngineRuntime:
                 if silent_chunks > 25:
                     with self._para_lock:
                         can_gate = (not self._para_parts) and (not self._para_has_active_partial)
+                    if can_gate and hasattr(asr, "is_speech_active") and asr.is_speech_active():
+                        can_gate = False
                     if can_gate:
                         gated = True
                         breath_chunks = 0
@@ -2619,6 +2692,16 @@ class EngineRuntime:
                     self._remote_parts,
                     preserve_case=self._get_capitalized_glossary_words(),
                 )
+                is_whisper = out.provider.startswith("whisper-turbo")
+                is_non_spaced = r_src.startswith(_NON_SPACED_SCRIPT_PREFIXES)
+                if is_whisper:
+                    self._remote_flush_locked()
+                    return
+                if is_non_spaced:
+                    stripped = combined.strip()
+                    if len(stripped) >= 14 or stripped.endswith(("。", "！", "？", ".", "!", "?")):
+                        self._remote_flush_locked()
+                        return
                 wc = len(combined.split())
                 min_words, target_words, _ = self._paragraph_thresholds()
                 if wc >= target_words or (wc >= min_words and not self._ends_with_connector(combined)):
@@ -2660,6 +2743,8 @@ class EngineRuntime:
                 if silent_chunks > 25:
                     with self._remote_lock:
                         can_gate = (not self._remote_parts) and (not self._remote_has_active_partial)
+                    if can_gate and hasattr(asr, "is_speech_active") and asr.is_speech_active():
+                        can_gate = False
                     if can_gate:
                         gated = True
                         breath_chunks = 0
@@ -2786,8 +2871,13 @@ class EngineRuntime:
                     protected_terms=set(self._get_glossary_hotwords()),
                 )
                 source_text = self.glossary.normalize_session_entities(source_text, item["source_lang"])
+                eff_wc = (
+                    max(len(source_text.split()), len(source_text) // 4)
+                    if item["source_lang"].startswith(_NON_SPACED_SCRIPT_PREFIXES)
+                    else len(source_text.split())
+                )
                 para_id = self._assign_paragraph_id(
-                    len(source_text.split()),
+                    eff_wc,
                     item["source_lang"],
                     item["target_lang"],
                     speaker=speaker,
@@ -2876,7 +2966,11 @@ class EngineRuntime:
                     continue
 
                 seg_id = str(partial_job["id"])
-                wc_now = len(draft_src.split())
+                wc_now = (
+                    max(len(draft_src.split()), len(draft_src) // 4)
+                    if partial_job["source_lang"].startswith(_NON_SPACED_SCRIPT_PREFIXES)
+                    else len(draft_src.split())
+                )
                 same_seg = seg_id == last_partial_seg_id
                 elapsed_s = now - last_partial_time
                 # Wait for calm cadence OR at least 2 new words (unless >=1.25s pause on same segment)
@@ -2950,6 +3044,16 @@ class EngineRuntime:
             sample = custom_text.strip()
         elif src == "eng_Latn":
             sample = "Hello everyone, today we are comparing MCP, API, and CLI tools for real-time translation."
+        elif src == "tha_Thai":
+            sample = "สวัสดีครับทุกท่าน วันนี้เรามาประชุมร่วมกันเรื่องความร่วมมือด้านการค้าระหว่างไทยและเวียดนาม"
+        elif src == "lao_Laoo":
+            sample = "ສະບາຍດີທຸກທ່ານ ມື້ນີ້ພວກເຮົາມາປະຊຸມຮ່ວມກັນກ່ຽວກັບການຮ່ວມມືລະຫວ່າງລາວແລະຫວຽດນາມ"
+        elif src == "jpn_Jpan":
+            sample = "皆様こんにちは。本日はベトナムと日本の技術協力について打ち合わせを行います。"
+        elif src in ("zho_Hans", "zho_Hant"):
+            sample = "大家好，今天我们一起讨论越南与中国在人工智能领域的合作项目。"
+        elif src == "kor_Hang":
+            sample = "안녕하세요 여러분, 오늘은 베트남과 한국의 협력 프로젝트에 대해 논의하겠습니다."
         else:
             sample = "Xin chào mọi người, hệ thống dịch giọng nói hai chiều đang chạy rất mượt với tốc độ siêu nhanh."
 
@@ -3106,6 +3210,7 @@ def api_download_model(model_id: str):
         "zipformer-30m-streaming",
         "zipformer-en-20m",
         "moonshine-en",
+        "whisper-turbo",
         "opus-vi-en",
         "opus-en-vi",
         "envit5",

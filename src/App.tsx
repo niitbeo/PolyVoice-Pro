@@ -88,6 +88,7 @@ const MODEL_DISPLAY_NAMES: Record<string, string> = {
   "zipformer-30m-streaming": "Nghe Tiếng Việt (+Hotwords)",
   "zipformer-en-20m": "Nghe Tiếng Anh (Nháp live)",
   "moonshine-en": "Nghe Tiếng Anh (Moonshine-v2)",
+  "whisper-turbo": "Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)",
   envit5: "Dịch Việt ⇄ Anh (EnViT5)",
   "nllb-600m": "Dịch Lào & 202 NN (NLLB-600M)",
   "hy-mt2": "Dịch Thái / 38 NN (Hy-MT2)",
@@ -107,6 +108,8 @@ function applyModelStateUpdate(prev: ModelsStatus | null, prog: ModelState): Mod
     return { ...prev, asr_zipformer_en_20m: prog };
   if (prog.model_id === "moonshine-en")
     return { ...prev, asr_moonshine_en: prog };
+  if (prog.model_id === "whisper-turbo")
+    return { ...prev, asr_whisper_turbo: prog };
   if (prog.model_id === "opus-vi-en") return { ...prev, mt_opus_vi_en: prog };
   if (prog.model_id === "opus-en-vi") return { ...prev, mt_opus_en_vi: prog };
   if (prog.model_id === "envit5") return { ...prev, mt_envit5: prog };
@@ -1367,6 +1370,7 @@ export default function App() {
       | "zipformer-30m-streaming"
       | "zipformer-en-20m"
       | "moonshine-en"
+      | "whisper-turbo"
       | "opus-vi-en"
       | "opus-en-vi"
       | "envit5"
@@ -1441,7 +1445,9 @@ export default function App() {
     }
   };
 
-  const handleDeleteModel = async (modelId: "hy-mt2" | "moonshine-en" | "zipformer-en-20m" | "nllb-600m") => {
+  const handleDeleteModel = async (
+    modelId: "hy-mt2" | "moonshine-en" | "zipformer-en-20m" | "nllb-600m" | "whisper-turbo"
+  ) => {
     if (
       modelId === "hy-mt2" &&
       typeof window !== "undefined" &&
@@ -1623,6 +1629,7 @@ export default function App() {
   const optionalModelRows = useMemo(
     () =>
       [
+        ["Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)", models?.asr_whisper_turbo, "whisper-turbo", "540 MB"],
         ["Dịch Tiếng Lào & 202 NN (NLLB-600M)", models?.mt_nllb_600m, "nllb-600m", "604 MB"],
       ] as const,
     [models]
@@ -2319,6 +2326,9 @@ export default function App() {
                 }}
               >
                 <option value="auto">Tự động tối ưu theo ngôn ngữ (Khuyên dùng)</option>
+                <option value="whisper-turbo" disabled={!status?.whisper_turbo_ready}>
+                  Whisper-Turbo 99 NN (Thái, Nhật, Trung, Hàn, Pháp, Đức • Offline)
+                </option>
                 {status?.mac_helper_ready && (
                   <option value="apple-native">
                     Apple Neural Engine (macOS Native • ~1% CPU • 60 NN)
@@ -2544,7 +2554,7 @@ export default function App() {
                 })}
 
                 <div className="hint" style={{ marginTop: 4, fontWeight: 700, color: "var(--text-1)" }}>
-                  <span>Mở rộng Tiếng Lào &amp; 202 Ngôn ngữ (Tùy chọn)</span>
+                  <span>Mở rộng Đa ngôn ngữ &amp; Tiếng Lào (Tùy chọn)</span>
                 </div>
 
                 {optionalModelRows.map(([label, st, id, sz]) => {
@@ -2571,7 +2581,7 @@ export default function App() {
                               className="btn sm icon-only"
                               style={{ width: 22, height: 22, minWidth: 22, padding: 3 }}
                               onClick={() => handleDeleteModel(id)}
-                              title="Xóa model này để giảm tổng ổ cứng xuống chỉ còn 1.18 GB"
+                              title={`Xóa ${label} (${sz}) để giải phóng dung lượng ổ cứng`}
                             >
                               <Trash2 size={11} />
                             </button>
@@ -2752,6 +2762,63 @@ export default function App() {
                       title="Ẩn gợi ý thiết lập"
                     >
                       <X size={12} />
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
+
+          {connected &&
+            models !== null &&
+            sourceLang !== "vie_Latn" &&
+            sourceLang !== "eng_Latn" &&
+            models.asr_whisper_turbo?.status !== "ready" &&
+            (() => {
+              const wt = models.asr_whisper_turbo;
+              const isDl = wt?.status === "downloading";
+              const pct = Math.max(0, Math.min(100, Math.round(wt?.progress ?? 0)));
+              const srcName = currentSrcObj?.name_vi || sourceLang;
+              return (
+                <div className="banner-setup">
+                  <div className="row" style={{ gap: 8, minWidth: 0, flex: 1 }}>
+                    {isDl ? (
+                      <Loader2 size={15} className="spin" style={{ flexShrink: 0 }} />
+                    ) : (
+                      <Download size={15} style={{ flexShrink: 0 }} />
+                    )}
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div style={{ fontWeight: 700, fontSize: 12.5 }}>
+                        {isDl
+                          ? `Đang tải Whisper-Turbo 99 ngôn ngữ (${pct}%)...`
+                          : `Nghe ${srcName} offline 100% trên cả Windows & macOS`}
+                      </div>
+                      <div style={{ fontSize: 11.5, color: "var(--text-2)", marginTop: 1 }}>
+                        {isDl
+                          ? wt?.message || "Đang tải Whisper Large-v3-Turbo + Silero VAD..."
+                          : "Tải 1 lần Whisper-Turbo + Silero VAD (~540 MB) để nhận dạng 99 ngôn ngữ (Thái, Nhật, Trung, Hàn, Pháp, Đức...) kèm dấu câu."}
+                      </div>
+                      {isDl && (
+                        <div className="progress-track" style={{ marginTop: 6 }}>
+                          <div className="progress-fill" style={{ width: `${Math.max(3, pct)}%` }} />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="row" style={{ gap: 6, flexShrink: 0 }}>
+                    <button
+                      className={`btn sm ${isDl ? "downloading" : "primary"}`}
+                      disabled={isDl}
+                      onClick={() => handleDownloadModel("whisper-turbo")}
+                    >
+                      {isDl ? (
+                        <>
+                          <Loader2 size={12} className="spin" /> {pct}%
+                        </>
+                      ) : (
+                        <>
+                          <Download size={12} /> Tải Whisper-Turbo (540 MB)
+                        </>
+                      )}
                     </button>
                   </div>
                 </div>

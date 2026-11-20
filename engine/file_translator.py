@@ -362,11 +362,20 @@ def translate_media_file(
     en_moonshine = runtime.ensure_en_pass2_refiner() if source_lang == "eng_Latn" else None
     zf_en = (
         runtime.ensure_onnx_asr_loaded("zipformer-en-20m")
-        if source_lang == "eng_Latn" and en_moonshine is None
+        if source_lang == "eng_Latn"
+        and en_moonshine is None
+        and runtime.model_manager.is_zipformer_en_20m_ready()
         else None
     )
+    whisper_asr = None
     if not use_vi_batch and en_moonshine is None and zf_en is None:
-        raise RuntimeError("Dịch file offline hiện hỗ trợ file nói Tiếng Việt hoặc Tiếng Anh.")
+        if runtime.model_manager.is_whisper_turbo_ready():
+            whisper_asr = runtime.ensure_onnx_asr_loaded("whisper-turbo", lang_code=source_lang)
+        else:
+            raise RuntimeError(
+                "Để dịch file nói ngôn ngữ này offline (Thái, Lào, Nhật, Trung, Hàn...), "
+                "hãy mở 'Mô hình Offline' và tải 'Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)' (~540 MB)."
+            )
     if cancel_event is not None and cancel_event.is_set():
         raise FileTranslateCancelled("Đã hủy dịch file.")
 
@@ -400,6 +409,8 @@ def translate_media_file(
             text, _ = refiner.refine(seg_pcm, p1_fallback, protected_terms=protected_terms)
         elif en_moonshine is not None:
             text, _ = en_moonshine.refine(seg_pcm, "")
+        elif whisper_asr is not None:
+            text = whisper_asr.transcribe_pcm_isolated(seg_pcm, language=source_lang)
         else:
             assert zf_en is not None
             text = zf_en.transcribe_pcm_isolated(seg_pcm)

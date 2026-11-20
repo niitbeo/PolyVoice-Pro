@@ -1,11 +1,14 @@
 """
-Cross-Platform Real-Time Streaming ASR Engines (Vietnamese & English ONNX).
+Cross-Platform Real-Time Streaming ASR Engines (Vietnamese, English & 99-Language Whisper ONNX).
 
 1. `ZipformerStreamingViEngine`:
    `hynt/Zipformer-30M-RNNT-Streaming-6000h` (51 MB, chunk-16) — TRUE O(1) Vietnamese streaming (~10–45ms/chunk).
 2. `ZipformerStreamingEnEngine`:
    `sherpa-onnx-streaming-zipformer-en-20M-2023-02-17` (30 MB INT8) — TRUE O(1) English streaming (~10–30ms/chunk).
-3. `VietASRStreamingEngine`:
+3. `WhisperTurboStreamingEngine`:
+   `sherpa-onnx-whisper-turbo` (538 MB INT8) + `Silero VAD v5` (2.2 MB) — 99-language offline ASR
+   (Thai, Lao, Japanese, Chinese, Korean, Khmer, French, German...) with built-in punctuation on Windows & macOS.
+4. `VietASRStreamingEngine`:
    Embedded 78 MB INT8 Zipformer2 + Silero VAD + Punctuation/ITN with max-utterance auto-commit.
 """
 
@@ -946,3 +949,311 @@ class MoonshineV2EnRefiner:
             return fallback_text, ms
         except Exception:
             return fallback_text, round((time.perf_counter() - t0) * 1000.0, 1)
+
+
+_WHISPER_SILENCE_HALLUCINATIONS = frozenset({
+    "thanks for watching",
+    "thanks for watching.",
+    "thank you for watching",
+    "thank you for watching.",
+    "thank you for watching!",
+    "please subscribe",
+    "subscribe",
+    "...",
+    "..",
+    ".",
+    "mbc 뉴스",
+    "mbc 뉴스 이덕영입니다",
+    "시청해주셔서 감사합니다",
+    "시청해주셔서 감사합니다.",
+    "구독과 좋아요 부탁드립니다",
+    "ご視聴ありがとうございました",
+    "ご視聴ありがとうございました。",
+    "チャンネル登録お願いします",
+    "字幕由",
+    "字幕提供",
+    "谢谢观看",
+    "謝謝觀看",
+    "请不吝点赞",
+    "ขอบคุณที่รับชม",
+    "ขอบคุณที่รับชมครับ",
+    "ขอบคุณที่รับชมค่ะ",
+    "subtitles by",
+    "amara.org",
+})
+
+_WHISPER_LOW_ENERGY_HALLUCINATIONS = frozenset({
+    "thank you",
+    "thank you.",
+    "thanks",
+    "thanks.",
+    "you",
+    "you.",
+    "bye",
+    "bye.",
+    "oh",
+    "uh",
+    "um",
+})
+
+_RE_WHISPER_BRACKET_ONLY = re.compile(r"^[\s\[\(\{♪♫🎵🎶*\-—._~]*?(?:music|applause|laughter|silence|blank_audio|inaudible|noise|nhạc|vỗ tay)?[\s\]\)\}♪♫🎵🎶*\-—._~]*$", re.IGNORECASE)
+_RE_WHISPER_CHAR_LOOP = re.compile(r"(.{1,4})\1{5,}")
+
+
+def _clean_whisper_text(raw: str, rms: float = 1.0) -> str:
+    """Filter classic Whisper silence/noise hallucinations and looping artifacts."""
+    txt = " ".join((raw or "").strip().split())
+    if not txt:
+        return ""
+    # Strip bracketed non-speech markers like [Music], (Applause), ♪
+    txt = re.sub(r"\[[^\]]{1,28}\]|\([^)]{1,28}\)", " ", txt)
+    txt = txt.replace("♪", "").replace("♫", "").strip()
+    txt = " ".join(txt.split())
+    if not txt:
+        return ""
+    low = txt.lower().strip(" .!?,;:\"'")
+    if not low or txt.lower() in _WHISPER_SILENCE_HALLUCINATIONS or low in _WHISPER_SILENCE_HALLUCINATIONS:
+        return ""
+    if rms < 0.016 and (txt.lower() in _WHISPER_LOW_ENERGY_HALLUCINATIONS or low in _WHISPER_LOW_ENERGY_HALLUCINATIONS):
+        return ""
+    if _RE_WHISPER_BRACKET_ONLY.match(txt):
+        return ""
+    # Collapse pathological repeated-character loops (Whisper noise artifact)
+    if _RE_WHISPER_CHAR_LOOP.search(txt):
+        txt = _RE_WHISPER_CHAR_LOOP.sub(r"\1\1\1", txt).strip()
+        if len(set(txt.replace(" ", ""))) <= 2:
+            return ""
+    return txt
+
+
+class WhisperTurboStreamingEngine:
+    """
+    Cross-Platform 99-Language Offline ASR Engine (Windows x64 & macOS arm64):
+    Silero VAD v5 (2.2 MB) speech segmentation + OpenAI Whisper Large-v3-Turbo INT8 (538 MB)
+    via `sherpa-onnx` (`OfflineRecognizer.from_whisper`, zero PyTorch).
+
+    Supports Thai, Lao, Japanese, Chinese, Korean, Khmer, French, German, Spanish, Russian,
+    English, Vietnamese, etc. with native punctuation and zero-cloud offline privacy.
+    """
+
+    def __init__(
+        self,
+        model_dir: Path,
+        vad_model: Optional[Path] = None,
+        language: str = "th",
+        sample_rate: int = 16000,
+        num_threads: int = 4,
+    ) -> None:
+        d = Path(model_dir)
+        self.model_dir = d
+        self.sample_rate = sample_rate
+        self._num_threads = max(2, num_threads)
+        self._lock = threading.Lock()
+
+        self._encoder = self._pick_file(d, "turbo-encoder.int8.onnx", "*-encoder.int8.onnx")
+        self._decoder = self._pick_file(d, "turbo-decoder.int8.onnx", "*-decoder.int8.onnx")
+        self._tokens = self._pick_file(d, "turbo-tokens.txt", "*-tokens.txt")
+        self._vad_path = Path(vad_model) if vad_model is not None else (d / "silero_vad_v5.onnx")
+        if not self._vad_path.is_file():
+            raise FileNotFoundError(f"Missing Silero VAD model: {self._vad_path}")
+
+        self._language = self._normalize_lang(language)
+        self.active_provider = f"whisper-turbo-{self._language or 'auto'}"
+        self._recognizer = self._build_recognizer(self._language)
+        self._vad_window = 512
+        self._vad = self._build_vad()
+        self._vad_buf = np.zeros(0, dtype=np.float32)
+        self._active_chunks: list[np.ndarray] = []
+        self._active_samples: int = 0
+        self._last_partial_ts: float = 0.0
+        self._last_partial: str = ""
+
+    @staticmethod
+    def _pick_file(d: Path, preferred: str, pattern: str) -> Path:
+        p = d / preferred
+        if p.is_file():
+            return p
+        found = next(d.glob(pattern), None)
+        if found and found.is_file():
+            return found
+        raise FileNotFoundError(f"Missing Whisper-Turbo file '{preferred}' in {d}")
+
+    @staticmethod
+    def _normalize_lang(lang: str) -> str:
+        code = (lang or "").strip()
+        if not code:
+            return ""
+        if "_" in code:
+            from languages import get_whisper_lang_code
+
+            return get_whisper_lang_code(code)
+        return code.lower()
+
+    def _build_recognizer(self, iso_lang: str) -> sherpa_onnx.OfflineRecognizer:
+        return sherpa_onnx.OfflineRecognizer.from_whisper(
+            encoder=str(self._encoder),
+            decoder=str(self._decoder),
+            tokens=str(self._tokens),
+            language=iso_lang,
+            task="transcribe",
+            num_threads=self._num_threads,
+            decoding_method="greedy_search",
+            provider="cpu",
+        )
+
+    def _build_vad(self) -> sherpa_onnx.VoiceActivityDetector:
+        silero = sherpa_onnx.SileroVadModelConfig(
+            model=str(self._vad_path),
+            threshold=0.45,
+            min_silence_duration=0.65,
+            min_speech_duration=0.25,
+            window_size=self._vad_window,
+            max_speech_duration=10.5,
+        )
+        cfg = sherpa_onnx.VadModelConfig(
+            silero_vad=silero,
+            sample_rate=self.sample_rate,
+            num_threads=1,
+            provider="cpu",
+            debug=False,
+        )
+        return sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=60.0)
+
+    def set_language(self, lang_code: str) -> None:
+        iso = self._normalize_lang(lang_code)
+        if iso == self._language:
+            return
+        new_rec = self._build_recognizer(iso)
+        with self._lock:
+            self._recognizer = new_rec
+            self._language = iso
+            self.active_provider = f"whisper-turbo-{iso or 'auto'}"
+            self._last_partial = ""
+
+    def is_speech_active(self) -> bool:
+        with self._lock:
+            return self._active_samples > 0 or bool(self._vad.is_speech_detected()) or (not self._vad.empty())
+
+    def reset(self) -> None:
+        with self._lock:
+            self._vad.reset()
+            self._vad_buf = np.zeros(0, dtype=np.float32)
+            self._active_chunks.clear()
+            self._active_samples = 0
+            self._last_partial_ts = 0.0
+            self._last_partial = ""
+
+    def _decode_f32_locked(self, samples_f32: np.ndarray) -> str:
+        if samples_f32 is None or len(samples_f32) < int(self.sample_rate * 0.30):
+            return ""
+        rms = float(np.sqrt(np.mean(np.square(samples_f32))))
+        if rms < 0.006:
+            return ""
+        stream = self._recognizer.create_stream()
+        # Non-Latin scripts (Thai, Khmer, Hindi, Arabic, CJK) expand to 2-3 BPE byte tokens per char;
+        # raise sherpa-onnx's default 6 tokens/sec limit so Thai/SEA sentences are never truncated!
+        if hasattr(stream, "set_option"):
+            stream.set_option("max_tokens_per_second", "30")
+        stream.accept_waveform(self.sample_rate, samples_f32)
+        self._recognizer.decode_stream(stream)
+        return _clean_whisper_text(stream.result.text or "", rms=rms)
+
+    def accept_pcm(self, pcm_s16: np.ndarray) -> ASROutput:
+        t0 = time.perf_counter()
+        audio_f32 = pcm_s16.astype(np.float32) / 32768.0
+
+        with self._lock:
+            if len(self._vad_buf) > 0:
+                buf = np.concatenate((self._vad_buf, audio_f32))
+            else:
+                buf = audio_f32
+
+            pos = 0
+            n = len(buf)
+            while pos + self._vad_window <= n:
+                win = buf[pos : pos + self._vad_window]
+                self._vad.accept_waveform(win)
+                if self._vad.is_speech_detected():
+                    self._active_chunks.append(win)
+                    self._active_samples += self._vad_window
+                    # Cap live preview buffer at 12s
+                    if self._active_samples > self.sample_rate * 12:
+                        drop = self._active_chunks.pop(0)
+                        self._active_samples -= len(drop)
+                pos += self._vad_window
+            self._vad_buf = buf[pos:].copy() if pos < n else np.zeros(0, dtype=np.float32)
+
+            finals: list[str] = []
+            while not self._vad.empty():
+                seg = self._vad.front
+                self._vad.pop()
+                seg_samples = np.asarray(seg.samples, dtype=np.float32)
+                txt = self._decode_f32_locked(seg_samples)
+                if txt:
+                    finals.append(txt)
+
+            if finals:
+                self._active_chunks.clear()
+                self._active_samples = 0
+                self._last_partial = ""
+                self._last_partial_ts = 0.0
+                ms = round((time.perf_counter() - t0) * 1000.0, 1)
+                return ASROutput("final", " ".join(finals).strip(), ms, self.active_provider)
+
+            # During long continuous speech (>= 3.6s), emit throttled interim preview every 3.0s
+            now = time.monotonic()
+            if (
+                self._active_samples >= int(self.sample_rate * 3.6)
+                and (now - self._last_partial_ts) >= 3.0
+                and self._vad.is_speech_detected()
+            ):
+                self._last_partial_ts = now
+                preview_audio = np.concatenate(self._active_chunks)
+                preview_txt = self._decode_f32_locked(preview_audio)
+                ms = round((time.perf_counter() - t0) * 1000.0, 1)
+                if preview_txt and preview_txt != self._last_partial:
+                    self._last_partial = preview_txt
+                    return ASROutput("partial", preview_txt, ms, self.active_provider)
+
+            ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            return ASROutput("none", "", ms, self.active_provider)
+
+    def flush_final(self) -> ASROutput:
+        t0 = time.perf_counter()
+        with self._lock:
+            self._vad.flush()
+            finals: list[str] = []
+            while not self._vad.empty():
+                seg = self._vad.front
+                self._vad.pop()
+                seg_samples = np.asarray(seg.samples, dtype=np.float32)
+                txt = self._decode_f32_locked(seg_samples)
+                if txt:
+                    finals.append(txt)
+            if not finals and self._active_chunks:
+                txt = self._decode_f32_locked(np.concatenate(self._active_chunks))
+                if txt:
+                    finals.append(txt)
+            self._vad.reset()
+            self._vad_buf = np.zeros(0, dtype=np.float32)
+            self._active_chunks.clear()
+            self._active_samples = 0
+            self._last_partial = ""
+            self._last_partial_ts = 0.0
+            ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            if finals:
+                return ASROutput("final", " ".join(finals).strip(), ms, self.active_provider)
+            return ASROutput("none", "", ms, self.active_provider)
+
+    def transcribe_pcm_isolated(self, pcm_s16: np.ndarray, language: Optional[str] = None) -> str:
+        """Transcribe a standalone PCM segment cleanly for offline file translation."""
+        if pcm_s16 is None or len(pcm_s16) == 0:
+            return ""
+        if language is not None:
+            self.set_language(language)
+        audio_f32 = pcm_s16.astype(np.float32) / 32768.0
+        with self._lock:
+            return self._decode_f32_locked(audio_f32)
+
+    def close(self) -> None:
+        self.reset()

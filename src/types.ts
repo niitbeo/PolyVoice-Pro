@@ -42,6 +42,7 @@ export interface ModelsStatus {
   asr_zipformer_streaming: ModelState;
   asr_zipformer_en_20m: ModelState;
   asr_moonshine_en?: ModelState;
+  asr_whisper_turbo?: ModelState;
   asr_vietasr: ModelState;
   mt_hymt2?: ModelState;
   mt_envit5: ModelState;
@@ -56,6 +57,7 @@ export type InputChannelId = "mix" | "left" | "right";
 export type AsrEngineId =
   | "auto"
   | "apple-native"
+  | "whisper-turbo"
   | "zipformer-30m-streaming"
   | "zipformer-en-20m"
   | "viet-asr";
@@ -215,6 +217,7 @@ export interface EngineStatus {
   zipformer_ready: boolean;
   zipformer_en_ready: boolean;
   moonshine_en_ready?: boolean;
+  whisper_turbo_ready?: boolean;
   hymt2_ready?: boolean;
   hymt2_loaded?: boolean;
   hymt2_backend?: string;
@@ -410,6 +413,8 @@ const NLLB_TO_BCP47: Record<string, string> = {
   spa_Latn: "es-ES",
   rus_Cyrl: "ru-RU",
   tha_Thai: "th-TH",
+  lao_Laoo: "lo-LA",
+  khm_Khmr: "km-KH",
   ita_Latn: "it-IT",
   por_Latn: "pt-BR",
   ind_Latn: "id-ID",
