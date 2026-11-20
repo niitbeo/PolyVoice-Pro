@@ -97,9 +97,13 @@ def _load_sentencepiece(sp_path: Path) -> spm.SentencePieceProcessor:
 
 
 def _clean_punctuation(text: str) -> str:
-    """Fix minor SentencePiece spacing artifacts (e.g. \"did n't\" -> \"didn't\", \"don 't\" -> \"don't\", \"a. m.\" -> \"a.m.\", \"9: 30\" -> \"9:30\")."""
-    s = re.sub(r"\s+(n['’]t\b)", r"\1", text, flags=re.IGNORECASE)
+    """Fix minor SentencePiece spacing artifacts (e.g. \"did n't\" -> \"didn't\", \"do n'tthink\" -> \"don't think\", \"o 'clock\" -> \"o'clock\", \"two - way\" -> \"two-way\", \"a. m.\" -> \"a.m.\", \"9: 30\" -> \"9:30\")."""
+    s = re.sub(r"\b(n['’]t)([a-zA-Z])", r"\1 \2", text, flags=re.IGNORECASE)
+    s = re.sub(r"\s+(n['’]t\b)", r"\1", s, flags=re.IGNORECASE)
     s = re.sub(r"\s+(['’](?:t|s|m|re|ve|ll|d)\b)", r"\1", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bo\s+['’]clock\b", "o'clock", s, flags=re.IGNORECASE)
+    # Collapse SentencePiece spaced hyphens inside compound words & numbers ("two - way" -> "two-way", "Twenty - four" -> "Twenty-four")
+    s = re.sub(r"(?<=[A-Za-z0-9])\s+-\s+(?=[A-Za-z0-9])", "-", s)
     s = re.sub(r"\s+([,.;:!?])", r"\1", s)
     s = re.sub(r"\b([ap])\.\s+m\.", r"\1.m.", s, flags=re.IGNORECASE)
     # Fix spaced times ("9: 30" -> "9:30") and short decimals ("9. 30" -> "9.30") without merging 4-digit years
@@ -359,8 +363,8 @@ class EnViT5Translator:
                 batch_tokens,
                 beam_size=max(1, beam_size),
                 max_decoding_length=min(256, max(64, max_src_len * 3)),
-                repetition_penalty=1.06,
-                no_repeat_ngram_size=6,
+                repetition_penalty=1.12,
+                no_repeat_ngram_size=4,
             )
 
         decoded_parts: list[str] = []

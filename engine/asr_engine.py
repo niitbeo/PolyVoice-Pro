@@ -11,6 +11,7 @@ Cross-Platform Real-Time Streaming ASR Engines (Vietnamese & English ONNX).
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import tempfile
@@ -152,9 +153,9 @@ class _SherpaOnlineTransducerBase:
             sample_rate=self.sample_rate,
             feature_dim=80,
             enable_endpoint_detection=True,
-            rule1_min_trailing_silence=2.0,
-            rule2_min_trailing_silence=1.05,
-            rule3_min_utterance_length=18.0,
+            rule1_min_trailing_silence=1.8,
+            rule2_min_trailing_silence=0.72,
+            rule3_min_utterance_length=11.5,
             provider="cpu",
         )
         if hw_path is not None and hw_count > 0:
@@ -255,22 +256,35 @@ class _SherpaOnlineTransducerBase:
     ) -> ASROutput:
         """
         Conference Breath-Pause Soft Commit:
-        Called when the audio loop detects a natural ~0.45s breath dip.
-        Commits the current utterance cleanly ONLY when it has reached a full semantic clause
-        (>= min_words) and does NOT end on a dangling connector — preventing both sluggish waits
-        and mid-word rule3 cuts during long speeches.
+        Called when the audio loop detects a genuine >=0.55s breath dip.
+        1. Pre-checks word count & dangling connectors BEFORE touching the stream.
+        2. Feeds 0.45s of zero tail-padding so Zipformer chunk-16 flushes its buffered
+           final syllable cleanly (prevents splitting compound words like 'doanh | nghiệp',
+           'Hà | Nội', 'khách | hàng').
+        3. Resets the stream and returns the complete clause cleanly.
         """
         t0 = time.perf_counter()
         with self._lock:
+            pre_raw = self._recognizer.get_result(self._stream).strip()
+            pre_fmt = _format_sentence(pre_raw)
+            if not pre_fmt or len(pre_fmt.split()) < min_words:
+                return ASROutput("none", "", 0.0, self.active_provider)
+            if block_tail_fn is not None and block_tail_fn(pre_fmt):
+                return ASROutput("none", "", 0.0, self.active_provider)
+            # Flush chunk-16 right-context lookahead so the final syllable completes cleanly
+            self._stream.accept_waveform(
+                self.sample_rate,
+                np.zeros(int(self.sample_rate * 0.45), dtype=np.float32),
+            )
+            while self._recognizer.is_ready(self._stream):
+                self._recognizer.decode_stream(self._stream)
             raw_text = self._recognizer.get_result(self._stream).strip()
-            formatted = _format_sentence(raw_text)
-            if not formatted or len(formatted.split()) < min_words:
-                return ASROutput("none", "", 0.0, self.active_provider)
-            if block_tail_fn is not None and block_tail_fn(formatted):
-                return ASROutput("none", "", 0.0, self.active_provider)
             self._recognizer.reset(self._stream)
             self._last_partial = ""
             ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            formatted = _format_sentence(raw_text)
+            if not formatted:
+                return ASROutput("none", "", ms, self.active_provider)
             return ASROutput("final", formatted, ms, self.active_provider)
 
     def flush_final(self) -> ASROutput:
@@ -437,18 +451,296 @@ class VietASRStreamingEngine:
                 pass
 
 
+_VI_PROPER_PHRASES: list[tuple[str, str]] = [
+    # Major Vietnamese cities, provinces, landmarks (prevents literal MT like "hải phòng" -> "Maritime Defense"!)
+    ("tp hồ chí minh", "TP. Hồ Chí Minh"),
+    ("thành phố hồ chí minh", "Thành phố Hồ Chí Minh"),
+    ("hồ chí minh", "Hồ Chí Minh"),
+    ("hà nội", "Hà Nội"),
+    ("hải phòng", "Hải Phòng"),
+    ("đà nẵng", "Đà Nẵng"),
+    ("sài gòn", "Sài Gòn"),
+    ("cần thơ", "Cần Thơ"),
+    ("nha trang", "Nha Trang"),
+    ("đà lạt", "Đà Lạt"),
+    ("vũng tàu", "Vũng Tàu"),
+    ("bắc ninh", "Bắc Ninh"),
+    ("bình dương", "Bình Dương"),
+    ("đồng nai", "Đồng Nai"),
+    ("quảng ninh", "Quảng Ninh"),
+    ("hải dương", "Hải Dương"),
+    ("nghệ an", "Nghệ An"),
+    ("thanh hóa", "Thanh Hóa"),
+    ("thái nguyên", "Thái Nguyên"),
+    ("lào cai", "Lào Cai"),
+    ("lạng sơn", "Lạng Sơn"),
+    ("móng cái", "Móng Cái"),
+    ("phú quốc", "Phú Quốc"),
+    ("hạ long", "Hạ Long"),
+    ("hàng gai", "Hàng Gai"),
+    ("kim mã", "Kim Mã"),
+    ("tân mỹ", "Tân Mỹ"),
+    # Countries & regions
+    ("việt nam", "Việt Nam"),
+    ("trung quốc", "Trung Quốc"),
+    ("nhật bản", "Nhật Bản"),
+    ("hàn quốc", "Hàn Quốc"),
+    ("ấn độ", "Ấn Độ"),
+    ("thái lan", "Thái Lan"),
+    ("hoa kỳ", "Hoa Kỳ"),
+    ("campuchia", "Campuchia"),
+    ("singapore", "Singapore"),
+    ("malaysia", "Malaysia"),
+    ("indonesia", "Indonesia"),
+    ("tây ban nha", "Tây Ban Nha"),
+    ("đông nam á", "Đông Nam Á"),
+    ("châu á", "Châu Á"),
+    ("châu âu", "Châu Âu"),
+    # Language / nationality contexts ("người nhật", "tiếng anh", "ở mỹ")
+    ("tiếng anh", "tiếng Anh"),
+    ("tiếng pháp", "tiếng Pháp"),
+    ("tiếng đức", "tiếng Đức"),
+    ("tiếng nhật", "tiếng Nhật"),
+    ("tiếng hàn", "tiếng Hàn"),
+    ("tiếng trung", "tiếng Trung"),
+    ("tiếng việt", "tiếng Việt"),
+    ("tiếng thái", "tiếng Thái"),
+    ("tiếng lào", "tiếng Lào"),
+    ("người nhật", "người Nhật"),
+    ("người mỹ", "người Mỹ"),
+    ("người anh", "người Anh"),
+    ("người pháp", "người Pháp"),
+    ("người đức", "người Đức"),
+    ("người hàn", "người Hàn"),
+    ("người việt", "người Việt"),
+    ("ở mỹ", "ở Mỹ"),
+    ("nước mỹ", "nước Mỹ"),
+    ("nước nhật", "nước Nhật"),
+    ("nước anh", "nước Anh"),
+    ("nước pháp", "nước Pháp"),
+    ("nước đức", "nước Đức"),
+    ("ông kim", "ông Kim"),
+    ("bà helen", "bà Helen"),
+    ("metropol", "Metropole"),
+    # Major Vietnamese enterprises & international tech/business acronyms (prevents "fpt" -> "Comcast"!)
+    ("fpt", "FPT"),
+    ("vnpt", "VNPT"),
+    ("viettel", "Viettel"),
+    ("vingroup", "Vingroup"),
+    ("vinfast", "VinFast"),
+    ("bidv", "BIDV"),
+    ("vietcombank", "Vietcombank"),
+    ("techcombank", "Techcombank"),
+    ("google", "Google"),
+    ("microsoft", "Microsoft"),
+    ("amazon", "Amazon"),
+    ("openai", "OpenAI"),
+    ("chatgpt", "ChatGPT"),
+    ("youtube", "YouTube"),
+    ("facebook", "Facebook"),
+    ("tiktok", "TikTok"),
+    ("zalo", "Zalo"),
+    ("ceo", "CEO"),
+    ("cfo", "CFO"),
+    ("cto", "CTO"),
+    ("kpi", "KPI"),
+    ("okr", "OKR"),
+    ("roi", "ROI"),
+    ("crm", "CRM"),
+    ("erp", "ERP"),
+    ("api", "API"),
+    ("mcp", "MCP"),
+    ("cli", "CLI"),
+    ("gdp", "GDP"),
+    ("usd", "USD"),
+    ("vnd", "VND"),
+    ("b2b", "B2B"),
+    ("b2c", "B2C"),
+    ("d2c", "D2C"),
+    ("oem", "OEM"),
+    ("odm", "ODM"),
+]
+
+_VI_PROPER_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(rf"(?<!\w){re.escape(src)}(?!\w)", re.IGNORECASE | re.UNICODE), dst)
+    for src, dst in sorted(_VI_PROPER_PHRASES, key=lambda kv: len(kv[0]), reverse=True)
+]
+
+_VI_NUM_WORDS = frozenset({
+    "không", "một", "mốt", "hai", "ba", "bốn", "tư", "năm", "lăm", "nhăm",
+    "sáu", "bảy", "bẩy", "tám", "chín", "mười", "mươi", "trăm", "nghìn", "ngàn",
+    "lẻ", "linh", "phần", "phẩy", "rưỡi",
+})
+_VI_MAGNITUDE_WORDS = frozenset({"triệu", "tỷ", "tỉ"})
+
+
+def restore_vietnamese_casing(text: str) -> str:
+    """Restore proper capitalization for Vietnamese cities, countries, and business/tech acronyms."""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    for pat, repl in _VI_PROPER_PATTERNS:
+        s = pat.sub(repl, s)
+    if s and s[0].islower():
+        s = s[0].upper() + s[1:]
+    return s
+
+
+def _strip_edge_punct(tok: str) -> tuple[str, str, str]:
+    m = re.match(r'^([("\'“‘\[]*)(.*?)([.,!?;:)"\'”’\]]*)$', tok)
+    if not m:
+        return "", tok, ""
+    return m.group(1), m.group(2), m.group(3)
+
+
+def _is_valid_itn_replacement(p1_span: list[str], p2_span: list[str]) -> bool:
+    """Accept Pass-2 numeric ITN only when Pass-1 is pure spoken number words and Pass-2 is well-formed."""
+    if not p1_span or not p2_span:
+        return False
+    p1_cores = [_strip_edge_punct(t)[1].lower() for t in p1_span]
+    # Never let ITN drop high-magnitude units (triệu / tỷ)
+    if any(w in _VI_MAGNITUDE_WORDS for w in p1_cores):
+        return False
+    if not all((w in _VI_NUM_WORDS or w.isdigit()) for w in p1_cores if w):
+        return False
+    p2_joined = " ".join(_strip_edge_punct(t)[1] for t in p2_span)
+    if not any(ch.isdigit() for ch in p2_joined):
+        return False
+    # Reject malformed 5+ digit year hallucinations like "2020424"
+    for num_tok in re.findall(r"\d+", p2_joined):
+        if len(num_tok) >= 5 and num_tok.startswith("20"):
+            return False
+    return True
+
+
+_VI_NO_PERIOD_AFTER = frozenset({
+    "và", "hoặc", "nhưng", "mà", "thì", "là", "của", "vì", "nếu", "để", "nên",
+    "với", "cho", "trong", "khi", "cũng", "hay", "như", "tại", "vừa", "đã",
+    "đang", "sẽ", "không", "rất", "vẫn", "còn", "bị", "được", "các", "những", "một",
+})
+
+_VI_MID_NO_CAP = _VI_NO_PERIOD_AFTER | frozenset({
+    "có", "chúng", "tôi", "anh", "chị", "họ", "nó", "ông", "bà", "cô", "chú",
+    "bác", "cậu", "lão", "người", "cái", "này", "đó", "đấy", "kia", "làm",
+    "nói", "biết", "thấy", "đi", "về", "lên", "xuống", "ra", "vào", "qua",
+    "muốn", "phải", "cần", "nên", "quan", "tâm", "dùng", "giữ", "bảo",
+})
+
+
+def _transfer_punct_and_caps(pass1_text: str, pass2_text: str) -> str:
+    """
+    Word-aligned Punctuation, Capitalization & Safe-ITN Transfer:
+    Preserves Zipformer-30M-6000h's superior acoustic vocabulary (e.g. 'FPT', 'sân bay',
+    'khách sạn', 'bia hơi', 'năm cốc', 'Metropole', 'Helen', 'toilet', 'vừa lau chùi')
+    while adopting VietASR Pass-2's punctuation, sentence casing, proper-noun casing,
+    and clean numeric ITN — eliminating acoustic regressions and trailing audio bleed.
+    """
+    p1_toks = (pass1_text or "").strip().split()
+    p2_toks = (pass2_text or "").strip().split()
+    if not p1_toks:
+        return restore_vietnamese_casing(pass2_text)
+    if not p2_toks:
+        return restore_vietnamese_casing(pass1_text)
+
+    p1_norms = [_strip_edge_punct(t)[1].lower() for t in p1_toks]
+    p2_norms = [_strip_edge_punct(t)[1].lower() for t in p2_toks]
+
+    sm = difflib.SequenceMatcher(None, p1_norms, p2_norms, autojunk=False)
+    out: list[str] = []
+    after_sentence_end = True
+
+    def _safe_right_punct(core_word: str, punct: str, is_last_tok: bool) -> str:
+        if not punct:
+            return ""
+        # Never inject a sentence-ending period right after a dangling connector/adverb mid-sentence
+        if not is_last_tok and "." in punct and core_word.lower() in _VI_NO_PERIOD_AFTER:
+            return "," if core_word.lower() in {"nhưng", "vì", "nếu", "khi", "nên"} else ""
+        return punct
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                t1 = p1_toks[i1 + k]
+                t2 = p2_toks[j1 + k]
+                l1, c1, r1 = _strip_edge_punct(t1)
+                l2, c2, r2 = _strip_edge_punct(t2)
+                is_last = (i1 + k) == len(p1_toks) - 1
+                # Preserve existing ALL-CAPS Latin acronyms from Pass-1 (e.g., FPT, API, MCP)
+                if len(c1) >= 2 and c1.isupper() and c1.isascii():
+                    core = c1
+                elif not after_sentence_end and c2 and c2[0].isupper() and c1 and c1[0].islower() and c2.lower() in _VI_MID_NO_CAP:
+                    # Do not transfer spurious mid-clause capitalization onto common function/pronoun words
+                    core = c1
+                else:
+                    core = c2
+                if after_sentence_end and core and core[0].islower():
+                    core = core[0].upper() + core[1:]
+                right_p = _safe_right_punct(core, r2 or r1, is_last)
+                tok_out = f"{l2 or l1}{core}{right_p}"
+                out.append(tok_out)
+                after_sentence_end = any(ch in ".?!" for ch in right_p)
+        elif tag == "replace":
+            p1_span = p1_toks[i1:i2]
+            p2_span = p2_toks[j1:j2]
+            if _is_valid_itn_replacement(p1_span, p2_span):
+                for tok in p2_span:
+                    out.append(tok)
+                    after_sentence_end = tok.endswith((".", "?", "!"))
+            else:
+                # Keep Pass-1 words; inherit ONLY true sentence-start casing & safe closing punctuation
+                _, _, p2_end_p = _strip_edge_punct(p2_span[-1])
+                for idx_s, t1 in enumerate(p1_span):
+                    l1, c1, r1 = _strip_edge_punct(t1)
+                    is_last = (i1 + idx_s) == len(p1_toks) - 1
+                    if idx_s == 0 and after_sentence_end and c1 and c1[0].islower():
+                        c1 = c1[0].upper() + c1[1:]
+                    raw_rp = p2_end_p if (idx_s == len(p1_span) - 1 and p2_end_p and not r1) else r1
+                    right_p = _safe_right_punct(c1, raw_rp, is_last)
+                    out.append(f"{l1}{c1}{right_p}")
+                    after_sentence_end = any(ch in ".?!" for ch in right_p)
+        elif tag == "delete":
+            # Pass-2 dropped words that Pass-1 heard -> keep Pass-1 words cleanly
+            for idx_d, t1 in enumerate(p1_toks[i1:i2]):
+                l1, c1, r1 = _strip_edge_punct(t1)
+                is_last = (i1 + idx_d) == len(p1_toks) - 1
+                if after_sentence_end and c1 and c1[0].islower():
+                    c1 = c1[0].upper() + c1[1:]
+                right_p = _safe_right_punct(c1, r1, is_last)
+                out.append(f"{l1}{c1}{right_p}")
+                after_sentence_end = any(ch in ".?!" for ch in right_p)
+        elif tag == "insert":
+            # Never inject extra Pass-2 words (prevents trailing bleed like "Qua.", "Bảo là.");
+            # only carry sentence punctuation if preceding word is not a dangling connector.
+            if out and j1 > 0 and i1 < len(p1_toks):
+                _, prev_core, _ = _strip_edge_punct(out[-1])
+                _, _, ins_end_p = _strip_edge_punct(p2_toks[j2 - 1])
+                safe_p = _safe_right_punct(prev_core, ins_end_p, False)
+                if safe_p and any(ch in ".?!" for ch in safe_p) and not out[-1].endswith((".", "?", "!", ",")):
+                    out[-1] = out[-1] + safe_p
+                    after_sentence_end = True
+
+    merged = " ".join(out).strip()
+    merged = re.sub(r"\s+([,.;:!?])", r"\1", merged)
+    return restore_vietnamese_casing(merged)
+
+
 class VietASRBatchRefiner:
     """
-    Pass-2 Vietnamese batch refiner using embedded `viet-asr` (78 MB, 0 extra download).
-    Runs asynchronously on committed paragraph audio (~5x realtime on CPU) to restore
-    punctuation, capitalization, numbers (ITN), and fix acoustic errors without ever
-    blocking Pass-1 streaming.
+    Pass-2 Vietnamese Punctuation, Capitalization & Safe-ITN Refiner using embedded `viet-asr`.
+    Runs asynchronously on committed audio and transfers ONLY punctuation, proper-noun casing,
+    and well-formed numeric ITN onto Pass-1 Zipformer-30M's superior 6000h word sequence —
+    preventing acoustic word regressions and trailing-audio bleed.
     """
 
     def __init__(self, provider: str = "cpu", sample_rate: float = 16000.0) -> None:
         self.provider = provider
         self.sample_rate = sample_rate
         self._lock = threading.Lock()
+        try:
+            # Silence repetitive per-call native INFO logs (`loaded model from buffer`)
+            vietasr.ffi.native.lib.vietasr_set_log_level(3)
+        except Exception:
+            pass
         self._pipeline = (
             vietasr.Pipeline.new()
             .set_execution_provider(provider)
@@ -462,58 +754,29 @@ class VietASRBatchRefiner:
         fallback_text: str,
         protected_terms: list[str] | None = None,
     ) -> tuple[str, float]:
+        base_formatted = restore_vietnamese_casing(fallback_text)
         if pcm_s16 is None or len(pcm_s16) < int(self.sample_rate * 0.4):
-            return fallback_text, 0.0
+            return base_formatted, 0.0
         t0 = time.perf_counter()
         try:
             with self._lock:
                 res = self._pipeline.transcribe(pcm_s16, sample_rate=self.sample_rate)
             refined = (res.text or "").strip()
             ms = round((time.perf_counter() - t0) * 1000.0, 1)
-            # Safety guard 1: never drop a valid Pass-1 transcript if Pass-2 VAD clipped soft audio
-            fb_words = len(fallback_text.split())
+            fb_words = len(base_formatted.split())
             rf_words = len(refined.split())
-            if not refined or (fb_words > 0 and rf_words < max(2, int(fb_words * 0.55))):
-                return fallback_text, ms
+            if not refined or (fb_words > 0 and rf_words < max(2, int(fb_words * 0.50))):
+                return base_formatted, ms
 
-            # Safety guard 2: always protect glossary terms AND auto-extracted Pass-1 uppercase Latin
-            # acronyms (MCP, API, CLI, USD...) + high-magnitude Vietnamese units (triệu tỷ, nghìn tỷ, tỷ)
-            # even when custom glossary is disabled so Pass-2 never drops critical acronyms or 10^9 units!
-            if fallback_text:
-                effective_terms: list[str] = list(protected_terms or [])
-                if not fallback_text.isupper():
-                    effective_terms.extend(re.findall(r"(?<!\w)[A-Z]{2,}(?!\w)", fallback_text))
-                seen_terms: set[str] = set()
-                dropped = 0
-                for term in effective_terms:
-                    t = term.strip()
-                    tl = t.lower()
-                    if len(t) < 2 or tl in seen_terms:
-                        continue
-                    seen_terms.add(tl)
-                    pat = re.compile(rf"(?<!\w){re.escape(t)}(?!\w)", re.IGNORECASE | re.UNICODE)
-                    if pat.search(fallback_text) and not pat.search(refined):
-                        dropped += 1
+            if base_formatted:
+                # Word-aligned transfer preserves 100% of Pass-1 words (incl. glossary, FPT, toilet,
+                # sân bay, khách sạn, triệu tỷ) while gaining Pass-2 punctuation, caps & safe ITN!
+                transferred = _transfer_punct_and_caps(base_formatted, refined)
+                return transferred, ms
 
-                # Guard financial/magnitude units ("triệu tỷ", "nghìn tỷ", "tỷ" / "tỉ")
-                if dropped == 0:
-                    for unit_pat in (
-                        r"(?<!\w)triệu\s+t[ỷỉ](?!\w)",
-                        r"(?<!\w)nghìn\s+t[ỷỉ](?!\w)",
-                        r"(?<!\w)ngàn\s+t[ỷỉ](?!\w)",
-                        r"(?<!\w)t[ỷỉ](?!\w)",
-                    ):
-                        up = re.compile(unit_pat, re.IGNORECASE | re.UNICODE)
-                        if up.search(fallback_text) and not up.search(refined):
-                            dropped += 1
-                            break
-
-                if dropped >= 1:
-                    return _format_sentence(fallback_text), ms
-
-            return refined, ms
+            return restore_vietnamese_casing(refined), ms
         except Exception:
-            return fallback_text, round((time.perf_counter() - t0) * 1000.0, 1)
+            return base_formatted, round((time.perf_counter() - t0) * 1000.0, 1)
 
     def close(self) -> None:
         with self._lock:

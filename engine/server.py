@@ -84,6 +84,7 @@ from asr_engine import (
     VietASRStreamingEngine,
     ZipformerStreamingEnEngine,
     ZipformerStreamingViEngine,
+    restore_vietnamese_casing,
 )
 from audience_web import AUDIENCE_HTML, OBS_HTML, get_local_lan_ip
 from audio_capture import (
@@ -404,7 +405,7 @@ class StablePrefixTracker:
                 else:
                     window = set(new_norms[: len(locked_norms) + 3])
                     overlap = sum(1 for t in locked_norms if t and t in window) / max(len(locked_norms), 1)
-                    if overlap < 0.40 and len(new_tokens) >= len(self._locked_tokens) + 4:
+                    if overlap < 0.30 and len(new_tokens) >= len(self._locked_tokens) + 5:
                         # Major semantic re-parse (e.g., sentence-final negation) — clean re-anchor
                         self._locked_tokens = new_tokens[:cand_lock]
                         unstable_tokens = new_tokens[cand_lock:]
@@ -428,6 +429,15 @@ class StablePrefixTracker:
             else:
                 self._locked_tokens = new_tokens[:cand_lock]
                 unstable_tokens = new_tokens[cand_lock:]
+
+            # Prevent any duplicate seam word where locked prefix meets aligned unstable tail
+            while (
+                self._locked_tokens
+                and unstable_tokens
+                and self._norm_tok(self._locked_tokens[-1])
+                and self._norm_tok(self._locked_tokens[-1]) == self._norm_tok(unstable_tokens[0])
+            ):
+                unstable_tokens = unstable_tokens[1:]
 
             self._prev_tokens = new_tokens
             stable_str = " ".join(self._locked_tokens).strip()
@@ -2007,6 +2017,8 @@ class EngineRuntime:
 
         res = " ".join(out).strip()
         res = re.sub(r"\s+([,.;:!?])", r"\1", res)
+        if source_lang == "vie_Latn":
+            res = restore_vietnamese_casing(res)
         if had_leading_cap and res and res[0].islower():
             res = res[0].upper() + res[1:]
         return res
@@ -2020,6 +2032,7 @@ class EngineRuntime:
             "và", "hoặc", "nhưng", "mà", "thì", "là", "của", "vì", "nếu", "để",
             "nên", "với", "cho", "trong", "khi", "cũng", "hay", "như", "tại",
             "cái", "những", "các", "một", "đôi", "sẽ", "đang", "có", "bị", "được",
+            "tận", "cả", "đối",
             "and", "but", "so", "to", "that", "because", "with", "the", "of", "in", "for", "or", "a", "an",
         }
         if words[-1] in single_connectors:
@@ -2027,7 +2040,7 @@ class EngineRuntime:
         if len(words) >= 2:
             last2 = f"{words[-2]} {words[-1]}"
             if last2 in {
-                "nhưng mà", "để mà", "có thể", "tức là", "gọi là",
+                "nhưng mà", "để mà", "có thể", "tức là", "gọi là", "bất kể",
                 "cũng như", "hay là", "cho nên", "sẽ có", "có cái", "thì đôi",
             }:
                 return True
@@ -2410,6 +2423,7 @@ class EngineRuntime:
     def _audio_loop(self, asr) -> None:
         silent_chunks = 0
         breath_chunks = 0
+        speech_rms = 0.06
         gated = False
         preroll: deque[np.ndarray] = deque(maxlen=2)
         try:
@@ -2425,9 +2439,13 @@ class EngineRuntime:
                 elif rms >= 0.0055:
                     silent_chunks = 0
 
-                if rms < 0.009:
+                # Adaptive Speech/Noise-Floor Breath Detector (works on both studio mic & hall/YouTube!)
+                if rms > 0.025:
+                    speech_rms = speech_rms * 0.92 + rms * 0.08
+                dip_thresh = max(0.011, min(0.028, speech_rms * 0.22))
+                if rms < dip_thresh:
                     breath_chunks += 1
-                elif rms >= 0.011:
+                elif rms >= dip_thresh * 1.25:
                     breath_chunks = 0
 
                 if silent_chunks > 25:
@@ -2450,20 +2468,19 @@ class EngineRuntime:
                 out = asr.accept_pcm(chunk)
                 self._enqueue_asr_output(out)
 
-                # Conference Breath-Pause Soft Commit (~0.45s low-energy breath dip once a full clause is ready)
-                if (
-                    out.kind != "final"
-                    and breath_chunks == 4
-                    and hasattr(asr, "soft_commit_if_ready")
-                ):
+                # Conference Breath-Pause Soft Commit (native rule2=0.72s handles clean pauses;
+                # soft commit with 0.45s tail-flush assists on >=0.55s breath dips in long runs)
+                if out.kind != "final" and hasattr(asr, "soft_commit_if_ready"):
                     min_words, _, _ = self._paragraph_thresholds()
-                    soft_out = asr.soft_commit_if_ready(
-                        min_words=min_words,
-                        block_tail_fn=self._ends_with_connector,
-                    )
-                    if soft_out.kind == "final":
-                        self._enqueue_asr_output(soft_out)
-                        breath_chunks = 0
+                    soft_min = 24 if breath_chunks == 5 else (min_words if breath_chunks == 6 else 0)
+                    if soft_min > 0:
+                        soft_out = asr.soft_commit_if_ready(
+                            min_words=soft_min,
+                            block_tail_fn=self._ends_with_connector,
+                        )
+                        if soft_out.kind == "final":
+                            self._enqueue_asr_output(soft_out)
+                            breath_chunks = 0
         except Exception as exc:
             self.broadcast_threadsafe({"type": "error", "data": {"message": f"Lỗi thu âm / ASR: {exc}"}})
         finally:
@@ -2586,6 +2603,7 @@ class EngineRuntime:
     def _remote_audio_loop(self, asr) -> None:
         silent_chunks = 0
         breath_chunks = 0
+        speech_rms = 0.06
         gated = False
         preroll: deque[np.ndarray] = deque(maxlen=2)
         try:
@@ -2598,9 +2616,12 @@ class EngineRuntime:
                     silent_chunks += 1
                 elif rms >= 0.0055:
                     silent_chunks = 0
-                if rms < 0.009:
+                if rms > 0.025:
+                    speech_rms = speech_rms * 0.92 + rms * 0.08
+                dip_thresh = max(0.011, min(0.028, speech_rms * 0.22))
+                if rms < dip_thresh:
                     breath_chunks += 1
-                elif rms >= 0.011:
+                elif rms >= dip_thresh * 1.25:
                     breath_chunks = 0
                 if silent_chunks > 25:
                     with self._remote_lock:
@@ -2619,19 +2640,17 @@ class EngineRuntime:
                 self._append_remote_pcm(chunk)
                 out = asr.accept_pcm(chunk)
                 self._remote_enqueue_asr_output(out)
-                if (
-                    out.kind != "final"
-                    and breath_chunks == 4
-                    and hasattr(asr, "soft_commit_if_ready")
-                ):
+                if out.kind != "final" and hasattr(asr, "soft_commit_if_ready"):
                     min_words, _, _ = self._paragraph_thresholds()
-                    soft_out = asr.soft_commit_if_ready(
-                        min_words=min_words,
-                        block_tail_fn=self._ends_with_connector,
-                    )
-                    if soft_out.kind == "final":
-                        self._remote_enqueue_asr_output(soft_out)
-                        breath_chunks = 0
+                    soft_min = 24 if breath_chunks == 5 else (min_words if breath_chunks == 6 else 0)
+                    if soft_min > 0:
+                        soft_out = asr.soft_commit_if_ready(
+                            min_words=soft_min,
+                            block_tail_fn=self._ends_with_connector,
+                        )
+                        if soft_out.kind == "final":
+                            self._remote_enqueue_asr_output(soft_out)
+                            breath_chunks = 0
         except Exception as exc:
             if not self._stop_event.is_set():
                 self.broadcast_threadsafe({"type": "error", "data": {"message": f"Lỗi kênh đối tác: {exc}"}})
@@ -2982,7 +3001,7 @@ async def lifespan(_app: FastAPI):
     runtime.shutdown()
 
 
-app = FastAPI(title="VOICERECORE Local Engine", version="0.8.2", lifespan=lifespan)
+app = FastAPI(title="VOICERECORE Local Engine", version="0.8.3", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
