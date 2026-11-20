@@ -22,6 +22,7 @@ import logging
 import os
 import platform
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -263,6 +264,181 @@ class CloudQuotaResetRequest(BaseModel):
     provider: Optional[str] = None
 
 
+_NON_SPACED_SCRIPT_PREFIXES = ("tha_", "lao_", "khm_", "zho_", "jpn_", "mya_")
+
+# Legitimate Vietnamese reduplicative words (từ láy / lặp nghĩa) that Clean Verbatim must preserve
+_VI_REDUPLICATIVE_KEEP = frozenset({
+    "từng", "ngày", "nhà", "người", "rất", "xa", "gần", "dần", "nhanh", "chậm",
+    "khác", "lần", "mãi", "luôn", "đời", "lớp", "tầng", "nơi", "khắp", "trùng",
+    "điệp", "sâu", "rõ", "đều", "lớn", "nhỏ", "nhẹ", "khẽ", "từ", "lâu", "cao",
+    "thấp", "sáng", "tối", "xanh", "đỏ", "trắng", "đen", "nóng", "lạnh", "vui",
+    "buồn", "khỏe", "mạnh", "thật", "lắm", "quá", "vừa", "sát", "chặt", "kỹ",
+    "gọn", "đẹp", "tốt", "hay", "đúng", "sai", "đủ", "nhiều", "ít", "sớm",
+    "muộn", "trước", "sau", "trên", "dưới", "trong", "ngoài", "quanh", "đi",
+    "lại", "lên", "xuống", "ra", "vào", "qua", "về",
+})
+
+
+class StablePrefixTracker:
+    """
+    Conference Local Agreement-2 monotonic prefix stabilizer for live streaming MT.
+
+    Locks the longest common prefix agreed across consecutive draft translations so the
+    displayed translation grows smoothly left-to-right (bold locked prefix + soft tentative tail)
+    without flickering or rewriting already-read words.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._seg_id: str = ""
+        self._target_lang: str = ""
+        self._locked_tokens: list[str] = []
+        self._prev_tokens: list[str] = []
+        self._locked_chars: str = ""
+        self._prev_chars: str = ""
+
+    @staticmethod
+    def _norm_tok(tok: str) -> str:
+        return re.sub(r"^[^\w]+|[^\w]+$", "", tok.lower())
+
+    def reset(self) -> None:
+        with self._lock:
+            self._seg_id = ""
+            self._target_lang = ""
+            self._locked_tokens = []
+            self._prev_tokens = []
+            self._locked_chars = ""
+            self._prev_chars = ""
+
+    def clear_if(self, seg_id: str) -> None:
+        with self._lock:
+            if seg_id and seg_id == self._seg_id:
+                self._seg_id = ""
+                self._target_lang = ""
+                self._locked_tokens = []
+                self._prev_tokens = []
+                self._locked_chars = ""
+                self._prev_chars = ""
+
+    def update(self, seg_id: str, target_lang: str, text: str) -> tuple[str, str, str]:
+        """Return `(stable_text, unstable_text, full_stabilized_text)`."""
+        clean = " ".join((text or "").strip().split())
+        if not clean:
+            return ("", "", "")
+
+        with self._lock:
+            if seg_id != self._seg_id or target_lang != self._target_lang:
+                self._seg_id = seg_id
+                self._target_lang = target_lang
+                self._locked_tokens = []
+                self._prev_tokens = []
+                self._locked_chars = ""
+                self._prev_chars = ""
+
+            # Character-level agreement for non-space-delimited scripts (Thai/Lao/CJK/Khmer/Burmese)
+            is_non_spaced = (
+                target_lang.startswith(_NON_SPACED_SCRIPT_PREFIXES)
+                and len(clean.split()) <= 2
+                and len(clean) >= 8
+            )
+            if is_non_spaced:
+                if not self._prev_chars:
+                    self._prev_chars = clean
+                    return ("", clean, clean)
+                lcp = 0
+                lim = min(len(self._prev_chars), len(clean))
+                while lcp < lim and self._prev_chars[lcp] == clean[lcp]:
+                    lcp += 1
+                cand = max(0, lcp - 3) if lcp == len(clean) else lcp
+                if self._locked_chars:
+                    if clean.startswith(self._locked_chars):
+                        if cand > len(self._locked_chars):
+                            self._locked_chars = clean[:cand]
+                        unstable_c = clean[len(self._locked_chars) :]
+                    else:
+                        # Check character overlap before breaking monotonic lock
+                        match_c = 0
+                        mlim = min(len(self._locked_chars), len(clean))
+                        while match_c < mlim and self._locked_chars[match_c] == clean[match_c]:
+                            match_c += 1
+                        if match_c < len(self._locked_chars) * 0.4 and len(clean) >= len(self._locked_chars) + 10:
+                            self._locked_chars = clean[:cand]
+                            unstable_c = clean[len(self._locked_chars) :]
+                        else:
+                            unstable_c = clean[len(self._locked_chars) :]
+                else:
+                    self._locked_chars = clean[:cand]
+                    unstable_c = clean[cand:]
+                self._prev_chars = clean
+                full_c = self._locked_chars + unstable_c
+                return (self._locked_chars, unstable_c, full_c)
+
+            # Word-level Local Agreement-2 for space-delimited languages (EN, VI, FR, DE, KO, etc.)
+            new_tokens = clean.split()
+            if not self._prev_tokens:
+                self._prev_tokens = new_tokens
+                return ("", clean, clean)
+
+            prev_norms = [self._norm_tok(t) for t in self._prev_tokens]
+            new_norms = [self._norm_tok(t) for t in new_tokens]
+
+            lcp = 0
+            lim = min(len(prev_norms), len(new_norms))
+            while lcp < lim and prev_norms[lcp] == new_norms[lcp]:
+                lcp += 1
+
+            # Keep final token unlocked if no new tokens arrived yet so punctuation/tense can settle
+            cand_lock = max(0, lcp - 1) if lcp == len(new_tokens) else lcp
+
+            if self._locked_tokens:
+                locked_norms = [self._norm_tok(t) for t in self._locked_tokens]
+                pos_match = 0
+                mlim = min(len(locked_norms), len(new_norms))
+                while pos_match < mlim and locked_norms[pos_match] == new_norms[pos_match]:
+                    pos_match += 1
+
+                if pos_match == len(self._locked_tokens):
+                    if cand_lock > len(self._locked_tokens):
+                        self._locked_tokens = list(self._locked_tokens) + new_tokens[len(self._locked_tokens) : cand_lock]
+                    unstable_tokens = new_tokens[len(self._locked_tokens) :]
+                else:
+                    window = set(new_norms[: len(locked_norms) + 3])
+                    overlap = sum(1 for t in locked_norms if t and t in window) / max(len(locked_norms), 1)
+                    if overlap < 0.40 and len(new_tokens) >= len(self._locked_tokens) + 4:
+                        # Major semantic re-parse (e.g., sentence-final negation) — clean re-anchor
+                        self._locked_tokens = new_tokens[:cand_lock]
+                        unstable_tokens = new_tokens[cand_lock:]
+                    else:
+                        # Keep monotonic lock; align tail cleanly after last locked anchor word
+                        anchor_pos = -1
+                        lo = max(0, len(self._locked_tokens) - 3)
+                        hi = min(len(new_norms), len(self._locked_tokens) + 4)
+                        for back in range(1, min(3, len(locked_norms)) + 1):
+                            needle = locked_norms[-back]
+                            if not needle:
+                                continue
+                            for j in range(hi - 1, lo - 1, -1):
+                                if new_norms[j] == needle:
+                                    anchor_pos = j + back
+                                    break
+                            if anchor_pos >= 0:
+                                break
+                        tail_start = anchor_pos if anchor_pos >= 0 else len(self._locked_tokens)
+                        unstable_tokens = new_tokens[tail_start:] if tail_start < len(new_tokens) else []
+            else:
+                self._locked_tokens = new_tokens[:cand_lock]
+                unstable_tokens = new_tokens[cand_lock:]
+
+            self._prev_tokens = new_tokens
+            stable_str = " ".join(self._locked_tokens).strip()
+            unstable_str = " ".join(unstable_tokens).strip()
+            if stable_str and unstable_str:
+                full_str = f"{stable_str} {unstable_str}"
+            else:
+                full_str = stable_str or unstable_str
+            return (stable_str, unstable_str, full_str)
+
+
 class EngineRuntime:
     def __init__(self) -> None:
         self.model_manager = ModelManager()
@@ -317,6 +493,7 @@ class EngineRuntime:
         self._final_mt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self._partial_lock = threading.Lock()
         self._pending_partial: Optional[dict[str, Any]] = None
+        self._stable_prefix = StablePrefixTracker()
         self._mt_wakeup = threading.Event()
 
         # Primary channel semantic sentence buffer + PCM ring buffer for Pass-2 Vietnamese refinement
@@ -1337,6 +1514,7 @@ class EngineRuntime:
                 break
         with self._partial_lock:
             self._pending_partial = None
+        self._stable_prefix.reset()
         with self._para_lock:
             self._para_parts.clear()
             self._para_pcm_chunks.clear()
@@ -1750,6 +1928,90 @@ class EngineRuntime:
         return merged
 
     @staticmethod
+    def _clean_verbatim(
+        text: str,
+        source_lang: str = "vie_Latn",
+        protected_terms: Optional[set[str]] = None,
+    ) -> str:
+        """
+        Conference Clean Verbatim pre-processor:
+        Removes pure spoken hesitation fillers ('ờ, ờm, ừm, um, uh, erm') and immediate stutter
+        repeats ('chúng ta chúng ta sẽ' -> 'chúng ta sẽ', 'we we need' -> 'we need') while
+        preserving legitimate Vietnamese reduplicative words, numbers, and glossary terms.
+        """
+        raw = " ".join((text or "").strip().split())
+        if not raw:
+            return ""
+
+        had_leading_cap = raw[0].isupper()
+        prot_lower = {p.lower() for p in (protected_terms or set()) if p}
+
+        # 1) Strip standalone hesitation fillers (Unicode-safe word boundaries)
+        if source_lang == "vie_Latn":
+            filler_pat = r"(?i)(?:^|(?<=[\s,;:\-—]))(?:à\s+ờm?|ờ\s+thì|ờm+|ờ|ừm+|uhm|um+|uh+|erm)(?=$|[\s,.;:!?])"
+        else:
+            filler_pat = r"(?i)(?:^|(?<=[\s,;:\-—]))(?:uhm|um+|uh+|erm|ờm+|ừm+)(?=$|[\s,.;:!?])"
+
+        cleaned = re.sub(filler_pat, " ", raw)
+        cleaned = re.sub(r"\s*,\s*(?:,\s*)+", ", ", cleaned)
+        cleaned = re.sub(r"^[\s,;:\-—]+", "", cleaned)
+        cleaned = " ".join(cleaned.split())
+        if not cleaned:
+            return raw
+
+        # 2) Collapse immediate 2-word and 1-word stutters (skip numbers, glossary, & VI reduplicatives)
+        tokens = cleaned.split()
+        out: list[str] = []
+        i = 0
+        while i < len(tokens):
+            # 2-word stutter: e.g. "chúng ta chúng ta" or "in the in the"
+            if i + 3 < len(tokens):
+                a1 = tokens[i].lower().strip(".,!?;:\"'()[]")
+                a2 = tokens[i + 1].lower().strip(".,!?;:\"'()[]")
+                b1 = tokens[i + 2].lower().strip(".,!?;:\"'()[]")
+                b2 = tokens[i + 3].lower().strip(".,!?;:\"'()[]")
+                pair = f"{a1} {a2}"
+                if (
+                    a1
+                    and a2
+                    and a1 == b1
+                    and a2 == b2
+                    and not a1.isdigit()
+                    and not a2.isdigit()
+                    and pair not in prot_lower
+                    and not tokens[i + 1].endswith((".", "!", "?"))
+                ):
+                    out.append(tokens[i])
+                    out.append(tokens[i + 1])
+                    i += 4
+                    continue
+
+            # 1-word stutter: e.g. "tôi tôi muốn" or "we we need"
+            if i + 1 < len(tokens):
+                w1 = tokens[i].lower().strip(".,!?;:\"'()[]")
+                w2 = tokens[i + 1].lower().strip(".,!?;:\"'()[]")
+                if (
+                    w1
+                    and w1 == w2
+                    and not w1.isdigit()
+                    and w1 not in _VI_REDUPLICATIVE_KEEP
+                    and w1 not in prot_lower
+                    and not tokens[i].endswith((".", "!", "?"))
+                ):
+                    out.append(tokens[i + 1])
+                    i += 2
+                    continue
+
+            out.append(tokens[i])
+            i += 1
+
+        res = " ".join(out).strip()
+        res = re.sub(r"\s+([,.;:!?])", r"\1", res)
+        if had_leading_cap and res and res[0].islower():
+            res = res[0].upper() + res[1:]
+        return res
+
+    @staticmethod
     def _ends_with_connector(text: str) -> bool:
         words = text.lower().rstrip(".,!?;: ").split()
         if not words:
@@ -1835,18 +2097,18 @@ class EngineRuntime:
 
     def _paragraph_thresholds(self) -> tuple[int, int, float]:
         """
-        Semantic Sentence Commit thresholds (Backend Translation Unit):
-        Always commit clean semantic sentences (10-24 words) so Pass-2 & MT operate
-        at peak accuracy, while UI merges consecutive sentences into visual paragraphs.
+        Conference Semantic Sentence Commit thresholds (Backend Translation Unit):
+        Commit clean semantic clauses (12-28 words) so Pass-2 & MT operate at peak
+        accuracy and comfortable reading pace, while UI merges sentences into paragraphs.
         """
         mode = self.config.paragraph_mode
         if mode == "short":
-            return (6, 14, 1.0)
+            return (7, 15, 0.95)
         if mode == "medium":
-            return (8, 20, 1.2)
-        # Default "long": commit clean semantic sentences (~10-24 words, 1.35s pause);
-        # visual grouping then merges 3-4 sentences into a smooth long paragraph on Monitor #2!
-        return (10, 24, 1.35)
+            return (10, 22, 1.15)
+        # Default "long": commit natural conference clauses (~12-28 words, 1.35s pause);
+        # breath-pause soft commit catches 0.45s pauses cleanly once >= 12 words are spoken.
+        return (12, 28, 1.35)
 
     def _visual_paragraph_limits(self) -> tuple[int, float]:
         """Display grouping budget (max_words_per_paragraph, max_gap_seconds) by paragraph_mode."""
@@ -1931,11 +2193,17 @@ class EngineRuntime:
         self._current_segment_id = uuid.uuid4().hex[:10]
         with self._partial_lock:
             self._pending_partial = None
+        self._stable_prefix.reset()
 
         if not full_text:
             return
 
-        display_text = self.glossary.apply_asr_fixes(full_text)
+        prot_terms = set(self._get_glossary_hotwords())
+        display_text = self._clean_verbatim(
+            self.glossary.apply_asr_fixes(full_text),
+            src_lang,
+            protected_terms=prot_terms,
+        )
         speaker_tag = "self" if self.config.audio_source == "dual" else ""
         self.broadcast_threadsafe(
             {
@@ -2011,8 +2279,12 @@ class EngineRuntime:
             if out.kind == "partial":
                 self._para_has_active_partial = True
                 parts_snapshot = [*self._para_parts, out.text]
-                combined = self.glossary.apply_asr_fixes(
-                    self._join_fragments(parts_snapshot, preserve_case=self._get_capitalized_glossary_words())
+                combined = self._clean_verbatim(
+                    self.glossary.apply_asr_fixes(
+                        self._join_fragments(parts_snapshot, preserve_case=self._get_capitalized_glossary_words())
+                    ),
+                    src_lang,
+                    protected_terms=set(self._get_glossary_hotwords()),
                 )
                 seg_id = self._current_segment_id
                 self.broadcast_threadsafe(
@@ -2062,7 +2334,11 @@ class EngineRuntime:
                 else:
                     seg_id = self._current_segment_id
                     parts_snapshot = list(self._para_parts)
-                    combined_display = self.glossary.apply_asr_fixes(combined)
+                    combined_display = self._clean_verbatim(
+                        self.glossary.apply_asr_fixes(combined),
+                        src_lang,
+                        protected_terms=set(self._get_glossary_hotwords()),
+                    )
                     self.broadcast_threadsafe(
                         {
                             "type": "partial",
@@ -2133,6 +2409,7 @@ class EngineRuntime:
 
     def _audio_loop(self, asr) -> None:
         silent_chunks = 0
+        breath_chunks = 0
         gated = False
         preroll: deque[np.ndarray] = deque(maxlen=2)
         try:
@@ -2148,11 +2425,17 @@ class EngineRuntime:
                 elif rms >= 0.0055:
                     silent_chunks = 0
 
+                if rms < 0.009:
+                    breath_chunks += 1
+                elif rms >= 0.011:
+                    breath_chunks = 0
+
                 if silent_chunks > 25:
                     with self._para_lock:
                         can_gate = (not self._para_parts) and (not self._para_has_active_partial)
                     if can_gate:
                         gated = True
+                        breath_chunks = 0
                         preroll.append(chunk)
                         continue
 
@@ -2166,6 +2449,21 @@ class EngineRuntime:
                 self._append_para_pcm(chunk)
                 out = asr.accept_pcm(chunk)
                 self._enqueue_asr_output(out)
+
+                # Conference Breath-Pause Soft Commit (~0.45s low-energy breath dip once a full clause is ready)
+                if (
+                    out.kind != "final"
+                    and breath_chunks == 4
+                    and hasattr(asr, "soft_commit_if_ready")
+                ):
+                    min_words, _, _ = self._paragraph_thresholds()
+                    soft_out = asr.soft_commit_if_ready(
+                        min_words=min_words,
+                        block_tail_fn=self._ends_with_connector,
+                    )
+                    if soft_out.kind == "final":
+                        self._enqueue_asr_output(soft_out)
+                        breath_chunks = 0
         except Exception as exc:
             self.broadcast_threadsafe({"type": "error", "data": {"message": f"Lỗi thu âm / ASR: {exc}"}})
         finally:
@@ -2179,8 +2477,14 @@ class EngineRuntime:
     def _remote_flush_locked(self) -> None:
         if not self._remote_parts:
             return
-        full_text = self.glossary.apply_asr_fixes(
-            self._join_fragments(self._remote_parts, preserve_case=self._get_capitalized_glossary_words())
+        r_src = self.config.target_lang
+        r_tgt = self.config.source_lang
+        full_text = self._clean_verbatim(
+            self.glossary.apply_asr_fixes(
+                self._join_fragments(self._remote_parts, preserve_case=self._get_capitalized_glossary_words())
+            ),
+            r_src,
+            protected_terms=set(self._get_glossary_hotwords()),
         )
         pcm_snap: Optional[np.ndarray] = None
         if self._remote_pcm_chunks:
@@ -2197,8 +2501,6 @@ class EngineRuntime:
         if not full_text:
             return
         # Remote partner speaks `target_lang` -> translated back into our `source_lang`!
-        r_src = self.config.target_lang
-        r_tgt = self.config.source_lang
         self._final_mt_queue.put(
             {
                 "id": seg_id,
@@ -2234,11 +2536,15 @@ class EngineRuntime:
 
             if out.kind == "partial":
                 self._remote_has_active_partial = True
-                combined = self.glossary.apply_asr_fixes(
-                    self._join_fragments(
-                        [*self._remote_parts, out.text],
-                        preserve_case=self._get_capitalized_glossary_words(),
-                    )
+                combined = self._clean_verbatim(
+                    self.glossary.apply_asr_fixes(
+                        self._join_fragments(
+                            [*self._remote_parts, out.text],
+                            preserve_case=self._get_capitalized_glossary_words(),
+                        )
+                    ),
+                    r_src,
+                    protected_terms=set(self._get_glossary_hotwords()),
                 )
                 self.broadcast_threadsafe(
                     {
@@ -2279,6 +2585,7 @@ class EngineRuntime:
 
     def _remote_audio_loop(self, asr) -> None:
         silent_chunks = 0
+        breath_chunks = 0
         gated = False
         preroll: deque[np.ndarray] = deque(maxlen=2)
         try:
@@ -2291,11 +2598,16 @@ class EngineRuntime:
                     silent_chunks += 1
                 elif rms >= 0.0055:
                     silent_chunks = 0
+                if rms < 0.009:
+                    breath_chunks += 1
+                elif rms >= 0.011:
+                    breath_chunks = 0
                 if silent_chunks > 25:
                     with self._remote_lock:
                         can_gate = (not self._remote_parts) and (not self._remote_has_active_partial)
                     if can_gate:
                         gated = True
+                        breath_chunks = 0
                         preroll.append(chunk)
                         continue
                 if gated:
@@ -2307,6 +2619,19 @@ class EngineRuntime:
                 self._append_remote_pcm(chunk)
                 out = asr.accept_pcm(chunk)
                 self._remote_enqueue_asr_output(out)
+                if (
+                    out.kind != "final"
+                    and breath_chunks == 4
+                    and hasattr(asr, "soft_commit_if_ready")
+                ):
+                    min_words, _, _ = self._paragraph_thresholds()
+                    soft_out = asr.soft_commit_if_ready(
+                        min_words=min_words,
+                        block_tail_fn=self._ends_with_connector,
+                    )
+                    if soft_out.kind == "final":
+                        self._remote_enqueue_asr_output(soft_out)
+                        breath_chunks = 0
         except Exception as exc:
             if not self._stop_event.is_set():
                 self.broadcast_threadsafe({"type": "error", "data": {"message": f"Lỗi kênh đối tác: {exc}"}})
@@ -2354,6 +2679,8 @@ class EngineRuntime:
     def _mt_worker_loop(self) -> None:
         last_partial_time = 0.0
         last_partial_key: tuple[str, str, str] = ("", "", "")
+        last_partial_seg_id: str = ""
+        last_partial_wc: int = 0
         last_final_mt_ms = 0.0
 
         while not self._stop_event.is_set() or not self._final_mt_queue.empty():
@@ -2366,6 +2693,7 @@ class EngineRuntime:
                 with self._partial_lock:
                     if self._pending_partial is not None and self._pending_partial.get("id") == item.get("id"):
                         self._pending_partial = None
+                self._stable_prefix.clear_if(str(item.get("id") or ""))
                 cfg = self.config
                 source_text = item["source_text"]
                 speaker = item.get("speaker", "")
@@ -2399,7 +2727,11 @@ class EngineRuntime:
                         except Exception:
                             pass
 
-                source_text = self.glossary.apply_asr_fixes(source_text)
+                source_text = self._clean_verbatim(
+                    self.glossary.apply_asr_fixes(source_text),
+                    item["source_lang"],
+                    protected_terms=set(self._get_glossary_hotwords()),
+                )
                 para_id = self._assign_paragraph_id(
                     len(source_text.split()),
                     item["source_lang"],
@@ -2480,45 +2812,73 @@ class EngineRuntime:
                 # Adaptive Draft Throttle: if MT is under heavy load (>3.2s/sentence), skip drafts so finals never fall behind!
                 if last_final_mt_ms > 3200.0:
                     continue
-                debounce_s = 0.90 if cfg.eco_mode else 0.45
+                # Conference-grade calm cadence (~0.85s normal, ~1.05s eco) prevents visual flicker
+                debounce_s = 1.05 if cfg.eco_mode else 0.85
                 if last_final_mt_ms > 1400.0:
                     debounce_s = max(debounce_s, (last_final_mt_ms / 1000.0) * 0.85)
                 draft_src = self._trim_dangling_tail_for_draft(partial_job["source_text"])
                 key = (draft_src, partial_job["source_lang"], partial_job["target_lang"])
-                if draft_src and key != last_partial_key and (now - last_partial_time >= debounce_s):
-                    try:
-                        r = self.translate_text(
-                            draft_src,
-                            partial_job["source_lang"],
-                            partial_job["target_lang"],
-                            mt_mode=cfg.mt_mode,
-                            beam_size=1,
-                            llm_url=cfg.llm_url,
-                            llm_model=cfg.llm_model,
-                            llm_api_key=cfg.llm_api_key,
-                            context=list(self._recent_context),
-                            is_draft=True,
-                        )
+                if not draft_src or key == last_partial_key:
+                    continue
 
-                        last_partial_time = time.perf_counter()
-                        last_partial_key = key
-                        if r.latency_ms > 2800.0:
-                            last_final_mt_ms = max(last_final_mt_ms, r.latency_ms)
-                        self.broadcast_threadsafe(
-                            {
-                                "type": "partial_mt",
-                                "data": {
-                                    "id": partial_job["id"],
-                                    "translated_text": r.translated_text,
-                                    "source_lang": partial_job["source_lang"],
-                                    "target_lang": partial_job["target_lang"],
-                                    "mt_ms": round(r.latency_ms, 1),
-                                    "mt_engine": r.engine,
-                                },
-                            }
-                        )
-                    except Exception:
-                        pass
+                seg_id = str(partial_job["id"])
+                wc_now = len(draft_src.split())
+                same_seg = seg_id == last_partial_seg_id
+                elapsed_s = now - last_partial_time
+                # Wait for calm cadence OR at least 2 new words (unless >=1.25s pause on same segment)
+                need_wait = elapsed_s < debounce_s or (
+                    same_seg and (wc_now - last_partial_wc) < 2 and elapsed_s < 1.25
+                )
+                if need_wait:
+                    # Re-queue latest draft if nothing newer arrived so final words are never dropped
+                    with self._partial_lock:
+                        if self._pending_partial is None:
+                            self._pending_partial = partial_job
+                    self._mt_wakeup.wait(timeout=0.12)
+                    self._mt_wakeup.clear()
+                    continue
+
+                try:
+                    r = self.translate_text(
+                        draft_src,
+                        partial_job["source_lang"],
+                        partial_job["target_lang"],
+                        mt_mode=cfg.mt_mode,
+                        beam_size=1,
+                        llm_url=cfg.llm_url,
+                        llm_model=cfg.llm_model,
+                        llm_api_key=cfg.llm_api_key,
+                        context=list(self._recent_context),
+                        is_draft=True,
+                    )
+
+                    last_partial_time = time.perf_counter()
+                    last_partial_key = key
+                    last_partial_seg_id = seg_id
+                    last_partial_wc = wc_now
+                    if r.latency_ms > 2800.0:
+                        last_final_mt_ms = max(last_final_mt_ms, r.latency_ms)
+
+                    stable_text, unstable_text, stabilized = self._stable_prefix.update(
+                        seg_id, partial_job["target_lang"], r.translated_text
+                    )
+                    self.broadcast_threadsafe(
+                        {
+                            "type": "partial_mt",
+                            "data": {
+                                "id": seg_id,
+                                "translated_text": stabilized,
+                                "stable_text": stable_text,
+                                "unstable_text": unstable_text,
+                                "source_lang": partial_job["source_lang"],
+                                "target_lang": partial_job["target_lang"],
+                                "mt_ms": round(r.latency_ms, 1),
+                                "mt_engine": r.engine,
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
                 continue
 
             self._mt_wakeup.wait(timeout=0.1)
@@ -2543,8 +2903,9 @@ class EngineRuntime:
         seg_id = uuid.uuid4().hex[:10]
 
         def _run_demo() -> None:
+            demo_tracker = StablePrefixTracker()
             for step in range(3, len(words) + 1, 3):
-                partial_src = " ".join(words[:step])
+                partial_src = self._clean_verbatim(" ".join(words[:step]), src)
                 self.broadcast_threadsafe(
                     {
                         "type": "partial",
@@ -2559,12 +2920,15 @@ class EngineRuntime:
                 )
                 try:
                     mt = self.translate_text(partial_src, src, tgt, mt_mode=self.config.mt_mode, beam_size=1)
+                    st_txt, unst_txt, full_txt = demo_tracker.update(seg_id, tgt, mt.translated_text)
                     self.broadcast_threadsafe(
                         {
                             "type": "partial_mt",
                             "data": {
                                 "id": seg_id,
-                                "translated_text": mt.translated_text,
+                                "translated_text": full_txt,
+                                "stable_text": st_txt,
+                                "unstable_text": unst_txt,
                                 "source_lang": src,
                                 "target_lang": tgt,
                                 "mt_ms": mt.latency_ms,
@@ -2574,7 +2938,7 @@ class EngineRuntime:
                     )
                 except Exception:
                     pass
-                time.sleep(0.2)
+                time.sleep(0.35)
 
             tr_final = ""
             mt_ms = 0.0
@@ -2618,7 +2982,7 @@ async def lifespan(_app: FastAPI):
     runtime.shutdown()
 
 
-app = FastAPI(title="VOICERECORE Local Engine", version="0.8.1", lifespan=lifespan)
+app = FastAPI(title="VOICERECORE Local Engine", version="0.8.2", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

@@ -249,11 +249,16 @@ export interface EngineStatus {
   boot_error: string;
 }
 
+export type OverlayLayoutMode = "stacked" | "target-only" | "split";
+export const OVERLAY_LAYOUT_KEY = "polyvoice_overlay_layout";
+
 export interface PartialEvent {
   id: string;
   speaker?: "self" | "remote" | "";
   source_text: string;
   translated_text: string;
+  stable_text?: string;
+  unstable_text?: string;
   source_lang: string;
   target_lang: string;
   asr_ms: number;

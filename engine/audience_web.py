@@ -783,10 +783,14 @@ AUDIENCE_HTML = (
         </div>`;
       }
       if (partial) {
+        const hasSplit = Boolean(partial.stable_text || partial.unstable_text);
+        const liveTgtHtml = hasSplit
+          ? `${partial.stable_text ? `<span>${escapeHtml(partial.stable_text)}</span>` : ""}${partial.stable_text && partial.unstable_text ? " " : ""}${partial.unstable_text ? `<span style="opacity:0.68;font-weight:500">${escapeHtml(partial.unstable_text)}</span>` : ""}`
+          : escapeHtml(partial.translated_text || "...");
         html += `<div class="card live">
           <div class="meta"><span class="meta-live">${ICON_RADIO}<span>Đang nói...</span></span></div>
           ${showSource ? `<div class="src" style="font-size:${Math.max(13, fontSize - 5)}px;font-style:italic">${escapeHtml(partial.source_text)}</div>` : ""}
-          <div class="tgt" style="font-size:${fontSize}px">${escapeHtml(partial.translated_text || "...")}</div>
+          <div class="tgt" style="font-size:${fontSize}px">${liveTgtHtml}</div>
         </div>`;
       }
       feed.innerHTML = html;
@@ -859,15 +863,20 @@ AUDIENCE_HTML = (
             render();
           } else if (msg.type === "partial") {
             const d = msg.data;
+            const same = partial && partial.id === d.id;
             partial = {
               id: d.id, source_text: d.source_text,
-              translated_text: partial && partial.id === d.id ? partial.translated_text : ""
+              translated_text: same ? partial.translated_text : "",
+              stable_text: same ? partial.stable_text : "",
+              unstable_text: same ? partial.unstable_text : ""
             };
             render();
           } else if (msg.type === "partial_mt") {
             const d = msg.data;
             if (partial && partial.id === d.id) {
               partial.translated_text = d.translated_text;
+              partial.stable_text = d.stable_text || "";
+              partial.unstable_text = d.unstable_text || "";
               render();
             }
           } else if (msg.type === "final") {

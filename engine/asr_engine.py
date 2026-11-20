@@ -18,6 +18,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Optional
 
 import numpy as np
 import sentencepiece as spm
@@ -152,8 +153,8 @@ class _SherpaOnlineTransducerBase:
             feature_dim=80,
             enable_endpoint_detection=True,
             rule1_min_trailing_silence=2.0,
-            rule2_min_trailing_silence=1.15,
-            rule3_min_utterance_length=9.5,
+            rule2_min_trailing_silence=1.05,
+            rule3_min_utterance_length=18.0,
             provider="cpu",
         )
         if hw_path is not None and hw_count > 0:
@@ -246,6 +247,31 @@ class _SherpaOnlineTransducerBase:
                 self._last_partial = formatted
                 return ASROutput("partial", formatted, ms, self.active_provider)
             return ASROutput("none", "", ms, self.active_provider)
+
+    def soft_commit_if_ready(
+        self,
+        min_words: int = 12,
+        block_tail_fn: Optional[Callable[[str], bool]] = None,
+    ) -> ASROutput:
+        """
+        Conference Breath-Pause Soft Commit:
+        Called when the audio loop detects a natural ~0.45s breath dip.
+        Commits the current utterance cleanly ONLY when it has reached a full semantic clause
+        (>= min_words) and does NOT end on a dangling connector — preventing both sluggish waits
+        and mid-word rule3 cuts during long speeches.
+        """
+        t0 = time.perf_counter()
+        with self._lock:
+            raw_text = self._recognizer.get_result(self._stream).strip()
+            formatted = _format_sentence(raw_text)
+            if not formatted or len(formatted.split()) < min_words:
+                return ASROutput("none", "", 0.0, self.active_provider)
+            if block_tail_fn is not None and block_tail_fn(formatted):
+                return ASROutput("none", "", 0.0, self.active_provider)
+            self._recognizer.reset(self._stream)
+            self._last_partial = ""
+            ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            return ASROutput("final", formatted, ms, self.active_provider)
 
     def flush_final(self) -> ASROutput:
         t0 = time.perf_counter()

@@ -80,7 +80,7 @@ import {
   speakOfflineTTS,
 } from "./types";
 
-const APP_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.8.1";
+const APP_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.8.2";
 const GITHUB_REPO = "niitbeo/PolyVoice-Pro";
 const VU_BARS = 18;
 
@@ -419,20 +419,22 @@ export default function App() {
             }
           } else if (msg.type === "partial") {
             const d = msg.data;
-            setPartial((prev) => ({
-              id: d.id,
-              speaker: d.speaker,
-              source_text: d.source_text,
-              translated_text:
-                prev && prev.id === d.id && prev.target_lang === d.target_lang
-                  ? prev.translated_text
-                  : "",
-              source_lang: d.source_lang || "vie_Latn",
-              target_lang: d.target_lang,
-              asr_ms: d.asr_ms ?? 0,
-              mt_ms: prev && prev.id === d.id ? prev.mt_ms : 0,
-              mt_engine: prev && prev.id === d.id ? prev.mt_engine : undefined,
-            }));
+            setPartial((prev) => {
+              const same = Boolean(prev && prev.id === d.id && prev.target_lang === d.target_lang);
+              return {
+                id: d.id,
+                speaker: d.speaker,
+                source_text: d.source_text,
+                translated_text: same && prev ? prev.translated_text : "",
+                stable_text: same && prev ? prev.stable_text : "",
+                unstable_text: same && prev ? prev.unstable_text : "",
+                source_lang: d.source_lang || "vie_Latn",
+                target_lang: d.target_lang,
+                asr_ms: d.asr_ms ?? 0,
+                mt_ms: same && prev ? prev.mt_ms : 0,
+                mt_engine: same && prev ? prev.mt_engine : undefined,
+              };
+            });
           } else if (msg.type === "partial_mt") {
             const d = msg.data;
             setPartial((prev) =>
@@ -440,6 +442,8 @@ export default function App() {
                 ? {
                     ...prev,
                     translated_text: d.translated_text,
+                    stable_text: d.stable_text ?? "",
+                    unstable_text: d.unstable_text ?? "",
                     mt_ms: d.mt_ms ?? 0,
                     mt_engine: d.mt_engine,
                   }
@@ -2770,8 +2774,20 @@ export default function App() {
               </div>
             </div>
 
+            {isDraft && latestItem && latestItem.translated_text && (
+              <div className="spot-prev-anchor" aria-label="Câu vừa hoàn tất">
+                <span className="spot-prev-tag">Vừa xong</span>
+                <span className="spot-prev-text">{latestItem.translated_text}</span>
+              </div>
+            )}
+
             <div className={`spot-source ${isDraft ? "draft" : ""}`}>
-              {spotSource || (
+              {spotSource ? (
+                <>
+                  {spotSource}
+                  {isDraft && <span className="live-caret src" aria-hidden="true" />}
+                </>
+              ) : (
                 <span className="spot-empty">
                   Chọn <b>Ngôn ngữ nói</b> rồi bấm <b>Bắt đầu dịch</b> — hỗ trợ thu trực tiếp <b>Micro</b>, <b>YouTube</b> hoặc họp <b>2 Chiều</b>.
                 </span>
@@ -2782,7 +2798,23 @@ export default function App() {
 
             <div className={`spot-target ${isDraft ? "draft" : ""}`}>
               {spotTarget ? (
-                spotTarget
+                isDraft && (partial?.stable_text || partial?.unstable_text) ? (
+                  <>
+                    {partial.stable_text && (
+                      <span className="mt-stable">{partial.stable_text}</span>
+                    )}
+                    {partial.stable_text && partial.unstable_text ? " " : null}
+                    {partial.unstable_text && (
+                      <span className="mt-unstable">{partial.unstable_text}</span>
+                    )}
+                    <span className="live-caret" aria-hidden="true" />
+                  </>
+                ) : (
+                  <>
+                    {spotTarget}
+                    {isDraft && <span className="live-caret" aria-hidden="true" />}
+                  </>
+                )
               ) : spotPendingDraft ? (
                 <span className="spot-translating">
                   <Loader2 size={15} className="spin" /> Đang dịch câu hiện tại...
