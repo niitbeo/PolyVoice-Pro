@@ -1096,6 +1096,8 @@ class EngineRuntime:
         clean = self.glossary.apply_asr_fixes(text.strip())
         if not clean:
             return TranslationResult("", "", source_lang, target_lang, 0.0, mt_mode)
+        if source_lang == "vie_Latn":
+            clean = self.glossary.normalize_session_entities(clean, source_lang)
 
         if source_lang == target_lang:
             return TranslationResult(clean, clean, source_lang, target_lang, 0.0, "passthrough")
@@ -1552,6 +1554,7 @@ class EngineRuntime:
             self._active_group_langs = ("", "")
             self._active_group_speaker = ""
         self._recent_context.clear()
+        self.glossary.clear_session_entities()
 
         self._current_segment_id = uuid.uuid4().hex[:10]
 
@@ -1892,6 +1895,7 @@ class EngineRuntime:
             self._active_group_last_ts = 0.0
             self._active_group_langs = ("", "")
         self._recent_context.clear()
+        self.glossary.clear_session_entities()
         self.broadcast_threadsafe({"type": "history", "data": []})
 
     def _get_capitalized_glossary_words(self) -> set[str]:
@@ -2758,6 +2762,7 @@ class EngineRuntime:
                     item["source_lang"],
                     protected_terms=set(self._get_glossary_hotwords()),
                 )
+                source_text = self.glossary.normalize_session_entities(source_text, item["source_lang"])
                 para_id = self._assign_paragraph_id(
                     len(source_text.split()),
                     item["source_lang"],

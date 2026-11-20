@@ -140,6 +140,29 @@ _VI_NON_NAME_WORDS = frozenset({
     "nhân", "dân", "hội", "nghị", "cuộc", "họp", "chuyện", "câu", "việc", "sự",
     "thực", "thế", "giới", "kinh", "lịch", "do", "tốc", "kỳ", "lỗi", "phòng",
     "tham", "dự", "phát", "biểu", "trình", "bày", "giới", "thiệu", "chia", "tạo",
+    "nhất", "hơn", "bằng", "gần", "xa", "sang", "giáo", "phật", "thần", "linh",
+    "cung", "địa", "học", "thời", "trọng", "kính", "chúa", "tổ", "lão", "thượng",
+})
+
+# Known 2-word Vietnamese places / non-person phrases starting with a surname word
+_VI_2WORD_NON_PERSON_PHRASES = frozenset({
+    "hà nội", "hà tĩnh", "hà nam", "hà giang", "hà tây", "hà bắc",
+    "thái bình", "thái nguyên", "thái lan", "thái dương", "thái cực", "thái thượng",
+    "lâm đồng", "cao bằng", "cao nguyên", "cao cấp", "cao điểm", "cao trào", "cao tuổi",
+    "châu á", "châu âu", "châu mỹ", "châu phi", "châu úc", "châu lục", "châu báu",
+    "đồng tháp", "đồng nai", "đồng bằng", "đồng ý", "đồng hành", "đồng bộ", "đồng chí",
+    "hồ gươm", "hồ tây", "hồ hoàn", "hồ sơ", "ninh bình", "ninh thuận",
+    "lý tưởng", "lý thuyết", "lý lịch", "lý do", "lý tính", "lý luận",
+    "tôn giáo", "tôn vinh", "tôn chỉ", "hoàng gia", "hoàng hôn", "hoàng hậu", "hoàng cung",
+    "đào tạo", "lưu trữ", "lưu ý", "lưu hành", "lưu lượng", "tăng trưởng", "tăng cường",
+    "phạm vi", "bùi ngùi", "trần gian", "trần trụi", "mai sau", "mai mối",
+    "đoàn kết", "đoàn thể", "kiều bào", "kiều hối", "bạch cầu", "bạch kim", "bạch tuyết",
+    "hứa hẹn", "nghiêm túc", "nghiêm trọng", "nghiêm ngặt", "thạch cao", "thạch anh",
+    "diệp lục", "khúc xạ", "khúc quanh", "từ thiện", "từ điển", "từ chối", "từ bỏ",
+    "đàm phán", "đàm đạo", "nông dân", "nông nghiệp", "nông thôn", "nông sản",
+    "bế mạc", "bế tắc", "lương thực", "lương tâm", "lương thiện", "khổng lồ",
+    "thân thiện", "thân thiết", "thân phận", "thân thể", "âu lạc", "âu châu",
+    "vi mô", "vi sinh", "vi phạm", "triệu chứng", "triệu tập", "lục địa",
 })
 
 # Vietnamese places, landmarks & brands prone to literal/Pinyin MT errors
@@ -160,8 +183,8 @@ _HUMAN_NAME_SENTINELS: tuple[str, ...] = (
 _VI_TITLE_PAT = (
     r"(?:phó\s+chủ\s+tịch|chủ\s+tịch|tổng\s+giám\s+đốc|phó\s+giám\s+đốc|giám\s+đốc|"
     r"phó\s+hiệu\s+trưởng|hiệu\s+trưởng|phó\s+giáo\s+sư|giáo\s+sư|tiến\s+sĩ|thạc\s+sĩ|"
-    r"thủ\s+tướng|bộ\s+trưởng|thứ\s+trưởng|đồng\s+chí|đại\s+biểu|diễn\s+giả|"
-    r"bác\s+sĩ|kỹ\s+sư|luật\s+sư|nhà\s+báo|ông|bà|anh|chị|thầy|cô|bác|chú|cậu|lão|ngài)"
+    r"thủ\s+tướng|bộ\s+trưởng|thứ\s+trưởng|đồng\s+chí|đại\s+biểu|diễn\s+giả|tác\s+giả|"
+    r"bác\s+sĩ|kỹ\s+sư|luật\s+sư|nhà\s+báo|chú\s+bé|ông|bà|anh|chị|thầy|cô|bác|chú|cậu|lão|ngài)"
 )
 
 _VI_SURNAME_ALT = "|".join(re.escape(s) for s in sorted(_VI_SURNAMES, key=len, reverse=True))
@@ -169,17 +192,37 @@ _VI_CAP_SURNAME_ALT = "|".join(
     re.escape(s[0].upper() + s[1:]) for s in sorted(_VI_SURNAMES, key=len, reverse=True)
 )
 _VI_CAP_SYL = r"[A-ZÀÁẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬĐÈÉẺẼẸÊẾỀỂỄỆÌÍỈĨỊÒÓỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÙÚỦŨỤƯỨỪỬỮỰỲÝỶỸỴ][a-zàáảãạăắằẳẵặâấầẩẫậđèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵ]{1,7}"
+_VI_LOWER_SYL = r"[a-zàáảãạăắằẳẵặâấầẩẫậđèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵ]{2,7}"
 _VI_ANY_SYL = r"[A-Za-zÀ-ỹà-ỹ]{1,8}"
 
-# Pass A: Capitalized 3-4 syllable Vietnamese person name (e.g. "Trương Gia Bình", "Đặng Lê Nguyên Vũ")
+# Pass A1: Capitalized 3-4 syllable Vietnamese person name (e.g. "Trương Gia Bình", "Đặng Lê Nguyên Vũ")
 _RE_CAP_VI_NAME = re.compile(
     rf"(?<!\w)((?:{_VI_CAP_SURNAME_ALT})\s+{_VI_CAP_SYL}\s+{_VI_CAP_SYL}(?:\s+{_VI_CAP_SYL})?)(?!\w)",
     re.UNICODE,
 )
 
-# Pass B: Title + lowercase/mixed 3-4 syllable Vietnamese person name (e.g. "anh trương gia bình", "ông hoàng nam tiến")
+# Pass A2: Mixed-case 3-syllable person name where Pass-2 missed middle-word cap (e.g. "Ngô thừa Ân", "Trương gia Bình")
+_RE_MIXED3_VI_NAME = re.compile(
+    rf"(?<!\w)((?:{_VI_CAP_SURNAME_ALT})\s+{_VI_LOWER_SYL}\s+{_VI_CAP_SYL})(?!\w)",
+    re.UNICODE,
+)
+
+# Pass A3: Standalone capitalized 2-syllable Vietnamese person name (e.g. "Phan Đăng", "Nguyễn Du", "Lê Lợi")
+# Negative lookahead prevents slicing the first 2 words off a longer 3+ word capitalized phrase (e.g. "Tôn Ngộ Không")!
+_RE_CAP2_VI_NAME = re.compile(
+    rf"(?<!\w)((?:{_VI_CAP_SURNAME_ALT})\s+{_VI_CAP_SYL})(?!\w)(?!\s+{_VI_CAP_SYL})",
+    re.UNICODE,
+)
+
+# Pass B1: Title + lowercase/mixed 3-4 syllable Vietnamese person name (e.g. "anh trương gia bình", "ông hoàng nam tiến")
 _RE_TITLE_VI_NAME = re.compile(
     rf"(?<!\w){_VI_TITLE_PAT}\s+((?:{_VI_SURNAME_ALT})\s+{_VI_ANY_SYL}\s+{_VI_ANY_SYL}(?:\s+{_VI_ANY_SYL})?)(?!\w)",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# Pass B2: Title + 2-syllable Vietnamese person name (e.g. "diễn giả phan đăng", "anh phan đăng")
+_RE_TITLE2_VI_NAME = re.compile(
+    rf"(?<!\w){_VI_TITLE_PAT}\s+((?:{_VI_SURNAME_ALT})\s+{_VI_ANY_SYL})(?!\w)",
     re.IGNORECASE | re.UNICODE,
 )
 
@@ -188,11 +231,15 @@ def _title_case_vi_name(raw: str) -> str:
     return " ".join((w[0].upper() + w[1:].lower()) if len(w) > 1 else w.upper() for w in raw.split())
 
 
-def extract_vietnamese_proper_entities(text: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+def extract_vietnamese_proper_entities(
+    text: str,
+    session_persons: dict[str, str] | None = None,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """
     Automatically detect Vietnamese person names (preventing Sino-Vietnamese Pinyin
-    hallucinations like 'Trương Gia Bình' -> 'Zhang Jingping' or 'Hoàng Nam Tiến' -> 'Huang Nam')
-    and mistranslation-prone Vietnamese landmarks/brands ('Kim Mã', 'Tân Mỹ', 'Hải Phòng', 'FPT').
+    hallucinations like 'Trương Gia Bình' -> 'Zhang Jingping', 'Phan Đăng' -> 'Fang',
+    or 'Ngô Thừa Ân' -> 'Wu Enlil / Wu Zetian') and mistranslation-prone Vietnamese
+    landmarks/brands ('Kim Mã', 'Tân Mỹ', 'Hải Phòng', 'FPT').
 
     Returns `(person_pairs, place_brand_pairs)` where each pair is `(source_span, canonical_name)`.
     """
@@ -201,45 +248,82 @@ def extract_vietnamese_proper_entities(text: str) -> tuple[list[tuple[str, str]]
 
     persons: list[tuple[str, str]] = []
     seen_spans: set[str] = set()
+    protected_place_lowers = {p.lower() for p in _VI_PROTECTED_PLACES_AND_BRANDS}
 
-    def _validate_and_add(span: str, require_middle_hint: bool) -> None:
+    def _validate_and_add(span: str, require_middle_hint: bool, min_words: int = 3) -> None:
         toks = span.split()
-        if len(toks) < 3 or len(toks) > 4:
+        if len(toks) < min_words or len(toks) > 4:
             return
         if toks[0].lower() not in _VI_SURNAMES:
             return
-        # Trim trailing stopword if a 4-word match accidentally grabbed a following verb ("trương gia bình nói")
-        while len(toks) > 3 and toks[-1].lower() in _VI_NON_NAME_WORDS:
+        # Trim trailing lowercase stopword/verb if Pass-B accidentally grabbed one ("trương gia bình nói")
+        # Never slice a capitalized 4th word off a 4-word proper phrase!
+        while len(toks) > 3 and not toks[-1][0].isupper() and toks[-1].lower() in _VI_NON_NAME_WORDS:
             toks.pop()
-        if len(toks) < 3:
+        if len(toks) < min_words:
             return
         # Every syllable after surname must not be a common non-name word
         if any(t.lower() in _VI_NON_NAME_WORDS for t in toks[1:]):
             return
-        # For lowercase/mixed matches after a title, keep strict 3-syllable name unless the 4th word is capitalized
-        if require_middle_hint:
+        matched = " ".join(toks)
+        key = matched.lower()
+        if len(toks) == 2:
+            if key in _VI_2WORD_NON_PERSON_PHRASES or key in protected_place_lowers:
+                return
+            if require_middle_hint and not (toks[1][0].isupper() or toks[1].lower() in _VI_COMMON_MIDDLE_NAMES):
+                return
+        elif require_middle_hint:
+            # For lowercase/mixed 3-4 word matches after a title, require a common middle name or uppercase cue
             if not (toks[1][0].isupper() or toks[1].lower() in _VI_COMMON_MIDDLE_NAMES):
                 return
             if len(toks) == 4 and not toks[3][0].isupper():
                 toks = toks[:3]
-        matched = " ".join(toks)
-        key = matched.lower()
-        # Skip if already covered as a subset/superset of an earlier Pass-A capitalized match
+                matched = " ".join(toks)
+                key = matched.lower()
+        # Skip if already covered as a subset/superset of an earlier longer match
         if key in seen_spans or any(key in s or s in key for s in seen_spans):
             return
         seen_spans.add(key)
         persons.append((matched, _title_case_vi_name(matched)))
 
-    # Pass A: Capitalized names (check surname is also Title-Case so lowercase prose doesn't false-match)
+    # Pass A1: Capitalized 3-4 syllable names (e.g. "Trương Gia Bình")
     for m in _RE_CAP_VI_NAME.finditer(text):
         span = m.group(1)
         if span[0].isupper():
-            _validate_and_add(span, require_middle_hint=False)
+            _validate_and_add(span, require_middle_hint=False, min_words=3)
 
-    # Pass B: Title + lowercase/mixed names (e.g. "anh trương gia bình", "ông hoàng nam tiến")
+    # Pass A2: Mixed-case 3-syllable names where middle syllable stayed lowercase ("Ngô thừa Ân")
+    for m in _RE_MIXED3_VI_NAME.finditer(text):
+        span = m.group(1)
+        if span[0].isupper():
+            _validate_and_add(span, require_middle_hint=False, min_words=3)
+
+    # Pass B1: Title + lowercase/mixed 3-4 syllable names ("anh trương gia bình")
     for m in _RE_TITLE_VI_NAME.finditer(text):
         span = m.group(1)
-        _validate_and_add(span, require_middle_hint=True)
+        _validate_and_add(span, require_middle_hint=True, min_words=3)
+
+    # Pass A3: Capitalized 2-syllable names ("Phan Đăng", "Nguyễn Du") — runs after 3-4 word passes
+    for m in _RE_CAP2_VI_NAME.finditer(text):
+        span = m.group(1)
+        if span[0].isupper():
+            _validate_and_add(span, require_middle_hint=False, min_words=2)
+
+    # Pass B2: Title + 2-syllable names ("diễn giả phan đăng", "anh phan đăng")
+    for m in _RE_TITLE2_VI_NAME.finditer(text):
+        span = m.group(1)
+        _validate_and_add(span, require_middle_hint=True, min_words=2)
+
+    # Pass S: Remembered session person names (catches later lowercase recurrences like "Phan đăng" -> "Phan Đăng")
+    if session_persons:
+        for low_name, canonical in sorted(session_persons.items(), key=lambda kv: len(kv[0]), reverse=True):
+            if low_name in seen_spans or any(low_name in s or s in low_name for s in seen_spans):
+                continue
+            pat = _word_boundary_pattern(canonical)
+            m = pat.search(text)
+            if m:
+                seen_spans.add(low_name)
+                persons.append((m.group(0), canonical))
 
     # Pass C: Protected Vietnamese landmarks, cities & enterprises
     places: list[tuple[str, str]] = []
@@ -261,6 +345,42 @@ class GlossaryManager:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._data: dict[str, Any] = self._load()
+        self._session_persons: dict[str, str] = {}
+
+    def clear_session_entities(self) -> None:
+        with self._lock:
+            self._session_persons.clear()
+
+    def _remember_persons_locked(self, persons: list[tuple[str, str]]) -> None:
+        for _span, canonical in persons:
+            key = canonical.lower()
+            if key not in self._session_persons:
+                if len(self._session_persons) >= 64:
+                    # Drop oldest remembered name
+                    self._session_persons.pop(next(iter(self._session_persons)))
+                self._session_persons[key] = canonical
+
+    def normalize_session_entities(self, text: str, source_lang: str = "vie_Latn") -> str:
+        """
+        Detect Vietnamese person names, remember them for the current session, and restore
+        consistent Title-Case on mixed/lowercase recurrences (e.g. 'Phan đăng' -> 'Phan Đăng',
+        'Ngô thừa Ân' -> 'Ngô Thừa Ân') before display and MT.
+        """
+        if not text or source_lang != "vie_Latn":
+            return text
+        with self._lock:
+            snap = dict(self._session_persons)
+        persons, _ = extract_vietnamese_proper_entities(text, session_persons=snap)
+        if not persons:
+            return text
+        with self._lock:
+            self._remember_persons_locked(persons)
+        out = text
+        for src_span, canonical in persons:
+            if src_span != canonical:
+                pat = _word_boundary_pattern(src_span)
+                out = pat.sub(lambda _m, c=canonical: c, out)
+        return out
 
     def _load(self) -> dict[str, Any]:
         if self.path.exists():
@@ -394,9 +514,13 @@ class GlossaryManager:
         """
         with self._lock:
             base = list(self._data["term_locks"]) if self._data.get("enabled", True) else []
+            session_snap = dict(self._session_persons)
         if source_lang != "vie_Latn" or target_lang == "vie_Latn" or not text:
             return base
-        persons, places = extract_vietnamese_proper_entities(text)
+        persons, places = extract_vietnamese_proper_entities(text, session_persons=session_snap)
+        if persons:
+            with self._lock:
+                self._remember_persons_locked(persons)
         if not persons and not places:
             return base
         existing = {x["source"].lower() for x in base}
@@ -431,6 +555,7 @@ class GlossaryManager:
                 if self._data.get("enabled", True) and self._data.get("term_locks")
                 else []
             )
+            session_snap = dict(self._session_persons)
 
         masked = text
         restore_pairs: list[tuple[str, str]] = []
@@ -447,7 +572,10 @@ class GlossaryManager:
 
         # 2) Automatic Vietnamese Proper-Name & Landmark Shield (prevents Chinese Pinyin & literal errors)
         if source_lang == "vie_Latn" and target_lang != "vie_Latn":
-            persons, places = extract_vietnamese_proper_entities(masked)
+            persons, places = extract_vietnamese_proper_entities(masked, session_persons=session_snap)
+            if persons:
+                with self._lock:
+                    self._remember_persons_locked(persons)
             is_latin_target = target_lang.endswith("_Latn")
             used_human: set[str] = set()
 

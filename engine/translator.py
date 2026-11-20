@@ -114,8 +114,13 @@ def _clean_punctuation(text: str) -> str:
     s = re.sub(r"\s+([)\]}])", r"\1", s)
     s = re.sub(r'(?<!\S)"\s+([^"]+?)\s+"(?=$|[\s,.;:!?)\]])', r'"\1"', s)
     s = re.sub(r"“\s+([^”]+?)\s+”", r"“\1”", s)
-    s = re.sub(r"\s{2,}", " ", s)
-    return s.strip()
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    # Strip stray unmatched leading/trailing quote hallucinated by seq2seq MT (e.g. '" Then this hand...')
+    if s.count('"') == 1 and (s.startswith('"') or s.endswith('"')):
+        s = s.strip('"').strip()
+    if (s.startswith("“") and "”" not in s) or (s.endswith("”") and "“" not in s):
+        s = s.strip("“”").strip()
+    return s
 
 
 def _split_semantic_sentences(text: str, max_words: int = 32) -> list[str]:
@@ -907,6 +912,72 @@ class HyMT2Translator:
         s = re.sub(r"^(?:Translation|Translated text|Output)\s*:\s*", "", s, flags=re.IGNORECASE).strip()
         return _clean_punctuation(s)
 
+    @staticmethod
+    def _content_words(s: str) -> set[str]:
+        return set(re.findall(r"[A-Za-zÀ-ỹ0-9]{3,}", s.lower()))
+
+    @classmethod
+    def _looks_like_context_leak(cls, clean_src: str, translated: str, ctx_pairs: list[tuple[str, str]]) -> bool:
+        """Detect when a 1.8B LLM accidentally re-translates the background context instead of the target segment."""
+        if not ctx_pairs or not translated:
+            return False
+        out_words = cls._content_words(translated)
+        if len(out_words) < 4:
+            return False
+        prev_src = " ".join(s for s, _ in ctx_pairs if s)
+        prev_tgt = " ".join(t for _, t in ctx_pairs if t)
+        prev_tgt_words = cls._content_words(prev_tgt)
+        if len(prev_tgt_words) < 4:
+            return False
+        overlap_out = len(out_words & prev_tgt_words) / max(min(len(out_words), len(prev_tgt_words)), 1)
+        src_words = cls._content_words(clean_src)
+        prev_src_words = cls._content_words(prev_src)
+        overlap_src = len(src_words & prev_src_words) / max(min(len(src_words), len(prev_src_words)), 1) if src_words and prev_src_words else 0.0
+        return overlap_out >= 0.55 and overlap_src <= 0.35
+
+    def _build_prompt(
+        self,
+        clean: str,
+        tgt_name: str,
+        matched_terms: list[tuple[str, str]],
+        ctx_pairs: list[tuple[str, str]],
+    ) -> str:
+        blocks: list[str] = []
+        if matched_terms:
+            lines = ["Reference the following translations:"]
+            for s, t in matched_terms:
+                lines.append(f"{s} translates to {t}")
+            blocks.append("\n".join(lines))
+
+        bg = " ".join(s for s, _ in ctx_pairs if s).strip() if ctx_pairs else ""
+        if bg:
+            blocks.append(bg)
+            blocks.append(
+                f"Reference the above context (do NOT translate the context above). "
+                f"Translate ONLY the following segment into {tgt_name}, without additional explanation:\n\n{clean}"
+            )
+        else:
+            blocks.append(
+                f"Translate the following segment into {tgt_name}, without additional explanation.\n\n{clean}"
+            )
+        return "\n\n".join(blocks)
+
+    def _run_completion(self, prompt: str, clean: str) -> str:
+        with self._client_lock:
+            resp = self._get_client().post(
+                f"{self.base_url}/v1/chat/completions",
+                json={
+                    "model": "hy-mt2-1.8b",
+                    "temperature": 0.0,
+                    "top_p": 0.6,
+                    "max_tokens": min(384, max(96, len(clean.split()) * 6)),
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        return self._clean_output(data["choices"][0]["message"]["content"])
+
     def translate(
         self,
         text: str,
@@ -934,7 +1005,8 @@ class HyMT2Translator:
             if s and t and s.lower() in low_clean:
                 matched_terms.append((s, t))
 
-        ctx_pairs = (context or [])[-2:]
+        # Keep single most recent turn for pronoun/topic continuity without overwhelming short target segments
+        ctx_pairs = (context or [])[-1:]
         term_sig = "|".join(f"{s}->{t}" for s, t in matched_terms)
         ctx_sig = "|".join(s for s, _ in ctx_pairs)
         cache_key = (f"{term_sig}||{ctx_sig}||{clean}", src_lang, tgt_lang, 2)
@@ -944,41 +1016,13 @@ class HyMT2Translator:
 
         self.ensure_started()
 
-        # Build official Hy-MT2 prompt combining Terminology + Context-Aware Background
-        blocks: list[str] = []
-        if matched_terms:
-            lines = ["Reference the following translations:"]
-            for s, t in matched_terms:
-                lines.append(f"{s} translates to {t}")
-            blocks.append("\n".join(lines))
-
-        if ctx_pairs:
-            bg = " ".join(s for s, _ in ctx_pairs if s).strip()
-            if bg:
-                blocks.append(f"[Background Information]\n{bg}")
-
-        blocks.append(
-            f"Translate the following text into {tgt_name}. "
-            f"Note that you must ONLY output the translated result without any additional explanation:\n\n{clean}"
-        )
-        prompt = "\n\n".join(blocks)
-
+        prompt = self._build_prompt(clean, tgt_name, matched_terms, ctx_pairs)
         t0 = time.perf_counter()
-        with self._client_lock:
-            resp = self._get_client().post(
-                f"{self.base_url}/v1/chat/completions",
-                json={
-                    "model": "hy-mt2-1.8b",
-                    "temperature": 0.0,
-                    "top_p": 0.6,
-                    "max_tokens": min(384, max(96, len(clean.split()) * 6)),
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        raw_out = data["choices"][0]["message"]["content"]
-        translated = self._clean_output(raw_out)
+        translated = self._run_completion(prompt, clean)
+        if ctx_pairs and self._looks_like_context_leak(clean, translated, ctx_pairs):
+            # Guardrail: if 1.8B leaked context into output, cleanly retry without context
+            fallback_prompt = self._build_prompt(clean, tgt_name, matched_terms, [])
+            translated = self._run_completion(fallback_prompt, clean)
         ms = round((time.perf_counter() - t0) * 1000.0, 1)
         self._cache.set(cache_key, translated)
         return TranslationResult(clean, translated, src_lang, tgt_lang, ms, "hy-mt2-1.8b")

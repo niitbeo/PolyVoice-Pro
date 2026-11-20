@@ -559,12 +559,55 @@ _VI_PROPER_PHRASES: list[tuple[str, str]] = [
     ("d2c", "D2C"),
     ("oem", "OEM"),
     ("odm", "ODM"),
+    # Standard Vietnamese orthography for major religions, spiritual titles & cultural classics
+    # (prevents lowercase MT hallucinations like "đạo giáo" -> "Muslim" or "tôn ngộ không" -> "is not"!)
+    ("phật tổ như lai", "Phật Tổ Như Lai"),
+    ("phật thích ca mâu ni", "Phật Thích Ca Mâu Ni"),
+    ("thích ca mâu ni", "Thích Ca Mâu Ni"),
+    ("phật a di đà", "Phật A Di Đà"),
+    ("phật di lặc", "Phật Di Lặc"),
+    ("thiên chúa giáo", "Thiên Chúa giáo"),
+    ("ấn độ giáo", "Ấn Độ giáo"),
+    ("phật giáo", "Phật giáo"),
+    ("đạo giáo", "Đạo giáo"),
+    ("nho giáo", "Nho giáo"),
+    ("công giáo", "Công giáo"),
+    ("hồi giáo", "Hồi giáo"),
+    ("tin lành", "Tin Lành"),
+    ("cao đài", "Cao Đài"),
+    ("hòa hảo", "Hòa Hảo"),
+    ("đức phật", "Đức Phật"),
+    ("phật tổ", "Phật Tổ"),
+    ("tượng phật", "tượng Phật"),
+    ("ông phật", "ông Phật"),
+    ("cửa phật", "cửa Phật"),
+    ("bồ tát", "Bồ Tát"),
+    ("quan thế âm", "Quan Thế Âm"),
+    ("quán thế âm", "Quán Thế Âm"),
+    ("thượng đế", "Thượng Đế"),
+    ("chúa giêsu", "Chúa Giêsu"),
+    ("ngọc hoàng", "Ngọc Hoàng"),
+    ("thái thượng lão quân", "Thái Thượng Lão Quân"),
+    ("tôn ngộ không", "Tôn Ngộ Không"),
+    ("đường tăng", "Đường Tăng"),
+    ("tây du ký", "Tây Du Ký"),
+    ("thiên cung", "Thiên Cung"),
 ]
 
 _VI_PROPER_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(rf"(?<!\w){re.escape(src)}(?!\w)", re.IGNORECASE | re.UNICODE), dst)
     for src, dst in sorted(_VI_PROPER_PHRASES, key=lambda kv: len(kv[0]), reverse=True)
 ]
+
+# Standalone "Phật" is always capitalized in Vietnamese orthography, EXCEPT idioms "phật ý" / "phật lòng"
+_RE_VI_BUDDHA_WORD = re.compile(r"(?<!\w)phật(?!\s+(?:ý|lòng)(?!\w))(?!\w)", re.IGNORECASE | re.UNICODE)
+
+# Northern Vietnamese ASR homophone fix: verb-first "dơ [cái/hai/bàn/cánh/cao/lên] tay" -> "giơ ... tay"
+# (leaves adjective-after-noun "tay dơ" = dirty hand untouched!)
+_RE_VI_GIO_TAY = re.compile(
+    r"(?<!\w)(d)ơ((?:\s+(?:cái|hai|bàn|cánh|cao|lên))?\s+tay)(?!\w)",
+    re.IGNORECASE | re.UNICODE,
+)
 
 _VI_NUM_WORDS = frozenset({
     "không", "một", "mốt", "hai", "ba", "bốn", "tư", "năm", "lăm", "nhăm",
@@ -575,12 +618,14 @@ _VI_MAGNITUDE_WORDS = frozenset({"triệu", "tỷ", "tỉ"})
 
 
 def restore_vietnamese_casing(text: str) -> str:
-    """Restore proper capitalization for Vietnamese cities, countries, and business/tech acronyms."""
+    """Restore proper capitalization for Vietnamese cities, countries, religions, titles, and tech/business acronyms."""
     s = (text or "").strip()
     if not s:
         return ""
+    s = _RE_VI_GIO_TAY.sub(lambda m: ("Giơ" if m.group(1).isupper() else "giơ") + m.group(2), s)
     for pat, repl in _VI_PROPER_PATTERNS:
         s = pat.sub(repl, s)
+    s = _RE_VI_BUDDHA_WORD.sub("Phật", s)
     if s and s[0].islower():
         s = s[0].upper() + s[1:]
     return s
@@ -624,7 +669,72 @@ _VI_MID_NO_CAP = _VI_NO_PERIOD_AFTER | frozenset({
     "bác", "cậu", "lão", "người", "cái", "này", "đó", "đấy", "kia", "làm",
     "nói", "biết", "thấy", "đi", "về", "lên", "xuống", "ra", "vào", "qua",
     "muốn", "phải", "cần", "nên", "quan", "tâm", "dùng", "giữ", "bảo",
+    "tạo", "thời", "đặt", "nhìn", "nghĩ", "hiểu", "xem", "học", "trở", "đến",
+    "khiến", "giúp", "mang", "đưa", "lấy", "nhận", "gọi", "kể", "nghe", "hỏi",
+    "trả", "lời", "viết", "đọc", "chạy", "ngồi", "đứng", "nằm", "sống", "chết",
 })
+
+# Vietnamese auxiliaries / copulas / modifiers that should NEVER start a new sentence right after a spurious Pass-2 '.'
+_VI_NO_PERIOD_BEFORE_DROP = frozenset({
+    "đã", "đang", "sẽ", "đều", "vẫn", "cũng", "được", "bị", "lớp", "năm", "tháng", "ngày",
+})
+_VI_NO_PERIOD_BEFORE_COMMA = frozenset({
+    "là", "thì", "mà", "của", "cho", "với", "để",
+})
+
+# Vietnamese head nouns / prepositions / transitive openers that should NEVER take a spurious mid-phrase comma
+_VI_NO_COMMA_AFTER = frozenset({
+    "tượng", "đức", "ông", "bà", "của", "giữa", "trước", "sau", "trong", "ngoài",
+    "đặt", "tạo", "đan", "cái", "một", "những", "các", "nhiều", "mọi",
+})
+
+
+def _uncap_title_word(word: str) -> str:
+    """Lowercase a Title-Case word (preserving ALL-CAPS acronyms like FPT, API)."""
+    if len(word) >= 2 and word[0].isupper() and word[1:].islower():
+        return word[0].lower() + word[1:]
+    return word
+
+
+def _sanitize_vi_punct(tokens: list[str]) -> list[str]:
+    """
+    Post-pass sanitizer for VietASR Pass-2 punctuation artifacts:
+    1. Merge 1-word orphan trailing splits ("ngưỡng. Mộ" -> "ngưỡng mộ.", "đạo. Giáo" -> "đạo giáo.").
+    2. Heal spurious periods before Vietnamese auxiliaries/copulas ("Ngô Thừa Ân. Đã đặt" -> "Ngô Thừa Ân đã đặt").
+    3. Strip spurious commas inside tight head-modifier / verb-object pairs ("tượng, phật" -> "tượng phật").
+    """
+    if len(tokens) < 2:
+        return tokens
+    out = list(tokens)
+
+    # 1. Heal orphan 1-word trailing split at the very end (e.g. "... mình ngưỡng. Mộ")
+    if len(out) >= 4:
+        lp, cp, rp = _strip_edge_punct(out[-2])
+        ll, cl, rl = _strip_edge_punct(out[-1])
+        if rp == "." and not any(ch in ".?!" for ch in rl):
+            out[-2] = f"{lp}{cp}"
+            out[-1] = f"{ll}{_uncap_title_word(cl)}{rl}."
+
+    # 2. Heal spurious mid-sentence periods before auxiliary / copula / modifier tokens
+    for i in range(len(out) - 1):
+        la, ca, ra = _strip_edge_punct(out[i])
+        lb, cb, rb = _strip_edge_punct(out[i + 1])
+        if ra == ".":
+            low_b = cb.lower()
+            if low_b in _VI_NO_PERIOD_BEFORE_DROP:
+                out[i] = f"{la}{ca}"
+                out[i + 1] = f"{lb}{_uncap_title_word(cb)}{rb}"
+            elif low_b in _VI_NO_PERIOD_BEFORE_COMMA:
+                out[i] = f"{la}{ca},"
+                out[i + 1] = f"{lb}{_uncap_title_word(cb)}{rb}"
+
+    # 3. Strip spurious commas breaking tight Vietnamese noun/verb compounds
+    for i in range(len(out) - 1):
+        la, ca, ra = _strip_edge_punct(out[i])
+        if ra == "," and ca.lower() in _VI_NO_COMMA_AFTER:
+            out[i] = f"{la}{ca}"
+
+    return out
 
 
 def _transfer_punct_and_caps(pass1_text: str, pass2_text: str) -> str:
@@ -719,6 +829,7 @@ def _transfer_punct_and_caps(pass1_text: str, pass2_text: str) -> str:
                     out[-1] = out[-1] + safe_p
                     after_sentence_end = True
 
+    out = _sanitize_vi_punct(out)
     merged = " ".join(out).strip()
     merged = re.sub(r"\s+([,.;:!?])", r"\1", merged)
     return restore_vietnamese_casing(merged)
