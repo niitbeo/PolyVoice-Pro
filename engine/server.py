@@ -1841,25 +1841,6 @@ class EngineRuntime:
         self._draft_mt_thread = threading.Thread(target=self._draft_mt_loop, daemon=True, name="draft-mt-worker")
         self._draft_mt_thread.start()
 
-        # Pre-warm Hy-MT2 llama-server in the background so Sentence #1 has zero cold-start delay
-        if (
-            self.config.mt_mode in ("auto-offline", "hy-mt2")
-            and self._llama_server_ready
-            and self.model_manager.is_hymt2_ready()
-            and bool(get_hymt2_lang_name(self.config.source_lang))
-            and bool(get_hymt2_lang_name(self.config.target_lang))
-        ):
-            def _warmup_hymt2() -> None:
-                try:
-                    h = self.ensure_hymt2_loaded()
-                    if h is not None:
-                        h.ensure_started()
-                        self.broadcast_threadsafe({"type": "status", "data": self.get_status_payload()})
-                except Exception:
-                    pass
-
-            threading.Thread(target=_warmup_hymt2, daemon=True, name="hymt2-warmup").start()
-
         # Primary audio channel: "mic" in mic/dual mode, "system" in system mode, "mix" in hall-mixer mode
         primary_source = (
             "mix"

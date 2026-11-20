@@ -360,9 +360,11 @@ class MicrophoneStream:
 
         self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=64)
         self._stream: Optional[sd.InputStream] = None
+        self._reader_thread: Optional[threading.Thread] = None
         self._running = threading.Event()
         self._src_rate: int = sample_rate
         self._src_channels: int = CHANNELS
+        self._src_blocksize: int = block_size
         self._last_error_ts: float = 0.0
 
     def set_conditioning(
@@ -387,14 +389,7 @@ class MicrophoneStream:
             except Exception:
                 pass
 
-    def _callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
-        if not self._running.is_set():
-            return
-        if status and self.on_error is not None:
-            now = time.monotonic()
-            if (status.input_underflow or status.priming_output) and (now - self._last_error_ts) > 10.0:
-                self._last_error_ts = now
-
+    def _process_block(self, indata: np.ndarray) -> None:
         mono = _resample_to_16k_mono(
             indata,
             self._src_rate,
@@ -415,18 +410,47 @@ class MicrophoneStream:
             except queue.Empty:
                 pass
 
+    def _read_loop(self) -> None:
+        """
+        Blocking PortAudio read loop (NO libffi/cffi C callback trampoline!).
+        Prevents SIGSEGV inside `ffi_closure_SYSV_inner` on macOS ARM64 CoreAudio HALC_IOThread
+        during rapid mic/system source switching and GC cycles.
+        """
+        st = self._stream
+        blk = self._src_blocksize
+        while self._running.is_set() and st is not None:
+            try:
+                indata, _overflowed = st.read(blk)
+            except Exception:
+                if not self._running.is_set():
+                    break
+                time.sleep(0.02)
+                continue
+            if not self._running.is_set():
+                break
+            if indata is not None and len(indata) > 0:
+                self._process_block(indata)
+
     def _open_stream(self, rate: int, ch: int) -> sd.InputStream:
         blk = max(160, int(round(rate * CHUNK_MS / 1000)))
         self._src_rate = rate
         self._src_channels = ch
+        self._src_blocksize = blk
         return sd.InputStream(
             samplerate=rate,
             channels=ch,
             dtype="float32",
             blocksize=blk,
             device=self.device_id,
-            callback=self._callback,
         )
+
+    def _spawn_reader(self) -> None:
+        self._reader_thread = threading.Thread(
+            target=self._read_loop,
+            daemon=True,
+            name="mic-blocking-reader",
+        )
+        self._reader_thread.start()
 
     def start(self) -> None:
         if self._running.is_set():
@@ -446,6 +470,7 @@ class MicrophoneStream:
             try:
                 self._stream = self._open_stream(self.sample_rate, prefer_ch)
                 self._stream.start()
+                self._spawn_reader()
                 return
             except sd.PortAudioError:
                 # Many Windows WASAPI / Bluetooth / USB interfaces only accept native rate (48kHz/44.1kHz) or stereo
@@ -465,6 +490,7 @@ class MicrophoneStream:
                     try:
                         self._stream = self._open_stream(rate, ch)
                         self._stream.start()
+                        self._spawn_reader()
                         return
                     except Exception as exc:
                         last_exc = exc
@@ -495,13 +521,27 @@ class MicrophoneStream:
 
     def stop(self) -> None:
         self._running.clear()
-        if self._stream is not None:
+        th = self._reader_thread
+        self._reader_thread = None
+        # Wait for blocking `st.read()` (<= 100ms) to exit cleanly BEFORE calling PortAudio stop/close,
+        # preventing concurrent `Pa_StopStream` vs `Pa_ReadStream` ring-buffer corruption!
+        if th is not None and th.is_alive():
+            th.join(timeout=0.6)
+        st = self._stream
+        self._stream = None
+        if st is not None:
             try:
-                self._stream.stop()
-                self._stream.close()
+                if th is not None and th.is_alive():
+                    st.abort()
+                st.stop()
             except Exception:
                 pass
-            self._stream = None
+            if th is not None and th.is_alive():
+                th.join(timeout=0.5)
+            try:
+                st.close()
+            except Exception:
+                pass
         try:
             self._queue.put_nowait(None)
         except queue.Full:
