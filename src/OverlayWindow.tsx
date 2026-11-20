@@ -347,6 +347,22 @@ export default function OverlayWindow() {
     }
   };
 
+  const handleTitlebarMouseDown = async (e: React.MouseEvent<HTMLElement>) => {
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest("button")) return;
+    if (e.detail === 2) {
+      handleToggleFillMonitor();
+      return;
+    }
+    if (!isTauriEnv()) return;
+    try {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      await getCurrentWindow().startDragging();
+    } catch {
+      // fallback to native data-tauri-drag-region
+    }
+  };
+
   const currentParaMode: ParagraphModeId = status?.config?.paragraph_mode || "long";
 
   const cycleParagraphMode = () => {
@@ -386,10 +402,9 @@ export default function OverlayWindow() {
       }}
     >
       <div className="overlay-stage-card" style={{ background: cardBg }}>
-        {/* Top Draggable Header — Auto-hides in Stage Mode until pointer approaches top edge */}
-        <header
-          className={`overlay-topbar ${hideTopbar ? "auto-hidden" : ""}`}
-          data-tauri-drag-region
+        {/* 2-Tier Floating Modal Chrome: Tier 1 = Dedicated Draggable Titlebar, Tier 2 = Compact Control Strip */}
+        <div
+          className={`overlay-chrome ${hideTopbar ? "auto-hidden" : ""}`}
           onMouseEnter={() => {
             if (stageMode) {
               if (hideBarTimerRef.current) {
@@ -403,143 +418,164 @@ export default function OverlayWindow() {
             if (stageMode) revealControlsTemporarily();
           }}
         >
-          <div className="overlay-topbar-left" data-tauri-drag-region>
-            <div className="brand-crest sm" data-tauri-drag-region>
-              <img src="/school-logo.png" alt="PolyVoice Pro" />
+          {/* Tier 1: Dedicated Modal Titlebar — easy to grab & drag anywhere */}
+          <header
+            className="overlay-titlebar"
+            data-tauri-drag-region
+            onMouseDown={handleTitlebarMouseDown}
+          >
+            <div className="overlay-titlebar-left" data-tauri-drag-region>
+              <div className="brand-crest sm" data-tauri-drag-region>
+                <img src="/school-logo.png" alt="PolyVoice Pro" />
+              </div>
+              <span className="overlay-brand" data-tauri-drag-region>
+                <span>PolyVoice</span>
+                <span className="brand-pro-tag">PRO</span>
+              </span>
+              <span className="overlay-modal-sub" data-tauri-drag-region>
+                Phụ đề nổi
+              </span>
+              <span className={`pill overlay-status-pill ${status?.listening ? "live" : "ok"}`}>
+                <span className={`dot ${status?.listening ? "pulse" : ""}`} />
+                {status?.listening ? "Đang phát" : "Sẵn sàng"}
+              </span>
             </div>
-            <span className="overlay-brand" data-tauri-drag-region>
-              <span>PolyVoice</span>
-              <span className="brand-pro-tag">PRO</span>
-            </span>
-            <span className={`pill overlay-status-pill ${status?.listening ? "live" : "ok"}`}>
-              <span className={`dot ${status?.listening ? "pulse" : ""}`} />
-              {status?.listening ? "Đang phát" : "Sẵn sàng"}
-            </span>
-            <span className="overlay-drag-hint" data-tauri-drag-region>
-              <GripHorizontal size={12} /> Kéo sang màn hình #2
-            </span>
+
+            <div className="overlay-drag-center" data-tauri-drag-region>
+              <span className="overlay-drag-pill" data-tauri-drag-region>
+                <GripHorizontal size={12} /> Kéo để di chuyển
+              </span>
+            </div>
+
+            <div className="overlay-win-controls">
+              <button
+                className={`btn sm icon-only ${alwaysOnTop ? "info-active" : ""}`}
+                title={alwaysOnTop ? "Đang ghim nổi trên cùng (bấm để tắt)" : "Ghim nổi trên cùng"}
+                onClick={handleTogglePin}
+              >
+                {alwaysOnTop ? <Pin size={13} /> : <PinOff size={13} />}
+              </button>
+              <button
+                className={`btn sm icon-only ${filledMonitor ? "info-active" : ""}`}
+                title={filledMonitor ? "Thu gọn cửa sổ" : "Phóng đầy màn hình (nháy đúp thanh tiêu đề)"}
+                onClick={handleToggleFillMonitor}
+              >
+                {filledMonitor ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+              </button>
+              <button
+                className="btn sm icon-only overlay-close-btn"
+                title="Đóng màn hình phụ đề"
+                onClick={handleClose}
+              >
+                <X size={13.5} />
+              </button>
+            </div>
+          </header>
+
+          {/* Tier 2: Compact Control Bar — wraps cleanly with zero overlap at any window size */}
+          <div className="overlay-toolbar">
+            <div className="overlay-toolbar-left">
+              <div className="overlay-layout-seg" role="group" aria-label="Bố cục hiển thị">
+                <button
+                  className={`overlay-layout-btn ${layoutMode === "stacked" ? "active" : ""}`}
+                  onClick={() => setLayoutMode("stacked")}
+                  title="Xếp tầng chuẩn hội trường: Gốc nhỏ ở trên ↑ • Bản dịch lớn ở dưới ↓"
+                >
+                  <Rows2 size={12} /> Xếp tầng
+                </button>
+                <button
+                  className={`overlay-layout-btn ${layoutMode === "target-only" ? "active" : ""}`}
+                  onClick={() => setLayoutMode("target-only")}
+                  title="Chỉ hiển thị Bản Dịch cỡ lớn (tối ưu cho khán giả ngồi xa)"
+                >
+                  <Type size={12} /> Chỉ dịch
+                </button>
+                <button
+                  className={`overlay-layout-btn ${layoutMode === "split" ? "active" : ""}`}
+                  onClick={() => setLayoutMode("split")}
+                  title="Chia đôi 50/50 Trái–Phải để đối chiếu song ngữ"
+                >
+                  <Columns2 size={12} /> 50/50
+                </button>
+              </div>
+
+              <span className="overlay-lang-chip">
+                <Languages size={11.5} />
+                <span>{layoutMode === "target-only" ? tgtLabel : `${srcLabel} → ${tgtLabel}`}</span>
+              </span>
+            </div>
+
+            <div className="overlay-toolbar-right">
+              <button
+                className="btn sm overlay-ctrl-btn"
+                title="Chế độ gom đoạn hiển thị (Đoạn dài / Đoạn vừa / Từng câu)"
+                onClick={cycleParagraphMode}
+              >
+                <AlignLeft size={12} /> {paraLabel}
+              </button>
+
+              <div className="overlay-stepper" role="group" aria-label="Cỡ chữ phụ đề">
+                <button
+                  className="overlay-step-btn"
+                  title="Giảm cỡ chữ"
+                  onClick={() => setFontSize((s) => Math.max(16, s - 2))}
+                >
+                  <Minus size={12} />
+                </button>
+                <span className="overlay-size-tag">{fontSize}px</span>
+                <button
+                  className="overlay-step-btn"
+                  title="Tăng cỡ chữ"
+                  onClick={() => setFontSize((s) => Math.min(56, s + 2))}
+                >
+                  <Plus size={12} />
+                </button>
+              </div>
+
+              <button
+                className="btn sm overlay-ctrl-btn"
+                title="Đổi độ mờ nền (78% / 94% / 100%)"
+                onClick={() => setOpacity((o) => (o >= 0.99 ? 0.78 : o >= 0.9 ? 1.0 : 0.94))}
+              >
+                <Contrast size={12} /> {Math.round(opacity * 100)}%
+              </button>
+
+              <button
+                className={`btn sm ${stageMode ? "info-active" : "overlay-ctrl-btn"}`}
+                title={
+                  stageMode
+                    ? "Đang ở chế độ Trình chiếu sạch (tự ẩn thanh công cụ & thông số kỹ thuật) — bấm để tắt"
+                    : "Bật chế độ Trình chiếu sạch (ẩn thanh nút khi rời chuột & ẩn thông số ms khỏi màn chiếu)"
+                }
+                onClick={() => setStageMode((v) => !v)}
+              >
+                <Presentation size={12.5} /> Trình chiếu
+              </button>
+
+              <button
+                className="btn sm icon-only"
+                title={theme === "dark" ? "Chuyển phụ đề sang nền Sáng (cho phòng chiếu sáng)" : "Chuyển phụ đề sang nền Tối"}
+                onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+              >
+                {theme === "dark" ? <Sun size={13} /> : <Moon size={13} />}
+              </button>
+
+              <button
+                className="btn sm icon-only"
+                title="Xóa chữ trên màn hình phụ đề"
+                onClick={() => {
+                  setEntries([]);
+                  setPartial(null);
+                }}
+              >
+                <Trash2 size={13} />
+              </button>
+            </div>
           </div>
+        </div>
 
-          <div className="overlay-topbar-actions">
-            {/* 3-Layout Presentation Switcher */}
-            <div className="overlay-layout-seg" role="group" aria-label="Bố cục hiển thị">
-              <button
-                className={`overlay-layout-btn ${layoutMode === "stacked" ? "active" : ""}`}
-                onClick={() => setLayoutMode("stacked")}
-                title="Xếp tầng chuẩn hội trường: Gốc nhỏ ở trên ↑ • Bản dịch lớn ở dưới ↓"
-              >
-                <Rows2 size={12} /> Xếp tầng
-              </button>
-              <button
-                className={`overlay-layout-btn ${layoutMode === "target-only" ? "active" : ""}`}
-                onClick={() => setLayoutMode("target-only")}
-                title="Chỉ hiển thị Bản Dịch cỡ lớn (tối ưu cho khán giả ngồi xa)"
-              >
-                <Type size={12} /> Chỉ dịch
-              </button>
-              <button
-                className={`overlay-layout-btn ${layoutMode === "split" ? "active" : ""}`}
-                onClick={() => setLayoutMode("split")}
-                title="Chia đôi 50/50 Trái–Phải để đối chiếu song ngữ"
-              >
-                <Columns2 size={12} /> 50/50
-              </button>
-            </div>
-
-            <button
-              className="btn sm overlay-ctrl-btn"
-              title="Chế độ gom đoạn hiển thị (Đoạn dài / Đoạn vừa / Từng câu)"
-              onClick={cycleParagraphMode}
-            >
-              <AlignLeft size={12} /> {paraLabel}
-            </button>
-
-            <div className="overlay-stepper" role="group" aria-label="Cỡ chữ phụ đề">
-              <button
-                className="overlay-step-btn"
-                title="Giảm cỡ chữ"
-                onClick={() => setFontSize((s) => Math.max(16, s - 2))}
-              >
-                <Minus size={12} />
-              </button>
-              <span className="overlay-size-tag">{fontSize}px</span>
-              <button
-                className="overlay-step-btn"
-                title="Tăng cỡ chữ"
-                onClick={() => setFontSize((s) => Math.min(56, s + 2))}
-              >
-                <Plus size={12} />
-              </button>
-            </div>
-
-            <button
-              className="btn sm overlay-ctrl-btn"
-              title="Đổi độ mờ nền (78% / 94% / 100%)"
-              onClick={() => setOpacity((o) => (o >= 0.99 ? 0.78 : o >= 0.9 ? 1.0 : 0.94))}
-            >
-              <Contrast size={12} /> {Math.round(opacity * 100)}%
-            </button>
-
-            <span className="overlay-sep" />
-
-            {/* Clean Stage Mode (auto-hides controls & hides technical metrics) */}
-            <button
-              className={`btn sm ${stageMode ? "info-active" : "overlay-ctrl-btn"}`}
-              title={
-                stageMode
-                  ? "Đang ở chế độ Trình chiếu sạch (tự ẩn thanh công cụ & thông số kỹ thuật) — bấm để tắt"
-                  : "Bật chế độ Trình chiếu sạch (ẩn thanh nút khi rời chuột & ẩn thông số ms khỏi màn chiếu)"
-              }
-              onClick={() => setStageMode((v) => !v)}
-            >
-              <Presentation size={12.5} /> Trình chiếu
-            </button>
-
-            <button
-              className="btn sm icon-only"
-              title={theme === "dark" ? "Chuyển phụ đề sang nền Sáng (cho phòng chiếu sáng)" : "Chuyển phụ đề sang nền Tối"}
-              onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-            >
-              {theme === "dark" ? <Sun size={13} /> : <Moon size={13} />}
-            </button>
-
-            <button
-              className={`btn sm icon-only ${alwaysOnTop ? "info-active" : ""}`}
-              title={alwaysOnTop ? "Đang ghim nổi trên cùng (bấm để tắt)" : "Ghim nổi trên cùng"}
-              onClick={handleTogglePin}
-            >
-              {alwaysOnTop ? <Pin size={13} /> : <PinOff size={13} />}
-            </button>
-
-            <button
-              className={`btn sm ${filledMonitor ? "info-active" : ""}`}
-              title={filledMonitor ? "Thu về kích thước cửa sổ" : "Phóng đầy màn hình hiện tại (màn hình 1 hoặc 2)"}
-              onClick={handleToggleFillMonitor}
-            >
-              {filledMonitor ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
-              <span>{filledMonitor ? "Thu gọn" : "Đầy màn hình"}</span>
-            </button>
-
-            <span className="overlay-sep" />
-
-            <button
-              className="btn sm icon-only"
-              title="Xóa chữ trên màn hình phụ đề"
-              onClick={() => {
-                setEntries([]);
-                setPartial(null);
-              }}
-            >
-              <Trash2 size={13} />
-            </button>
-            <button className="btn sm icon-only" title="Đóng màn hình phụ đề" onClick={handleClose}>
-              <X size={13} />
-            </button>
-          </div>
-        </header>
-
-        {/* Sub-header language ribbon (hidden cleanly when stageMode auto-hides chrome in target-only/stacked) */}
-        {layoutMode === "split" ? (
+        {/* Split Column Language Headers (only shown in 50/50 split layout) */}
+        {layoutMode === "split" && (
           <div className={`overlay-col-headers ${stageMode ? "compact" : ""}`}>
             <div className="overlay-col-head left">
               <span className="col-badge src">
@@ -554,17 +590,6 @@ export default function OverlayWindow() {
               <span className="col-lang">{tgtLabel}</span>
             </div>
           </div>
-        ) : (
-          !stageMode && (
-            <div className="overlay-single-header">
-              <span className="col-badge tgt">
-                <Languages size={11} /> {layoutMode === "target-only" ? "CHỈ BẢN DỊCH" : "XẾP TẦNG HỘI TRƯỜNG"}
-              </span>
-              <span className="col-lang">
-                {layoutMode === "target-only" ? tgtLabel : `${srcLabel} → ${tgtLabel}`}
-              </span>
-            </div>
-          )
         )}
 
         {/* Scrollable Conference Subtitle Feed */}
