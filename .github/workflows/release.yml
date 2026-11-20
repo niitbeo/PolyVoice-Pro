@@ -7,7 +7,37 @@ on:
   workflow_dispatch:
 
 jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure single Draft Release exists before parallel matrix builds
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+          TAG="v${VERSION}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --draft \
+              --title "PolyVoice Pro v${VERSION}" \
+              --notes "$(cat <<EOF
+          ## PolyVoice Pro v${VERSION}
+
+          Bản phát hành chính thức cho **Windows (\`.exe\`/\`.msi\`)** và **macOS (\`.dmg\`)** tích hợp sẵn AI Engine (không cần cài Python).
+          Người dùng đang cài đặt bản cũ chỉ cần mở app lên để **tự động cập nhật 1 chạm** (giữ nguyên toàn bộ model offline, từ điển và API Key).
+          EOF
+          )"
+            echo "Created draft release $TAG"
+          else
+            echo "Draft/existing release $TAG already present"
+          fi
+
   publish-tauri:
+    needs: prepare-release
     permissions:
       contents: write
     strategy:
@@ -179,18 +209,34 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install
 
+      - name: Configure optional Apple Developer signing (only when secret is set)
+        if: matrix.platform == 'macos-latest'
+        env:
+          _APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          _APPLE_CERT_PW: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          _APPLE_SIGN_ID: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          _APPLE_ID: ${{ secrets.APPLE_ID }}
+          _APPLE_PW: ${{ secrets.APPLE_PASSWORD }}
+          _APPLE_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$_APPLE_CERT" ]; then
+            echo "APPLE_CERTIFICATE=$_APPLE_CERT" >> "$GITHUB_ENV"
+            [ -n "$_APPLE_CERT_PW" ] && echo "APPLE_CERTIFICATE_PASSWORD=$_APPLE_CERT_PW" >> "$GITHUB_ENV"
+            [ -n "$_APPLE_SIGN_ID" ] && echo "APPLE_SIGNING_IDENTITY=$_APPLE_SIGN_ID" >> "$GITHUB_ENV"
+            [ -n "$_APPLE_ID" ] && echo "APPLE_ID=$_APPLE_ID" >> "$GITHUB_ENV"
+            [ -n "$_APPLE_PW" ] && echo "APPLE_PASSWORD=$_APPLE_PW" >> "$GITHUB_ENV"
+            [ -n "$_APPLE_TEAM" ] && echo "APPLE_TEAM_ID=$_APPLE_TEAM" >> "$GITHUB_ENV"
+            echo "Apple Developer signing enabled."
+          else
+            echo "No APPLE_CERTIFICATE secret configured; building ad-hoc signed macOS bundle."
+          fi
+
       - name: Build & Upload Signed Installer to Draft Release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: v__VERSION__
           releaseName: "PolyVoice Pro v__VERSION__"
@@ -221,11 +267,15 @@ jobs:
           import os
           import subprocess
           import tempfile
+          import time
+          import urllib.parse
+          import urllib.request
           from pathlib import Path
 
           conf = json.loads(Path("src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
           version = conf["version"]
           tag = f"v{version}"
+          repo = os.environ["GITHUB_REPOSITORY"]
 
           rel_raw = subprocess.check_output(
               ["gh", "release", "view", tag, "--json", "assets,body,isDraft"],
@@ -240,6 +290,11 @@ jobs:
               if not matches:
                   raise SystemExit(f"Missing required release asset ending with '{suffix}'")
               return matches[0]
+
+          def canonical_url(asset: dict) -> str:
+              url = f"https://github.com/{repo}/releases/download/{tag}/{urllib.parse.quote(asset['name'])}"
+              assert "/untagged-" not in url, f"Invalid draft URL: {url}"
+              return url
 
           mac_tar = find_asset("aarch64.app.tar.gz")
           mac_sig_asset = find_asset("aarch64.app.tar.gz.sig")
@@ -268,11 +323,11 @@ jobs:
                   "notes": rel.get("body") or f"PolyVoice Pro v{version}",
                   "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                   "platforms": {
-                      "darwin-aarch64": {"signature": mac_sig, "url": mac_tar["url"]},
-                      "darwin-aarch64-app": {"signature": mac_sig, "url": mac_tar["url"]},
-                      "windows-x86_64": {"signature": msi_sig, "url": win_msi["url"]},
-                      "windows-x86_64-msi": {"signature": msi_sig, "url": win_msi["url"]},
-                      "windows-x86_64-nsis": {"signature": nsis_sig, "url": win_nsis["url"]},
+                      "darwin-aarch64": {"signature": mac_sig, "url": canonical_url(mac_tar)},
+                      "darwin-aarch64-app": {"signature": mac_sig, "url": canonical_url(mac_tar)},
+                      "windows-x86_64": {"signature": msi_sig, "url": canonical_url(win_msi)},
+                      "windows-x86_64-msi": {"signature": msi_sig, "url": canonical_url(win_msi)},
+                      "windows-x86_64-nsis": {"signature": nsis_sig, "url": canonical_url(win_nsis)},
                   },
               }
               required_keys = {
@@ -295,4 +350,22 @@ jobs:
                   check=True,
               )
               print(f"Published {tag} with verified latest.json platforms:", sorted(manifest["platforms"].keys()))
+
+              # Verify published latest.json endpoint resolves cleanly (retry briefly for GitHub CDN propagation)
+              latest_url = f"https://github.com/{repo}/releases/latest/download/latest.json"
+              last_err = None
+              for attempt in range(6):
+                  try:
+                      with urllib.request.urlopen(latest_url, timeout=15) as resp:
+                          live = json.loads(resp.read().decode("utf-8"))
+                          if live.get("version") == version:
+                              print(f"Verified live auto-update endpoint -> v{live['version']} OK")
+                              last_err = None
+                              break
+                          last_err = RuntimeError(f"Live version still {live.get('version')} != {version}")
+                  except Exception as exc:
+                      last_err = exc
+                  time.sleep(3)
+              if last_err is not None:
+                  raise last_err
           PY
