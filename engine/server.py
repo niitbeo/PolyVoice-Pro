@@ -1100,8 +1100,7 @@ class EngineRuntime:
         if source_lang == target_lang:
             return TranslationResult(clean, clean, source_lang, target_lang, 0.0, "passthrough")
 
-        g_data = self.glossary.get()
-        active_term_locks = g_data["term_locks"] if g_data.get("enabled", True) else []
+        active_term_locks = self.glossary.get_effective_term_locks(clean, source_lang, target_lang)
         is_vi_en_pair = {source_lang, target_lang} == {"vie_Latn", "eng_Latn"}
         can_hymt2 = (
             self._llama_server_ready
@@ -1146,7 +1145,7 @@ class EngineRuntime:
                             self.clear_cloud_cooldown()
                             return res
                         else:
-                            masked_c, restore_c = self.glossary.protect_terms(clean)
+                            masked_c, restore_c = self.glossary.protect_terms(clean, source_lang, target_lang)
                             res = adapter.translate(masked_c, source_lang, target_lang)
                             if not res.cached:
                                 self.cloud_quota.record_usage(pid, len(clean))
@@ -1187,7 +1186,15 @@ class EngineRuntime:
                 pass
 
         # Placeholder-protected paths for CTranslate2 / Online / External LLM
-        masked, restore_pairs = self.glossary.protect_terms(clean)
+        masked, restore_pairs = self.glossary.protect_terms(clean, source_lang, target_lang)
+
+        # Standalone proper-name utterance (e.g. "Trương Gia Bình.") -> preserve verbatim with 0ms MT!
+        if restore_pairs:
+            stripped_masked = masked.strip(".,!?;: ")
+            for tok, tgt_name in restore_pairs:
+                if stripped_masked == tok:
+                    direct_out = self.glossary.restore_terms(masked, restore_pairs)
+                    return TranslationResult(clean, direct_out, source_lang, target_lang, 0.0, "proper-name-lock")
 
         def _finish(res: TranslationResult) -> TranslationResult:
             restored = self.glossary.restore_terms(res.translated_text, restore_pairs)
@@ -3001,7 +3008,7 @@ async def lifespan(_app: FastAPI):
     runtime.shutdown()
 
 
-app = FastAPI(title="VOICERECORE Local Engine", version="0.8.3", lifespan=lifespan)
+app = FastAPI(title="VOICERECORE Local Engine", version="0.8.4", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
