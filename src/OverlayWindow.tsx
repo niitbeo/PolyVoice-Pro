@@ -19,6 +19,7 @@ import {
   Rows2,
   Sun,
   Trash2,
+  Tv,
   Type,
   X,
 } from "lucide-react";
@@ -42,7 +43,7 @@ import {
 function getInitialOverlayLayout(): OverlayLayoutMode {
   try {
     const saved = localStorage.getItem(OVERLAY_LAYOUT_KEY);
-    if (saved === "stacked" || saved === "target-only" || saved === "split") {
+    if (saved === "stacked" || saved === "youtube" || saved === "target-only" || saved === "split") {
       return saved;
     }
   } catch {
@@ -484,6 +485,13 @@ export default function OverlayWindow() {
                   <Rows2 size={12} /> Xếp tầng
                 </button>
                 <button
+                  className={`overlay-layout-btn ${layoutMode === "youtube" ? "active" : ""}`}
+                  onClick={() => setLayoutMode("youtube")}
+                  title="Phụ đề gọn kiểu YouTube (1–2 dòng nổi nền tối bán trong suốt, kéo đặt trực tiếp lên video/Zoom/Slide)"
+                >
+                  <Tv size={12} /> YouTube
+                </button>
+                <button
                   className={`overlay-layout-btn ${layoutMode === "target-only" ? "active" : ""}`}
                   onClick={() => setLayoutMode("target-only")}
                   title="Chỉ hiển thị Bản Dịch cỡ lớn (tối ưu cho khán giả ngồi xa)"
@@ -644,6 +652,38 @@ export default function OverlayWindow() {
                 </div>
               </div>
             )
+          ) : layoutMode === "youtube" ? (
+            (() => {
+              const latestFinal = entries[entries.length - 1] || null;
+              const activeHasMt = Boolean(partial && (partial.translated_text || partial.stable_text || partial.unstable_text));
+              const ytSource = partial?.source_text || latestFinal?.source_text || "";
+              const ytIsLive = Boolean(partial);
+              return (
+                <div className="overlay-yt-stage">
+                  <div className={`overlay-yt-pill ${ytIsLive ? "live" : ""}`}>
+                    {ytSource && (
+                      <div className="overlay-yt-src" style={{ fontSize: Math.max(13, Math.round(fontSize * 0.56)) }}>
+                        {ytSource}
+                      </div>
+                    )}
+                    <div className="overlay-yt-tgt" style={{ fontSize }}>
+                      {activeHasMt && partial ? (
+                        renderLiveTarget(partial)
+                      ) : latestFinal?.translated_text ? (
+                        <>
+                          {latestFinal.translated_text}
+                          {ytIsLive && <span className="live-caret" aria-hidden="true" />}
+                        </>
+                      ) : partial ? (
+                        <span className="overlay-translating-dots">...</span>
+                      ) : (
+                        "—"
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()
           ) : layoutMode === "split" ? (
             <div className="overlay-feed-inner split">
               {groupedEntries.map((item) => (

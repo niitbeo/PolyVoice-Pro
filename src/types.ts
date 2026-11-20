@@ -56,6 +56,7 @@ export type AudioSourceId = "mic" | "system" | "dual" | "mix";
 export type InputChannelId = "mix" | "left" | "right";
 export type AsrEngineId =
   | "auto"
+  | "moonshine-en"
   | "apple-native"
   | "whisper-turbo"
   | "zipformer-30m-streaming"
@@ -253,7 +254,7 @@ export interface EngineStatus {
   boot_error: string;
 }
 
-export type OverlayLayoutMode = "stacked" | "target-only" | "split";
+export type OverlayLayoutMode = "stacked" | "youtube" | "target-only" | "split";
 export const OVERLAY_LAYOUT_KEY = "polyvoice_overlay_layout";
 
 export interface PartialEvent {

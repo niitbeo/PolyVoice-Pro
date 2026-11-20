@@ -363,13 +363,15 @@ class EnViT5Translator:
         chunks = _split_semantic_sentences(clean, max_words=32)
         batch_tokens = [self._sp.encode(f"{prefix}: {c}", out_type=str) + ["</s>"] for c in chunks]
         max_src_len = max(len(toks) for toks in batch_tokens)
+        is_short_src = len(clean.split()) <= 6
+        max_dec = min(256, max(16, int(max_src_len * 2.5) + 6))
         with self._lock:
             results = self._translator.translate_batch(
                 batch_tokens,
                 beam_size=max(1, beam_size),
-                max_decoding_length=min(256, max(64, max_src_len * 3)),
-                repetition_penalty=1.12,
-                no_repeat_ngram_size=4,
+                max_decoding_length=max_dec,
+                repetition_penalty=1.18 if is_short_src else 1.12,
+                no_repeat_ngram_size=3 if is_short_src else 4,
             )
 
         decoded_parts: list[str] = []
@@ -380,6 +382,25 @@ class EnViT5Translator:
                 if part.startswith(tag):
                     part = part[len(tag) :].strip()
                     break
+            # Short-fragment echo guard: EnViT5 beam=1 on <=6-word drafts (even with trailing '.')
+            # can emit multiple echoed variations ("Chào mừng anh chào đón em...", or 3 sentences).
+            if is_short_src and part:
+                src_sents = [s for s in re.split(r"[.!?]+", clean) if s.strip()]
+                max_sents = max(1, len(src_sents))
+                out_sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", part) if s.strip()]
+                if len(out_sents) > max_sents:
+                    part = " ".join(out_sents[:max_sents]).strip()
+                # Also clip unpunctuated opening-phrase echoes (e.g. "Chào mừng các bạn chào mừng các bạn...")
+                ptoks = part.split()
+                if len(ptoks) >= 6:
+                    lead2 = (ptoks[0].lower(), ptoks[1].lower())
+                    for k in range(2, len(ptoks) - 1):
+                        if (ptoks[k].lower(), ptoks[k + 1].lower()) == lead2:
+                            part = " ".join(ptoks[:k]).rstrip(" ,;:-")
+                            break
+                        if ptoks[k].lower() == lead2[0] and k >= 3 and len(clean.split()) <= 3:
+                            part = " ".join(ptoks[:k]).rstrip(" ,;:-")
+                            break
             if part:
                 decoded_parts.append(part)
 

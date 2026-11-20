@@ -2326,6 +2326,9 @@ export default function App() {
                 }}
               >
                 <option value="auto">Tự động tối ưu theo ngôn ngữ (Khuyên dùng)</option>
+                <option value="moonshine-en" disabled={!status?.moonshine_en_ready}>
+                  Moonshine-v2 Tiếng Anh (Streaming dấu câu chuẩn YouTube)
+                </option>
                 <option value="whisper-turbo" disabled={!status?.whisper_turbo_ready}>
                   Whisper-Turbo 99 NN (Thái, Nhật, Trung, Hàn, Pháp, Đức • Offline)
                 </option>
@@ -2902,8 +2905,13 @@ export default function App() {
                   </>
                 )
               ) : spotPendingDraft ? (
-                <span className="spot-translating">
-                  <Loader2 size={15} className="spin" /> Đang dịch câu hiện tại...
+                <span className="spot-translating subtle" aria-label="Đang dịch trực tiếp">
+                  <span className="live-dots" aria-hidden="true">
+                    <span />
+                    <span />
+                    <span />
+                  </span>
+                  <span className="spot-translating-label">Đang dịch trực tiếp...</span>
                 </span>
               ) : (
                 <span className="spot-empty">

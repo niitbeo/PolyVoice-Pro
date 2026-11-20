@@ -79,6 +79,7 @@ from pydantic import BaseModel
 
 from asr_engine import (
     ASROutput,
+    MoonshineEnStreamingEngine,
     MoonshineV2EnRefiner,
     VietASRBatchRefiner,
     VietASRStreamingEngine,
@@ -474,6 +475,8 @@ class EngineRuntime:
 
         self._asr_zf_vi: Optional[ZipformerStreamingViEngine] = None
         self._asr_zf_en: Optional[ZipformerStreamingEnEngine] = None
+        self._asr_moonshine_en: Optional[MoonshineEnStreamingEngine] = None
+        self._asr_moonshine_en_remote: Optional[MoonshineEnStreamingEngine] = None
         self._asr_viet: Optional[VietASRStreamingEngine] = None
         self._asr_whisper: Optional[WhisperTurboStreamingEngine] = None
         self._asr_whisper_remote: Optional[WhisperTurboStreamingEngine] = None
@@ -499,6 +502,7 @@ class EngineRuntime:
         self._asr_thread: Optional[threading.Thread] = None
         self._remote_asr_thread: Optional[threading.Thread] = None
         self._mt_thread: Optional[threading.Thread] = None
+        self._draft_mt_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._listening = False
         self._active_asr_label: str = ""
@@ -507,8 +511,10 @@ class EngineRuntime:
         self._final_mt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self._partial_lock = threading.Lock()
         self._pending_partial: Optional[dict[str, Any]] = None
+        self._committed_seg_ids: deque[str] = deque(maxlen=64)
         self._stable_prefix = StablePrefixTracker()
         self._mt_wakeup = threading.Event()
+        self._draft_wakeup = threading.Event()
 
         # Primary channel semantic sentence buffer + PCM ring buffer for Pass-2 Vietnamese refinement
         self._para_lock = threading.Lock()
@@ -874,6 +880,25 @@ class EngineRuntime:
                         hotwords=self._get_glossary_hotwords(),
                     )
                 return self._asr_zf_vi
+
+            if engine_name == "moonshine-en":
+                if not self.model_manager.is_moonshine_en_ready():
+                    raise RuntimeError("Model tiếng Anh Moonshine-v2 chưa được tải. Hãy bấm tải trong mục Mô hình Offline.")
+                use_remote_slot = remote and self._active_asr_label == "moonshine-en"
+                slot = self._asr_moonshine_en_remote if use_remote_slot else self._asr_moonshine_en
+                if slot is None:
+                    shared_rec = self._en_pass2_refiner._recognizer if (self._en_pass2_refiner is not None and not use_remote_slot) else None
+                    slot = MoonshineEnStreamingEngine(
+                        self.model_manager.moonshine_en_dir,
+                        sample_rate=SAMPLE_RATE,
+                        num_threads=_adaptive_mt_threads(),
+                        recognizer=shared_rec,
+                    )
+                    if use_remote_slot:
+                        self._asr_moonshine_en_remote = slot
+                    else:
+                        self._asr_moonshine_en = slot
+                return slot
 
             if engine_name == "zipformer-en-20m":
                 if self._asr_zf_en is None:
@@ -1288,13 +1313,16 @@ class EngineRuntime:
             return "viet-asr"
 
         if lang_code == "eng_Latn":
+            # Moonshine-v2 sliding-window streaming: ~99% acc, built-in punctuation, clean sentence boundaries!
+            if self.model_manager.is_moonshine_en_ready():
+                return "moonshine-en"
             if self.model_manager.is_zipformer_en_20m_ready():
                 return "zipformer-en-20m"
             if self.model_manager.is_whisper_turbo_ready():
                 return "whisper-turbo"
             if self.mac_helper is not None:
                 return "apple-native"
-            raise RuntimeError("Chưa có model nhận dạng tiếng Anh (hãy tải Zipformer-20M EN hoặc Whisper-Turbo).")
+            raise RuntimeError("Chưa có model nhận dạng tiếng Anh (hãy tải Moonshine-v2 EN hoặc Zipformer-20M EN).")
 
         # For Lao, Thai, Japanese, Chinese, Korean, Khmer, French, German, etc.:
         # Prefer cross-platform Whisper Large-v3-Turbo + Silero VAD v5 when downloaded (100% offline Win & Mac, incl. Lao!)
@@ -1327,7 +1355,7 @@ class EngineRuntime:
             "listening": self._listening,
             "active_asr_label": self._active_asr_label,
             "remote_asr_label": self._remote_asr_label,
-            "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_en is not None) or (self._asr_whisper is not None),
+            "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_whisper is not None),
             "pass2_loaded": self._pass2_refiner is not None,
             "hotwords_active": self._asr_zf_vi._hotwords_count if self._asr_zf_vi is not None else 0,
             "zipformer_ready": self.model_manager.is_zipformer_streaming_ready(),
@@ -1386,6 +1414,8 @@ class EngineRuntime:
                 self._opus_ev = None
             elif model_id == "moonshine-en":
                 self._en_pass2_refiner = None
+                self._asr_moonshine_en = None
+                self._asr_moonshine_en_remote = None
             elif model_id == "whisper-turbo":
                 for w in (self._asr_whisper, self._asr_whisper_remote):
                     if w is not None:
@@ -1518,6 +1548,8 @@ class EngineRuntime:
         if self.config.audio_source == "mix" and chosen_asr == "apple-native":
             if self.config.source_lang == "vie_Latn" and self.model_manager.is_zipformer_streaming_ready():
                 chosen_asr = "zipformer-30m-streaming"
+            elif self.config.source_lang == "eng_Latn" and self.model_manager.is_moonshine_en_ready():
+                chosen_asr = "moonshine-en"
             elif self.config.source_lang == "eng_Latn" and self.model_manager.is_zipformer_en_20m_ready():
                 chosen_asr = "zipformer-en-20m"
             elif self.model_manager.is_whisper_turbo_ready():
@@ -1570,6 +1602,7 @@ class EngineRuntime:
             self.ensure_pass2_refiner()
         if (
             self.config.pass2_refine
+            and chosen_asr != "moonshine-en"
             and (self.config.source_lang == "eng_Latn" or (self.config.audio_source == "dual" and self.config.target_lang == "eng_Latn"))
             and self.model_manager.is_moonshine_en_ready()
         ):
@@ -1580,6 +1613,7 @@ class EngineRuntime:
 
         self._stop_event.clear()
         self._mt_wakeup.clear()
+        self._draft_wakeup.clear()
         while not self._final_mt_queue.empty():
             try:
                 self._final_mt_queue.get_nowait()
@@ -1587,6 +1621,7 @@ class EngineRuntime:
                 break
         with self._partial_lock:
             self._pending_partial = None
+            self._committed_seg_ids.clear()
         self._stable_prefix.reset()
         with self._para_lock:
             self._para_parts.clear()
@@ -1614,6 +1649,8 @@ class EngineRuntime:
 
         self._mt_thread = threading.Thread(target=self._mt_worker_loop, daemon=True, name="mt-worker")
         self._mt_thread.start()
+        self._draft_mt_thread = threading.Thread(target=self._draft_mt_loop, daemon=True, name="draft-mt-worker")
+        self._draft_mt_thread.start()
 
         # Pre-warm Hy-MT2 llama-server in the background so Sentence #1 has zero cold-start delay
         if (
@@ -1819,6 +1856,7 @@ class EngineRuntime:
     def stop_session(self) -> dict[str, Any]:
         self._stop_event.set()
         self._mt_wakeup.set()
+        self._draft_wakeup.set()
         for stream_attr in ("_audio_stream", "_remote_audio_stream"):
             st = getattr(self, stream_attr, None)
             if st is not None:
@@ -1839,7 +1877,7 @@ class EngineRuntime:
                     except Exception:
                         pass
                 setattr(self, proc_attr, None)
-        for th_attr in ("_asr_thread", "_remote_asr_thread", "_mt_thread"):
+        for th_attr in ("_asr_thread", "_remote_asr_thread", "_mt_thread", "_draft_mt_thread"):
             th = getattr(self, th_attr, None)
             if th is not None and th.is_alive():
                 th.join(timeout=2.0)
@@ -1897,6 +1935,8 @@ class EngineRuntime:
             self._asr_viet = None
             self._asr_zf_vi = None
             self._asr_zf_en = None
+            self._asr_moonshine_en = None
+            self._asr_moonshine_en_remote = None
             self._asr_whisper = None
             self._asr_whisper_remote = None
 
@@ -2186,17 +2226,27 @@ class EngineRuntime:
     def _trim_dangling_tail_for_draft(cls, text: str) -> str:
         """
         YouTube Live Anti-Hallucination Guard:
-        If an in-progress speech draft ends on a dangling connector (e.g. '...nhưng mà',
-        '...để mà', '...because', '...to the'), strip the trailing dangling connector ONLY
-        from the string sent to partial MT (keep it visible in the live source transcript).
-        This prevents neural MT from hallucinating fake continuations like "but it's not".
+        If an in-progress speech draft ends on a dangling connector/determiner/auxiliary
+        (e.g. '...nhưng mà', '...to this', '...my', '...because'), strip the trailing dangling
+        words ONLY from the string sent to partial MT (keep them visible in live source transcript).
+        This prevents neural MT from hallucinating fake continuations like "bài kiểm tra này".
         """
         words = text.strip().split()
-        if len(words) < 5:
+        if len(words) < 3:
             return text.strip()
+        extra_draft_dangling = {
+            "this", "that", "these", "those", "my", "your", "our", "their", "its", "his", "her",
+            "very", "more", "most", "just", "will", "can", "could", "would", "should", "may", "might",
+            "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "about", "into",
+            "from", "at", "by", "on", "as", "if", "when", "while", "which", "who",
+        }
         cut = len(words)
-        while cut > 3 and (len(words) - cut) < 3 and cls._ends_with_connector(" ".join(words[:cut])):
-            cut -= 1
+        while cut > 2 and (len(words) - cut) < 4:
+            tail_w = words[cut - 1].lower().strip(".,!?;:\"'()[]")
+            if tail_w in extra_draft_dangling or cls._ends_with_connector(" ".join(words[:cut])):
+                cut -= 1
+            else:
+                break
         trimmed = " ".join(words[:cut]).rstrip(" ,;:-")
         return trimmed if trimmed else text.strip()
 
@@ -2298,6 +2348,7 @@ class EngineRuntime:
         self._current_segment_id = uuid.uuid4().hex[:10]
         with self._partial_lock:
             self._pending_partial = None
+            self._committed_seg_ids.append(seg_id)
         self._stable_prefix.reset()
 
         if not full_text:
@@ -2414,17 +2465,20 @@ class EngineRuntime:
                             "source_lang": src_lang,
                             "target_lang": tgt_lang,
                         }
-                    self._mt_wakeup.set()
+                    self._draft_wakeup.set()
                 return
 
             if out.kind == "final":
                 self._para_has_active_partial = False
                 self._para_parts.append(out.text)
                 combined = self._join_fragments(self._para_parts, preserve_case=self._get_capitalized_glossary_words())
-                is_whisper = out.provider.startswith("whisper-turbo")
+                is_sentence_asr = (
+                    out.provider.startswith("whisper-turbo")
+                    or out.provider == "moonshine-v2-en"
+                )
                 is_non_spaced = src_lang.startswith(_NON_SPACED_SCRIPT_PREFIXES)
-                if is_whisper:
-                    # Silero VAD + Whisper-Turbo already emits complete punctuated sentences -> commit immediately!
+                if is_sentence_asr:
+                    # Moonshine-v2 & Whisper-Turbo already commit clean punctuated sentences -> flush immediately!
                     self._flush_paragraph_locked(allow_carry_over=False)
                     return
 
@@ -2478,7 +2532,7 @@ class EngineRuntime:
                                 "source_lang": src_lang,
                                 "target_lang": tgt_lang,
                             }
-                        self._mt_wakeup.set()
+                        self._draft_wakeup.set()
 
     def _apple_asr_loop(self) -> None:
         proc = self._apple_proc
@@ -2692,9 +2746,12 @@ class EngineRuntime:
                     self._remote_parts,
                     preserve_case=self._get_capitalized_glossary_words(),
                 )
-                is_whisper = out.provider.startswith("whisper-turbo")
+                is_sentence_asr = (
+                    out.provider.startswith("whisper-turbo")
+                    or out.provider == "moonshine-v2-en"
+                )
                 is_non_spaced = r_src.startswith(_NON_SPACED_SCRIPT_PREFIXES)
-                if is_whisper:
+                if is_sentence_asr:
                     self._remote_flush_locked()
                     return
                 if is_non_spaced:
@@ -2815,12 +2872,7 @@ class EngineRuntime:
                 self._remote_flush_locked()
 
     def _mt_worker_loop(self) -> None:
-        last_partial_time = 0.0
-        last_partial_key: tuple[str, str, str] = ("", "", "")
-        last_partial_seg_id: str = ""
-        last_partial_wc: int = 0
-        last_final_mt_ms = 0.0
-
+        """Dedicated Final MT Worker (Pass-2 + Hy-MT2/EnViT5/NLLB/Cloud -> History + Logs + Audience)."""
         while not self._stop_event.is_set() or not self._final_mt_queue.empty():
             if not self._stop_event.is_set():
                 self._flush_paragraph_if_idle()
@@ -2828,10 +2880,13 @@ class EngineRuntime:
             try:
                 item = self._final_mt_queue.get_nowait()
                 # Drop any stale draft belonging to the exact utterance now being finalized
+                seg_id_str = str(item.get("id") or "")
                 with self._partial_lock:
+                    if seg_id_str and seg_id_str not in self._committed_seg_ids:
+                        self._committed_seg_ids.append(seg_id_str)
                     if self._pending_partial is not None and self._pending_partial.get("id") == item.get("id"):
                         self._pending_partial = None
-                self._stable_prefix.clear_if(str(item.get("id") or ""))
+                self._stable_prefix.clear_if(seg_id_str)
                 cfg = self.config
                 source_text = item["source_text"]
                 speaker = item.get("speaker", "")
@@ -2839,7 +2894,7 @@ class EngineRuntime:
 
                 # Pass-2 Async Refinement (never blocks live Pass-1 streaming):
                 # - Vietnamese: VietASRBatchRefiner (punctuation + ITN) with Glossary-Keyword Preservation Guard!
-                # - English: Moonshine-v2-Base (106 MB, 44x RT, 1.82% TED WER + full punctuation!)
+                # - English: Moonshine-v2-Base (only when Pass-1 was NOT already Moonshine-v2 streaming!)
                 if cfg.pass2_refine and item.get("pcm") is not None:
                     asr_label = self._remote_asr_label if speaker == "remote" else self._active_asr_label
                     if item["source_lang"] == "vie_Latn" and asr_label == "zipformer-30m-streaming":
@@ -2855,7 +2910,7 @@ class EngineRuntime:
                                 source_text = refined
                         except Exception:
                             pass
-                    elif item["source_lang"] == "eng_Latn":
+                    elif item["source_lang"] == "eng_Latn" and asr_label != "moonshine-en":
                         try:
                             en_refiner = self.ensure_en_pass2_refiner()
                             if en_refiner is not None:
@@ -2902,7 +2957,6 @@ class EngineRuntime:
                     translated = res.translated_text
                     mt_ms = res.latency_ms
                     mt_engine = res.engine
-                    last_final_mt_ms = mt_ms
                 except Exception as exc:
                     self.broadcast_threadsafe({"type": "error", "data": {"message": f"Lỗi dịch: {exc}"}})
 
@@ -2940,97 +2994,135 @@ class EngineRuntime:
             if self._stop_event.is_set():
                 break
 
-            # Strict Final Priority: NEVER start a draft translation while a committed sentence is waiting!
-            if not self._final_mt_queue.empty():
-                continue
+            self._mt_wakeup.wait(timeout=0.1)
+            self._mt_wakeup.clear()
 
+    def _draft_mt_loop(self) -> None:
+        """
+        Decoupled Live-Draft MT Worker (YouTube-Grade Word-by-Word Streaming):
+        Runs completely in parallel with Final Hy-MT2 GPU translations so live EnViT5 drafts
+        NEVER freeze behind a 700ms-2000ms final sentence, eliminating Spotlight spinners!
+        """
+        last_partial_time = 0.0
+        last_partial_key: tuple[str, str, str] = ("", "", "")
+        last_partial_seg_id: str = ""
+        last_partial_wc: int = 0
+        last_draft_mt_ms = 0.0
+
+        while not self._stop_event.is_set():
             partial_job = None
             with self._partial_lock:
                 if self._pending_partial is not None:
                     partial_job = self._pending_partial
                     self._pending_partial = None
 
-            if partial_job is not None:
-                now = time.perf_counter()
-                cfg = self.config
-                # Adaptive Draft Throttle: if MT is under heavy load (>3.2s/sentence), skip drafts so finals never fall behind!
-                if last_final_mt_ms > 3200.0:
-                    continue
-                # Conference-grade calm cadence (~0.85s normal, ~1.05s eco) prevents visual flicker
-                debounce_s = 1.05 if cfg.eco_mode else 0.85
-                if last_final_mt_ms > 1400.0:
-                    debounce_s = max(debounce_s, (last_final_mt_ms / 1000.0) * 0.85)
-                draft_src = self._trim_dangling_tail_for_draft(partial_job["source_text"])
-                key = (draft_src, partial_job["source_lang"], partial_job["target_lang"])
-                if not draft_src or key == last_partial_key:
-                    continue
-
-                seg_id = str(partial_job["id"])
-                wc_now = (
-                    max(len(draft_src.split()), len(draft_src) // 4)
-                    if partial_job["source_lang"].startswith(_NON_SPACED_SCRIPT_PREFIXES)
-                    else len(draft_src.split())
-                )
-                same_seg = seg_id == last_partial_seg_id
-                elapsed_s = now - last_partial_time
-                # Wait for calm cadence OR at least 2 new words (unless >=1.25s pause on same segment)
-                need_wait = elapsed_s < debounce_s or (
-                    same_seg and (wc_now - last_partial_wc) < 2 and elapsed_s < 1.25
-                )
-                if need_wait:
-                    # Re-queue latest draft if nothing newer arrived so final words are never dropped
-                    with self._partial_lock:
-                        if self._pending_partial is None:
-                            self._pending_partial = partial_job
-                    self._mt_wakeup.wait(timeout=0.12)
-                    self._mt_wakeup.clear()
-                    continue
-
-                try:
-                    r = self.translate_text(
-                        draft_src,
-                        partial_job["source_lang"],
-                        partial_job["target_lang"],
-                        mt_mode=cfg.mt_mode,
-                        beam_size=1,
-                        llm_url=cfg.llm_url,
-                        llm_model=cfg.llm_model,
-                        llm_api_key=cfg.llm_api_key,
-                        context=list(self._recent_context),
-                        is_draft=True,
-                    )
-
-                    last_partial_time = time.perf_counter()
-                    last_partial_key = key
-                    last_partial_seg_id = seg_id
-                    last_partial_wc = wc_now
-                    if r.latency_ms > 2800.0:
-                        last_final_mt_ms = max(last_final_mt_ms, r.latency_ms)
-
-                    stable_text, unstable_text, stabilized = self._stable_prefix.update(
-                        seg_id, partial_job["target_lang"], r.translated_text
-                    )
-                    self.broadcast_threadsafe(
-                        {
-                            "type": "partial_mt",
-                            "data": {
-                                "id": seg_id,
-                                "translated_text": stabilized,
-                                "stable_text": stable_text,
-                                "unstable_text": unstable_text,
-                                "source_lang": partial_job["source_lang"],
-                                "target_lang": partial_job["target_lang"],
-                                "mt_ms": round(r.latency_ms, 1),
-                                "mt_engine": r.engine,
-                            },
-                        }
-                    )
-                except Exception:
-                    pass
+            if partial_job is None:
+                self._draft_wakeup.wait(timeout=0.1)
+                self._draft_wakeup.clear()
                 continue
 
-            self._mt_wakeup.wait(timeout=0.1)
-            self._mt_wakeup.clear()
+            cfg = self.config
+            seg_id = str(partial_job["id"])
+            with self._partial_lock:
+                if seg_id in self._committed_seg_ids:
+                    continue
+
+            # If on a CPU-shared non-VI/EN light-offline pair while finals are queued, yield briefly
+            is_vi_en_pair = {partial_job["source_lang"], partial_job["target_lang"]} == {"vie_Latn", "eng_Latn"}
+            if not is_vi_en_pair and cfg.mt_mode == "light-offline" and not self._final_mt_queue.empty():
+                with self._partial_lock:
+                    if self._pending_partial is None and seg_id not in self._committed_seg_ids:
+                        self._pending_partial = partial_job
+                self._draft_wakeup.wait(timeout=0.15)
+                self._draft_wakeup.clear()
+                continue
+
+            # Adaptive throttle based strictly on DRAFT latency (never polluted by Hy-MT2 final latency!)
+            if last_draft_mt_ms > 2800.0:
+                continue
+
+            draft_src = self._trim_dangling_tail_for_draft(partial_job["source_text"])
+            key = (draft_src, partial_job["source_lang"], partial_job["target_lang"])
+            if not draft_src or key == last_partial_key:
+                continue
+
+            wc_now = (
+                max(len(draft_src.split()), len(draft_src) // 4)
+                if partial_job["source_lang"].startswith(_NON_SPACED_SCRIPT_PREFIXES)
+                else len(draft_src.split())
+            )
+            now = time.perf_counter()
+            same_seg = seg_id == last_partial_seg_id
+            elapsed_s = now - last_partial_time
+
+            # YouTube-style immediate first draft (0ms wait once >=2 words arrive on a brand-new sentence!)
+            # Subsequent updates on the same sentence stream smoothly every ~0.35s (0.65s in Eco).
+            base_debounce = 0.65 if cfg.eco_mode else 0.35
+            if last_draft_mt_ms > 550.0:
+                base_debounce = max(base_debounce, (last_draft_mt_ms / 1000.0) * 0.9)
+
+            if not same_seg:
+                min_first_wc = 2 if partial_job["source_lang"].startswith(_NON_SPACED_SCRIPT_PREFIXES) else 3
+                need_wait = wc_now < min_first_wc and elapsed_s < 0.55
+            else:
+                min_delta = 2 if cfg.eco_mode else 1
+                need_wait = elapsed_s < base_debounce or (
+                    (wc_now - last_partial_wc) < min_delta and elapsed_s < 0.85
+                )
+
+            if need_wait:
+                with self._partial_lock:
+                    if self._pending_partial is None and seg_id not in self._committed_seg_ids:
+                        self._pending_partial = partial_job
+                self._draft_wakeup.wait(timeout=0.10)
+                self._draft_wakeup.clear()
+                continue
+
+            try:
+                r = self.translate_text(
+                    draft_src,
+                    partial_job["source_lang"],
+                    partial_job["target_lang"],
+                    mt_mode=cfg.mt_mode,
+                    beam_size=1,
+                    llm_url=cfg.llm_url,
+                    llm_model=cfg.llm_model,
+                    llm_api_key=cfg.llm_api_key,
+                    context=list(self._recent_context),
+                    is_draft=True,
+                )
+
+                last_partial_time = time.perf_counter()
+                last_partial_key = key
+                last_partial_seg_id = seg_id
+                last_partial_wc = wc_now
+                last_draft_mt_ms = r.latency_ms
+
+                # Guard against race: if this segment committed while EnViT5 was running, drop stale draft
+                with self._partial_lock:
+                    if seg_id in self._committed_seg_ids:
+                        continue
+
+                stable_text, unstable_text, stabilized = self._stable_prefix.update(
+                    seg_id, partial_job["target_lang"], r.translated_text
+                )
+                self.broadcast_threadsafe(
+                    {
+                        "type": "partial_mt",
+                        "data": {
+                            "id": seg_id,
+                            "translated_text": stabilized,
+                            "stable_text": stable_text,
+                            "unstable_text": unstable_text,
+                            "source_lang": partial_job["source_lang"],
+                            "target_lang": partial_job["target_lang"],
+                            "mt_ms": round(r.latency_ms, 1),
+                            "mt_engine": r.engine,
+                        },
+                    }
+                )
+            except Exception:
+                pass
 
     def simulate_demo(
         self,
