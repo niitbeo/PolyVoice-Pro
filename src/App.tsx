@@ -1669,9 +1669,25 @@ export default function App() {
 
   const latestItem = history[0] || null;
   const isDraft = Boolean(partial);
-  const spotSource = partial ? partial.source_text : latestItem?.source_text || "";
-  const spotTarget = partial ? partial.translated_text : latestItem?.translated_text || "";
-  const spotPendingDraft = isDraft && !spotTarget;
+  const partialHasMt = Boolean(
+    partial && (partial.translated_text || partial.stable_text || partial.unstable_text)
+  );
+  // Atomic EN <-> VI pairing: hold BOTH previous source & translation during the ~150ms gap
+  // before the next sentence's first live draft translation arrives (zero mismatched pairing & zero flash!)
+  const holdPrevAtomic = Boolean(
+    isDraft && !partialHasMt && translatePartials && latestItem?.translated_text
+  );
+  const spotSource = holdPrevAtomic
+    ? latestItem?.source_text || ""
+    : partial
+    ? partial.source_text
+    : latestItem?.source_text || "";
+  const spotTarget = holdPrevAtomic
+    ? ""
+    : partial
+    ? partial.translated_text
+    : latestItem?.translated_text || "";
+  const spotPendingDraft = isDraft && !partialHasMt;
   const spotAsrMs = partial ? partial.asr_ms : latestItem?.asr_ms ?? 0;
   const spotMtMs = partial ? partial.mt_ms : latestItem?.mt_ms ?? 0;
   const litBars = Math.round(level * VU_BARS);
@@ -2863,19 +2879,19 @@ export default function App() {
               </div>
             </div>
 
-            {isDraft && latestItem && latestItem.translated_text && (
-              <div className="spot-prev-anchor" aria-label="Câu vừa hoàn tất">
-                <span className="spot-prev-tag">Vừa xong</span>
-                <span className="spot-prev-text">{latestItem.translated_text}</span>
-              </div>
-            )}
-
             <div className={`spot-source ${isDraft ? "draft" : ""}`}>
               {spotSource ? (
-                <>
-                  {spotSource}
-                  {isDraft && <span className="live-caret src" aria-hidden="true" />}
-                </>
+                holdPrevAtomic ? (
+                  <span className="spot-prev-hold">
+                    {spotSource}
+                    <span className="live-caret src" aria-hidden="true" />
+                  </span>
+                ) : (
+                  <>
+                    {spotSource}
+                    {isDraft && <span className="live-caret src" aria-hidden="true" />}
+                  </>
+                )
               ) : (
                 <span className="spot-empty">
                   Chọn <b>Ngôn ngữ nói</b> rồi bấm <b>Bắt đầu dịch</b> — hỗ trợ thu trực tiếp <b>Micro</b>, <b>YouTube</b> hoặc họp <b>2 Chiều</b>.
@@ -2904,6 +2920,11 @@ export default function App() {
                     {isDraft && <span className="live-caret" aria-hidden="true" />}
                   </>
                 )
+              ) : holdPrevAtomic && latestItem?.translated_text ? (
+                <span className="spot-prev-hold">
+                  {latestItem.translated_text}
+                  <span className="live-caret" aria-hidden="true" />
+                </span>
               ) : spotPendingDraft ? (
                 <span className="spot-translating subtle" aria-label="Đang dịch trực tiếp">
                   <span className="live-dots" aria-hidden="true">
@@ -2911,7 +2932,6 @@ export default function App() {
                     <span />
                     <span />
                   </span>
-                  <span className="spot-translating-label">Đang dịch trực tiếp...</span>
                 </span>
               ) : (
                 <span className="spot-empty">

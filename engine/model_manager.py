@@ -260,7 +260,17 @@ class ModelManager:
 
     @property
     def silero_vad_path(self) -> Path:
+        for candidate in (
+            self.whisper_turbo_dir / "silero_vad_v5.onnx",
+            self.moonshine_en_dir / "silero_vad_v5.onnx",
+            self.models_dir / "silero_vad_v5.onnx",
+        ):
+            if _file_ok(candidate, 500_000):
+                return candidate
         return self.whisper_turbo_dir / "silero_vad_v5.onnx"
+
+    def is_silero_vad_ready(self) -> bool:
+        return _file_ok(self.silero_vad_path, 500_000)
 
     @property
     def opus_vi_en_dir(self) -> Path:
@@ -924,10 +934,11 @@ class ModelManager:
             url=MOONSHINE_EN_URL,
             dirname=MOONSHINE_EN_DIRNAME,
             dest_dir=self.moonshine_en_dir,
-            expected_mb=106.0,
-            start_msg="Đang tải Moonshine-v2 Base Tiếng Anh (~106 MB • 1.8% WER)...",
+            expected_mb=108.0,
+            start_msg="Đang tải Moonshine-v2 Base Tiếng Anh + Silero VAD (~108 MB • 1.8% WER)...",
             ready_msg="Sẵn sàng (Moonshine-v2 EN • 1.8% WER • Dấu câu • 44× RT)",
             on_progress=on_progress,
+            extra_files=[("silero_vad_v5.onnx", SILERO_VAD_URL, 2_313_101)],
         )
 
     def ensure_whisper_turbo(self, on_progress: Optional[Callable[[dict], None]] = None) -> Path:

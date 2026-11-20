@@ -79,6 +79,7 @@ from pydantic import BaseModel
 
 from asr_engine import (
     ASROutput,
+    HybridEnStreamingEngine,
     MoonshineEnStreamingEngine,
     MoonshineV2EnRefiner,
     VietASRBatchRefiner,
@@ -475,6 +476,8 @@ class EngineRuntime:
 
         self._asr_zf_vi: Optional[ZipformerStreamingViEngine] = None
         self._asr_zf_en: Optional[ZipformerStreamingEnEngine] = None
+        self._asr_hybrid_en: Optional[HybridEnStreamingEngine] = None
+        self._asr_hybrid_en_remote: Optional[HybridEnStreamingEngine] = None
         self._asr_moonshine_en: Optional[MoonshineEnStreamingEngine] = None
         self._asr_moonshine_en_remote: Optional[MoonshineEnStreamingEngine] = None
         self._asr_viet: Optional[VietASRStreamingEngine] = None
@@ -545,6 +548,7 @@ class EngineRuntime:
         self._active_group_langs: tuple[str, str] = ("", "")
         self._active_group_speaker: str = ""
         self._recent_context: deque[tuple[str, str]] = deque(maxlen=2)
+        self._post_pass2_carry: dict[tuple[str, str], str] = {}
 
         self._current_segment_id: str = ""
         self._last_level_emit = 0.0
@@ -880,6 +884,29 @@ class EngineRuntime:
                         hotwords=self._get_glossary_hotwords(),
                     )
                 return self._asr_zf_vi
+
+            if engine_name == "hybrid-en":
+                if not self.model_manager.is_moonshine_en_ready():
+                    raise RuntimeError("Model tiếng Anh Moonshine-v2 chưa được tải.")
+                use_remote_slot = remote and self._active_asr_label == "hybrid-en"
+                slot = self._asr_hybrid_en_remote if use_remote_slot else self._asr_hybrid_en
+                if slot is None:
+                    if self._en_pass2_refiner is None:
+                        self._en_pass2_refiner = MoonshineV2EnRefiner(
+                            self.model_manager.moonshine_en_dir,
+                            sample_rate=SAMPLE_RATE,
+                            num_threads=_adaptive_mt_threads(),
+                        )
+                    slot = HybridEnStreamingEngine(
+                        self._en_pass2_refiner,
+                        self.model_manager.silero_vad_path,
+                        sample_rate=SAMPLE_RATE,
+                    )
+                    if use_remote_slot:
+                        self._asr_hybrid_en_remote = slot
+                    else:
+                        self._asr_hybrid_en = slot
+                return slot
 
             if engine_name == "moonshine-en":
                 if not self.model_manager.is_moonshine_en_ready():
@@ -1313,16 +1340,18 @@ class EngineRuntime:
             return "viet-asr"
 
         if lang_code == "eng_Latn":
-            # Moonshine-v2 sliding-window streaming: ~99% acc, built-in punctuation, clean sentence boundaries!
-            if self.model_manager.is_moonshine_en_ready():
-                return "moonshine-en"
+            # v0.9.1 Zero-Overlap Silero VAD v5 + Moonshine-v2 (0% duplicates, 0 mid-word cuts, 1.8% WER previews!)
+            if self.model_manager.is_moonshine_en_ready() and self.model_manager.is_silero_vad_ready():
+                return "hybrid-en"
             if self.model_manager.is_zipformer_en_20m_ready():
                 return "zipformer-en-20m"
+            if self.model_manager.is_moonshine_en_ready():
+                return "moonshine-en"
             if self.model_manager.is_whisper_turbo_ready():
                 return "whisper-turbo"
             if self.mac_helper is not None:
                 return "apple-native"
-            raise RuntimeError("Chưa có model nhận dạng tiếng Anh (hãy tải Moonshine-v2 EN hoặc Zipformer-20M EN).")
+            raise RuntimeError("Chưa có model nhận dạng tiếng Anh (hãy tải Zipformer-20M EN hoặc Moonshine-v2 EN).")
 
         # For Lao, Thai, Japanese, Chinese, Korean, Khmer, French, German, etc.:
         # Prefer cross-platform Whisper Large-v3-Turbo + Silero VAD v5 when downloaded (100% offline Win & Mac, incl. Lao!)
@@ -1355,7 +1384,7 @@ class EngineRuntime:
             "listening": self._listening,
             "active_asr_label": self._active_asr_label,
             "remote_asr_label": self._remote_asr_label,
-            "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_whisper is not None),
+            "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_en is not None) or (self._asr_hybrid_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_whisper is not None),
             "pass2_loaded": self._pass2_refiner is not None,
             "hotwords_active": self._asr_zf_vi._hotwords_count if self._asr_zf_vi is not None else 0,
             "zipformer_ready": self.model_manager.is_zipformer_streaming_ready(),
@@ -1414,6 +1443,8 @@ class EngineRuntime:
                 self._opus_ev = None
             elif model_id == "moonshine-en":
                 self._en_pass2_refiner = None
+                self._asr_hybrid_en = None
+                self._asr_hybrid_en_remote = None
                 self._asr_moonshine_en = None
                 self._asr_moonshine_en_remote = None
             elif model_id == "whisper-turbo":
@@ -1425,10 +1456,14 @@ class EngineRuntime:
                             pass
                 self._asr_whisper = None
                 self._asr_whisper_remote = None
+                self._asr_hybrid_en = None
+                self._asr_hybrid_en_remote = None
             elif model_id == "zipformer-30m-streaming":
                 self._asr_zf_vi = None
             elif model_id == "zipformer-en-20m":
                 self._asr_zf_en = None
+                self._asr_hybrid_en = None
+                self._asr_hybrid_en_remote = None
             elif model_id == "viet-asr":
                 self._asr_viet = None
                 self._pass2_refiner = None
@@ -1548,10 +1583,16 @@ class EngineRuntime:
         if self.config.audio_source == "mix" and chosen_asr == "apple-native":
             if self.config.source_lang == "vie_Latn" and self.model_manager.is_zipformer_streaming_ready():
                 chosen_asr = "zipformer-30m-streaming"
-            elif self.config.source_lang == "eng_Latn" and self.model_manager.is_moonshine_en_ready():
-                chosen_asr = "moonshine-en"
+            elif (
+                self.config.source_lang == "eng_Latn"
+                and self.model_manager.is_moonshine_en_ready()
+                and self.model_manager.is_silero_vad_ready()
+            ):
+                chosen_asr = "hybrid-en"
             elif self.config.source_lang == "eng_Latn" and self.model_manager.is_zipformer_en_20m_ready():
                 chosen_asr = "zipformer-en-20m"
+            elif self.config.source_lang == "eng_Latn" and self.model_manager.is_moonshine_en_ready():
+                chosen_asr = "moonshine-en"
             elif self.model_manager.is_whisper_turbo_ready():
                 chosen_asr = "whisper-turbo"
         self._active_asr_label = chosen_asr
@@ -1643,6 +1684,7 @@ class EngineRuntime:
             self._active_group_langs = ("", "")
             self._active_group_speaker = ""
         self._recent_context.clear()
+        self._post_pass2_carry.clear()
         self.glossary.clear_session_entities()
 
         self._current_segment_id = uuid.uuid4().hex[:10]
@@ -1935,6 +1977,8 @@ class EngineRuntime:
             self._asr_viet = None
             self._asr_zf_vi = None
             self._asr_zf_en = None
+            self._asr_hybrid_en = None
+            self._asr_hybrid_en_remote = None
             self._asr_moonshine_en = None
             self._asr_moonshine_en_remote = None
             self._asr_whisper = None
@@ -2014,6 +2058,7 @@ class EngineRuntime:
             self._active_group_last_ts = 0.0
             self._active_group_langs = ("", "")
         self._recent_context.clear()
+        self._post_pass2_carry.clear()
         self.glossary.clear_session_entities()
         self.broadcast_threadsafe({"type": "history", "data": []})
 
@@ -2250,20 +2295,96 @@ class EngineRuntime:
         trimmed = " ".join(words[:cut]).rstrip(" ,;:-")
         return trimmed if trimmed else text.strip()
 
-    def _paragraph_thresholds(self) -> tuple[int, int, float]:
+    def _paragraph_thresholds(self, src_lang: Optional[str] = None) -> tuple[int, int, float]:
         """
         Conference Semantic Sentence Commit thresholds (Backend Translation Unit):
-        Commit clean semantic clauses (12-28 words) so Pass-2 & MT operate at peak
-        accuracy and comfortable reading pace, while UI merges sentences into paragraphs.
+        Commit crisp YouTube-paced clauses so Pass-2 & MT run fast (~550-850ms) and smoothly,
+        while UI merges consecutive sentences into clean paragraphs.
         """
         mode = self.config.paragraph_mode
+        lang = src_lang or self.config.source_lang
+        if lang == "eng_Latn":
+            if mode == "short":
+                return (5, 11, 0.78)
+            if mode == "medium":
+                return (7, 15, 0.92)
+            # Crisp 8-18 word YouTube-paced English clauses (4-7.5s); UI groups 3-4 into paragraphs
+            return (8, 18, 1.05)
         if mode == "short":
             return (7, 15, 0.95)
         if mode == "medium":
             return (10, 22, 1.15)
-        # Default "long": commit natural conference clauses (~12-28 words, 1.35s pause);
-        # breath-pause soft commit catches 0.45s pauses cleanly once >= 12 words are spoken.
         return (12, 28, 1.35)
+
+    @staticmethod
+    def _apply_post_pass2_carry(text: str, prev_carry: str, allow_peel: bool = True) -> tuple[str, str]:
+        """
+        Text-Only Dangling-Tail Carry-Over after English Pass-2 Moonshine-v2:
+        1. Prepends `prev_carry` cleanly (deduplicating 1-2 overlapping seam words).
+        2. Peels off trailing dangling clause openers AFTER a sentence period (e.g.
+           '...naturally over time. And to' -> head='...naturally over time.', carry='And to')
+           OR trailing unfinished connectors ('...my 3000 most' -> carry='most') so zero
+           words are cut across segment boundaries and ZERO audio is ever duplicated!
+        """
+        s = (text or "").strip()
+        if prev_carry:
+            c_toks = prev_carry.strip().split()
+            s_toks = s.split()
+            if c_toks and s_toks:
+                norm = lambda w: re.sub(r"[^a-z0-9']+", "", w.lower())
+                # Deduplicate 1-2 overlapping words at the seam ("And to" + "to build" -> "And to build")
+                overlap = 0
+                for k in (2, 1):
+                    if len(c_toks) >= k and len(s_toks) >= k:
+                        if [norm(w) for w in c_toks[-k:]] == [norm(w) for w in s_toks[:k]]:
+                            overlap = k
+                            break
+                # Keep lowercase join if prev_carry didn't end a sentence
+                tail_toks = s_toks[overlap:]
+                if tail_toks and not prev_carry.endswith((".", "!", "?")) and tail_toks[0][0].isupper():
+                    w0 = tail_toks[0]
+                    if len(w0) > 1 and w0[1:].islower() and w0 not in {"I", "I'm", "I've", "I'll", "I'd", "English"}:
+                        tail_toks[0] = w0[0].lower() + w0[1:]
+                s = " ".join(c_toks + tail_toks).strip()
+            elif c_toks:
+                s = prev_carry.strip()
+
+        words = s.split()
+        if not allow_peel or len(words) < 6:
+            return s, ""
+
+        # Case 1: Complete sentence ending in .?! followed by 1..4 short unpunctuated trailing words
+        # e.g. "...over time. And to" / "...Let's get started. If you" / "...in English. Today,"
+        for i in range(len(words) - 1, max(3, len(words) - 5), -1):
+            if words[i - 1].endswith((".", "!", "?")) and not words[-1].endswith((".", "!", "?")):
+                tail_words = words[i:]
+                if 1 <= len(tail_words) <= 4:
+                    head = " ".join(words[:i]).strip()
+                    carry = " ".join(tail_words).strip()
+                    return head, carry
+
+        # Case 2: Unpunctuated tail ending on a clear dangling English connector / determiner / auxiliary
+        if not words[-1].endswith((".", "!", "?")):
+            dangling = {
+                "and", "or", "but", "so", "to", "for", "of", "in", "on", "at", "by", "from",
+                "with", "about", "into", "if", "when", "while", "because", "that", "which",
+                "the", "a", "an", "my", "your", "our", "their", "this", "these", "those",
+                "most", "more", "very", "can", "could", "will", "would", "should", "between",
+            }
+            cut = len(words)
+            while cut > 5 and (len(words) - cut) < 3:
+                w_low = re.sub(r"[^a-z']+", "", words[cut - 1].lower())
+                if w_low in dangling:
+                    cut -= 1
+                else:
+                    break
+            if cut < len(words):
+                head = " ".join(words[:cut]).rstrip(" ,;")
+                carry = " ".join(words[cut:]).strip()
+                if head and carry:
+                    return head, carry
+
+        return s, ""
 
     def _visual_paragraph_limits(self) -> tuple[int, float]:
         """Display grouping budget (max_words_per_paragraph, max_gap_seconds) by paragraph_mode."""
@@ -2302,7 +2423,7 @@ class EngineRuntime:
             self._active_group_last_ts = now
             return self._active_group_id
 
-    def _flush_paragraph_locked(self, allow_carry_over: bool = False) -> None:
+    def _flush_paragraph_locked(self, allow_carry_over: bool = False, is_stop_flush: bool = False) -> None:
         if not self._para_parts:
             return
         raw_text = self._join_fragments(self._para_parts, preserve_case=self._get_capitalized_glossary_words())
@@ -2383,6 +2504,7 @@ class EngineRuntime:
                 "asr_ms": asr_ms,
                 "pcm": pcm_snapshot,
                 "speaker": speaker_tag,
+                "is_stop_flush": is_stop_flush,
                 "timestamp": time.strftime("%H:%M:%S"),
             }
         )
@@ -2402,9 +2524,9 @@ class EngineRuntime:
             )
         self._mt_wakeup.set()
 
-    def _flush_paragraph_now(self) -> None:
+    def _flush_paragraph_now(self, is_stop_flush: bool = True) -> None:
         with self._para_lock:
-            self._flush_paragraph_locked(allow_carry_over=False)
+            self._flush_paragraph_locked(allow_carry_over=False, is_stop_flush=is_stop_flush)
 
     def _flush_paragraph_if_idle(self) -> None:
         _, _, pause_flush_s = self._paragraph_thresholds()
@@ -2414,7 +2536,7 @@ class EngineRuntime:
             if (time.monotonic() - self._para_last_speech_ts) >= pause_flush_s:
                 self._flush_paragraph_locked(allow_carry_over=False)
 
-    def _enqueue_asr_output(self, out: ASROutput) -> None:
+    def _enqueue_asr_output(self, out: ASROutput, is_stop_flush: bool = False) -> None:
         if out.kind == "none" or not out.text:
             return
 
@@ -2475,11 +2597,12 @@ class EngineRuntime:
                 is_sentence_asr = (
                     out.provider.startswith("whisper-turbo")
                     or out.provider == "moonshine-v2-en"
+                    or (out.provider == "hybrid-en-vad-moonshine" and len(combined.split()) >= 5)
                 )
                 is_non_spaced = src_lang.startswith(_NON_SPACED_SCRIPT_PREFIXES)
                 if is_sentence_asr:
                     # Moonshine-v2 & Whisper-Turbo already commit clean punctuated sentences -> flush immediately!
-                    self._flush_paragraph_locked(allow_carry_over=False)
+                    self._flush_paragraph_locked(allow_carry_over=False, is_stop_flush=is_stop_flush)
                     return
 
                 if is_non_spaced:
@@ -2502,7 +2625,10 @@ class EngineRuntime:
                 )
 
                 if should_commit:
-                    self._flush_paragraph_locked(allow_carry_over=not is_non_spaced)
+                    # For English with Moonshine-v2 Pass-2, keep full PCM snapshot (allow_carry_over=False)
+                    # and let Post-Pass-2 `_apply_post_pass2_carry` handle clean text-only boundary carry!
+                    pre_carry = (not is_non_spaced) and (src_lang != "eng_Latn")
+                    self._flush_paragraph_locked(allow_carry_over=pre_carry)
                 else:
                     seg_id = self._current_segment_id
                     parts_snapshot = list(self._para_parts)
@@ -2647,10 +2773,10 @@ class EngineRuntime:
         finally:
             try:
                 flushed = asr.flush_final()
-                self._enqueue_asr_output(flushed)
+                self._enqueue_asr_output(flushed, is_stop_flush=True)
             except Exception:
                 pass
-            self._flush_paragraph_now()
+            self._flush_paragraph_now(is_stop_flush=True)
 
     def _remote_flush_locked(self) -> None:
         if not self._remote_parts:
@@ -2749,6 +2875,7 @@ class EngineRuntime:
                 is_sentence_asr = (
                     out.provider.startswith("whisper-turbo")
                     or out.provider == "moonshine-v2-en"
+                    or (out.provider == "hybrid-en-vad-moonshine" and len(combined.split()) >= 5)
                 )
                 is_non_spaced = r_src.startswith(_NON_SPACED_SCRIPT_PREFIXES)
                 if is_sentence_asr:
@@ -2890,13 +3017,13 @@ class EngineRuntime:
                 cfg = self.config
                 source_text = item["source_text"]
                 speaker = item.get("speaker", "")
+                asr_label = self._remote_asr_label if speaker == "remote" else self._active_asr_label
                 pass2_ms = 0.0
 
                 # Pass-2 Async Refinement (never blocks live Pass-1 streaming):
                 # - Vietnamese: VietASRBatchRefiner (punctuation + ITN) with Glossary-Keyword Preservation Guard!
                 # - English: Moonshine-v2-Base (only when Pass-1 was NOT already Moonshine-v2 streaming!)
                 if cfg.pass2_refine and item.get("pcm") is not None:
-                    asr_label = self._remote_asr_label if speaker == "remote" else self._active_asr_label
                     if item["source_lang"] == "vie_Latn" and asr_label == "zipformer-30m-streaming":
                         try:
                             p1_fixed = self.glossary.apply_asr_fixes(source_text)
@@ -2910,7 +3037,7 @@ class EngineRuntime:
                                 source_text = refined
                         except Exception:
                             pass
-                    elif item["source_lang"] == "eng_Latn" and asr_label != "moonshine-en":
+                    elif item["source_lang"] == "eng_Latn" and asr_label not in ("moonshine-en", "hybrid-en"):
                         try:
                             en_refiner = self.ensure_en_pass2_refiner()
                             if en_refiner is not None:
@@ -2919,6 +3046,18 @@ class EngineRuntime:
                                     source_text = refined
                         except Exception:
                             pass
+
+                # Post-Pass-2 Text-Only Dangling-Tail Carry-Over for English (zero audio overlap, 0% duplicates!)
+                if item["source_lang"] == "eng_Latn" and asr_label != "moonshine-en":
+                    ckey = (speaker, item["source_lang"])
+                    prev_c = self._post_pass2_carry.pop(ckey, "")
+                    source_text, next_c = self._apply_post_pass2_carry(
+                        source_text,
+                        prev_c,
+                        allow_peel=not bool(item.get("is_stop_flush", False)),
+                    )
+                    if next_c:
+                        self._post_pass2_carry[ckey] = next_c
 
                 source_text = self._clean_verbatim(
                     self.glossary.apply_asr_fixes(source_text),
@@ -3055,9 +3194,8 @@ class EngineRuntime:
             same_seg = seg_id == last_partial_seg_id
             elapsed_s = now - last_partial_time
 
-            # YouTube-style immediate first draft (0ms wait once >=2 words arrive on a brand-new sentence!)
-            # Subsequent updates on the same sentence stream smoothly every ~0.35s (0.65s in Eco).
-            base_debounce = 0.65 if cfg.eco_mode else 0.35
+            # Calm, readable YouTube cadence: ~0.45s normal (0.75s Eco), 2-word delta on same segment
+            base_debounce = 0.75 if cfg.eco_mode else 0.45
             if last_draft_mt_ms > 550.0:
                 base_debounce = max(base_debounce, (last_draft_mt_ms / 1000.0) * 0.9)
 
@@ -3065,9 +3203,9 @@ class EngineRuntime:
                 min_first_wc = 2 if partial_job["source_lang"].startswith(_NON_SPACED_SCRIPT_PREFIXES) else 3
                 need_wait = wc_now < min_first_wc and elapsed_s < 0.55
             else:
-                min_delta = 2 if cfg.eco_mode else 1
+                min_delta = 3 if cfg.eco_mode else 2
                 need_wait = elapsed_s < base_debounce or (
-                    (wc_now - last_partial_wc) < min_delta and elapsed_s < 0.85
+                    (wc_now - last_partial_wc) < min_delta and elapsed_s < 0.95
                 )
 
             if need_wait:

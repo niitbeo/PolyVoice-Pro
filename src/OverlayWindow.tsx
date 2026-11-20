@@ -656,8 +656,12 @@ export default function OverlayWindow() {
             (() => {
               const latestFinal = entries[entries.length - 1] || null;
               const activeHasMt = Boolean(partial && (partial.translated_text || partial.stable_text || partial.unstable_text));
-              const ytSource = partial?.source_text || latestFinal?.source_text || "";
-              const ytIsLive = Boolean(partial);
+              // Atomic EN <-> VI swap: never show Sentence #2's English above Sentence #1's Vietnamese!
+              const holdPrevAtomic = Boolean(partial && !activeHasMt && latestFinal?.translated_text);
+              const ytSource = holdPrevAtomic
+                ? latestFinal?.source_text || ""
+                : partial?.source_text || latestFinal?.source_text || "";
+              const ytIsLive = Boolean(partial && activeHasMt);
               return (
                 <div className="overlay-yt-stage">
                   <div className={`overlay-yt-pill ${ytIsLive ? "live" : ""}`}>
@@ -672,7 +676,7 @@ export default function OverlayWindow() {
                       ) : latestFinal?.translated_text ? (
                         <>
                           {latestFinal.translated_text}
-                          {ytIsLive && <span className="live-caret" aria-hidden="true" />}
+                          {Boolean(partial) && <span className="live-caret" aria-hidden="true" />}
                         </>
                       ) : partial ? (
                         <span className="overlay-translating-dots">...</span>
