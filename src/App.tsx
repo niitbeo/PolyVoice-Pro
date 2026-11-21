@@ -33,6 +33,7 @@ import {
   Send,
   Settings,
   Settings2,
+  ShieldCheck,
   SlidersHorizontal,
   Smartphone,
   Sparkles,
@@ -56,9 +57,13 @@ import {
   ENGINE_HTTP,
   ENGINE_WS,
   EngineStatus,
+  EvaluationIssueType,
+  EvaluationItemResult,
+  EvaluationReport,
   FileTranslateProgress,
   FileTranslateResult,
   GlossaryData,
+  GlossarySuggestion,
   InputChannelId,
   LanguageEntry,
   MeetingSummary,
@@ -246,6 +251,19 @@ export default function App() {
   const [summaryOpen, setSummaryOpen] = useState(false);
   const [summaryBusy, setSummaryBusy] = useState(false);
   const [summaryData, setSummaryData] = useState<MeetingSummary | null>(null);
+
+  // AI Translation Quality Audit (Google Gemini / Google Cloud API)
+  const [evalOpen, setEvalOpen] = useState(false);
+  const [evalBusy, setEvalBusy] = useState(false);
+  const [evalReport, setEvalReport] = useState<EvaluationReport | null>(null);
+  const [evalError, setEvalError] = useState("");
+  const [evalMissingKey, setEvalMissingKey] = useState(false);
+  const [evalFilter, setEvalFilter] = useState<"all" | "issues">("all");
+  const [itemEvals, setItemEvals] = useState<Record<string, EvaluationItemResult>>({});
+  const [itemEvalGloss, setItemEvalGloss] = useState<Record<string, GlossarySuggestion[]>>({});
+  const [itemEvalBusyId, setItemEvalBusyId] = useState("");
+  const [appliedEvalIds, setAppliedEvalIds] = useState<Record<string, boolean>>({});
+  const [savedGlossKeys, setSavedGlossKeys] = useState<Record<string, boolean>>({});
 
   // Official Cloud API Modal (Google Cloud / Microsoft Azure F0 / Google Gemini + $0 Quota Cap)
   const [cloudOpen, setCloudOpen] = useState(false);
@@ -684,6 +702,7 @@ export default function App() {
         if (glossaryOpen) setGlossaryOpen(false);
         else if (qrOpen) setQrOpen(false);
         else if (summaryOpen) setSummaryOpen(false);
+        else if (evalOpen) setEvalOpen(false);
         else if (cloudOpen) setCloudOpen(false);
         else if (fileModalOpen && !fileBusy) setFileModalOpen(false);
         else if (updateModalOpen && !updateInstalling) setUpdateModalOpen(false);
@@ -706,6 +725,7 @@ export default function App() {
     glossaryOpen,
     qrOpen,
     summaryOpen,
+    evalOpen,
     cloudOpen,
     fileModalOpen,
     fileBusy,
@@ -1064,6 +1084,213 @@ export default function App() {
       setErrorMsg(`Lỗi tóm tắt cuộc họp: ${String(e)}`);
     } finally {
       setSummaryBusy(false);
+    }
+  };
+
+  const scoreToneClass = (score: number): string =>
+    score >= 85 ? "ok" : score >= 65 ? "warn" : "bad";
+
+  const issueLabelVi = (issue: EvaluationIssueType): string => {
+    if (issue === "ok") return "Chuẩn sát nghĩa";
+    if (issue === "nuance") return "Chỉnh nhẹ diễn đạt";
+    if (issue === "asr_error") return "Nghe nhầm ASR";
+    return "Dịch lệch nghĩa";
+  };
+
+  const handleEvaluateSession = async () => {
+    if (groupedHistory.length === 0) return;
+    setEvalOpen(true);
+    setEvalBusy(true);
+    setEvalError("");
+    setEvalMissingKey(false);
+    setEvalFilter("all");
+    try {
+      const payloadItems = groupedHistory
+        .slice(0, 40)
+        .reverse()
+        .map((it) => ({
+          id: it.id,
+          source_text: it.source_text,
+          translated_text: it.translated_text,
+          source_lang: it.source_lang,
+          target_lang: it.target_lang,
+          timestamp: it.timestamp,
+        }));
+      const res = await fetch(`${ENGINE_HTTP}/api/session/evaluate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "session", items: payloadItems }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data?.detail;
+        if (detail && typeof detail === "object" && detail.code === "missing_google_api_key") {
+          setEvalMissingKey(true);
+          setEvalError(detail.message || "Chưa cấu hình Google Gemini API Key.");
+        } else {
+          setEvalError(typeof detail === "string" ? detail : "Không thể đánh giá chất lượng dịch.");
+        }
+        return;
+      }
+      const rep = data as EvaluationReport;
+      setEvalReport(rep);
+      if (rep.cloud_api) {
+        setCloudStatus(rep.cloud_api);
+        setStatus((prev) => (prev ? { ...prev, cloud_api: rep.cloud_api } : prev));
+      }
+    } catch (e) {
+      setEvalError(`Lỗi kết nối đánh giá: ${String(e)}`);
+    } finally {
+      setEvalBusy(false);
+    }
+  };
+
+  const handleEvaluateSingleItem = async (item: TranscriptEntry) => {
+    setItemEvalBusyId(item.id);
+    setErrorMsg("");
+    try {
+      const res = await fetch(`${ENGINE_HTTP}/api/session/evaluate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: "item",
+          items: [
+            {
+              id: item.id,
+              source_text: item.source_text,
+              translated_text: item.translated_text,
+              source_lang: item.source_lang,
+              target_lang: item.target_lang,
+              timestamp: item.timestamp,
+            },
+          ],
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data?.detail;
+        if (detail && typeof detail === "object" && detail.code === "missing_google_api_key") {
+          setEvalMissingKey(true);
+          setEvalError(detail.message || "Chưa cấu hình Google Gemini API Key.");
+          setEvalReport(null);
+          setEvalOpen(true);
+        } else {
+          setErrorMsg(typeof detail === "string" ? detail : "Không thể đánh giá đoạn dịch này.");
+        }
+        return;
+      }
+      const rep = data as EvaluationReport;
+      const first = rep.items?.[0];
+      if (first) {
+        setItemEvals((prev) => ({ ...prev, [item.id]: first }));
+        if (rep.glossary_suggestions?.length) {
+          setItemEvalGloss((prev) => ({ ...prev, [item.id]: rep.glossary_suggestions }));
+        }
+      }
+      if (rep.cloud_api) {
+        setCloudStatus(rep.cloud_api);
+        setStatus((prev) => (prev ? { ...prev, cloud_api: rep.cloud_api } : prev));
+      }
+    } catch (e) {
+      setErrorMsg(`Lỗi đánh giá đoạn dịch: ${String(e)}`);
+    } finally {
+      setItemEvalBusyId("");
+    }
+  };
+
+  const handleApplySuggestedTranslation = async (
+    targetId: string,
+    suggestedText: string,
+    itemIds?: string[]
+  ) => {
+    const cleanText = suggestedText.trim();
+    if (!cleanText) return;
+    const matchGrp = groupedHistory.find((g) => g.id === targetId);
+    const ids = itemIds && itemIds.length > 0 ? itemIds : matchGrp?.item_ids || [targetId];
+    const idsSet = new Set([...ids, targetId]);
+
+    // Update local React state immediately (covers both live backend entries & Quick Translate local items)
+    setHistory((prev) => {
+      const matched = prev.filter(
+        (e) => idsSet.has(e.id) || (e.paragraph_id ? idsSet.has(e.paragraph_id) : false)
+      );
+      if (matched.length === 0) return prev;
+      const primaryId = matched[0].id;
+      const mergedSrc =
+        matched.length > 1
+          ? [...matched]
+              .reverse()
+              .map((m) => m.source_text)
+              .filter(Boolean)
+              .join(" ")
+              .trim()
+          : matched[0].source_text;
+      return prev
+        .filter(
+          (e) =>
+            e.id === primaryId ||
+            (!idsSet.has(e.id) && !(e.paragraph_id && idsSet.has(e.paragraph_id)))
+        )
+        .map((e) =>
+          e.id === primaryId
+            ? { ...e, source_text: mergedSrc, translated_text: cleanText }
+            : e
+        );
+    });
+
+    setAppliedEvalIds((prev) => ({ ...prev, [targetId]: true }));
+    setItemEvals((prev) =>
+      prev[targetId]
+        ? { ...prev, [targetId]: { ...prev[targetId], translated_text: cleanText, score: Math.max(prev[targetId].score, 95), issue_type: "ok" } }
+        : prev
+    );
+    setEvalReport((prev) =>
+      prev
+        ? {
+            ...prev,
+            items: prev.items.map((it) =>
+              it.id === targetId ? { ...it, translated_text: cleanText } : it
+            ),
+          }
+        : prev
+    );
+
+    try {
+      await fetch(`${ENGINE_HTTP}/api/history/update`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: targetId,
+          item_ids: ids,
+          translated_text: cleanText,
+        }),
+      });
+    } catch {
+      // local state already updated
+    }
+  };
+
+  const handleQuickAddGlossaryFix = async (wrong: string, correct: string) => {
+    const w = wrong.trim();
+    const c = correct.trim();
+    if (!w || !c) return;
+    try {
+      let cur = glossary;
+      if (!cur) {
+        const res = await fetch(`${ENGINE_HTTP}/api/glossary`);
+        if (res.ok) {
+          cur = await res.json();
+          setGlossary(cur);
+        }
+      }
+      const existing = cur?.asr_fixes || [];
+      const already = existing.some((r) => r.wrong.toLowerCase() === w.toLowerCase());
+      if (!already) {
+        await updateGlossaryRemote({ asr_fixes: [...existing, { wrong: w, correct: c }] });
+      }
+      setSavedGlossKeys((prev) => ({ ...prev, [w.toLowerCase()]: true }));
+    } catch (e) {
+      setErrorMsg(`Không thể thêm vào Từ điển: ${String(e)}`);
     }
   };
 
@@ -2998,6 +3225,14 @@ export default function App() {
               </div>
               <div className="history-head-actions">
                 <button
+                  className="btn sm eval-trigger-btn"
+                  onClick={handleEvaluateSession}
+                  disabled={!connected || history.length === 0 || evalBusy}
+                  title="Dùng Google Gemini API đánh giá độ chính xác ngữ nghĩa toàn phiên dịch & gợi ý bản sửa"
+                >
+                  {evalBusy ? <Loader2 size={12} className="spin" /> : <ShieldCheck size={12} />} Đánh giá
+                </button>
+                <button
                   className="btn sm active"
                   onClick={handleSummarizeMeeting}
                   disabled={!connected || history.length === 0}
@@ -3033,6 +3268,10 @@ export default function App() {
                   className="btn sm icon-only"
                   onClick={() => {
                     setHistory([]);
+                    setItemEvals({});
+                    setItemEvalGloss({});
+                    setEvalReport(null);
+                    setAppliedEvalIds({});
                     fetch(`${ENGINE_HTTP}/api/history/clear`, { method: "POST" }).catch(() => {});
                   }}
                   disabled={history.length === 0}
@@ -3062,6 +3301,14 @@ export default function App() {
                   ]
                     .filter(Boolean)
                     .join(" • ");
+                  const itemEv = itemEvals[item.id];
+                  const itemGl = itemEvalGloss[item.id] || [];
+                  const hasDiffSuggest = Boolean(
+                    itemEv &&
+                      itemEv.suggested_translation &&
+                      itemEv.suggested_translation.trim().toLowerCase() !==
+                        (item.translated_text || "").trim().toLowerCase()
+                  );
 
                   return (
                     <div
@@ -3087,6 +3334,18 @@ export default function App() {
                         </span>
                         <div className="row" style={{ gap: 4 }}>
                           <button
+                            className={`btn sm icon-only ${itemEv ? "active" : ""}`}
+                            onClick={() => handleEvaluateSingleItem(item)}
+                            disabled={!connected || itemEvalBusyId === item.id}
+                            title="Đánh giá độ chính xác ngữ nghĩa đoạn này bằng Google API"
+                          >
+                            {itemEvalBusyId === item.id ? (
+                              <Loader2 size={11.5} className="spin" />
+                            ) : (
+                              <ShieldCheck size={11.5} />
+                            )}
+                          </button>
+                          <button
                             className="btn sm icon-only"
                             onClick={() => speakOfflineTTS(item.translated_text, item.target_lang)}
                             title="Đọc bản dịch"
@@ -3104,6 +3363,73 @@ export default function App() {
                       </div>
                       <div className="history-vi">{item.source_text}</div>
                       <div className="history-tr">{item.translated_text || "—"}</div>
+
+                      {itemEv && (
+                        <div className="eval-inline-card">
+                          <div className="eval-inline-head">
+                            <div className="row" style={{ gap: 6 }}>
+                              <span className={`eval-issue-pill ${itemEv.issue_type}`}>
+                                <ShieldCheck size={11} /> {itemEv.score}% • {issueLabelVi(itemEv.issue_type)}
+                              </span>
+                            </div>
+                            <button
+                              className="btn sm icon-only"
+                              style={{ width: 20, height: 20, minWidth: 20, padding: 2 }}
+                              onClick={() =>
+                                setItemEvals((prev) => {
+                                  const next = { ...prev };
+                                  delete next[item.id];
+                                  return next;
+                                })
+                              }
+                              title="Ẩn nhận xét"
+                            >
+                              <X size={11} />
+                            </button>
+                          </div>
+                          <div className="eval-comment">{itemEv.comment_vi}</div>
+                          {hasDiffSuggest && (
+                            <div className="eval-suggest-box">
+                              <div className="eval-suggest-text">
+                                Gợi ý chuẩn: {itemEv.suggested_translation}
+                              </div>
+                              <button
+                                className="btn sm primary"
+                                style={{ flexShrink: 0 }}
+                                onClick={() =>
+                                  handleApplySuggestedTranslation(
+                                    item.id,
+                                    itemEv.suggested_translation,
+                                    item.item_ids
+                                  )
+                                }
+                              >
+                                <Check size={11} /> Áp dụng
+                              </button>
+                            </div>
+                          )}
+                          {itemGl.length > 0 && (
+                            <div className="eval-glossary-chips" style={{ marginTop: 2 }}>
+                              {itemGl.map((g, gi) => {
+                                const saved = Boolean(savedGlossKeys[g.wrong.toLowerCase()]);
+                                return (
+                                  <span className="eval-glossary-chip" key={`ig-${gi}`}>
+                                    <del>{g.wrong}</del> → <strong>{g.correct}</strong>
+                                    <button
+                                      className="btn sm"
+                                      style={{ padding: "1px 6px", fontSize: 10.5 }}
+                                      disabled={saved}
+                                      onClick={() => handleQuickAddGlossaryFix(g.wrong, g.correct)}
+                                    >
+                                      {saved ? "✓ Đã lưu" : "+ Từ điển"}
+                                    </button>
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })
@@ -3710,6 +4036,236 @@ export default function App() {
                   </button>
                 )}
                 <button className="btn primary sm" onClick={() => setSummaryOpen(false)}>
+                  Đóng
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* AI Translation Quality Evaluation Modal (Google Gemini / Google Cloud Audit) */}
+      {evalOpen && (
+        <div className="modal-backdrop" onClick={() => !evalBusy && setEvalOpen(false)}>
+          <div className="modal-card" style={{ width: "min(840px, 100%)" }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="row" style={{ gap: 8 }}>
+                <ShieldCheck size={18} color="var(--info-text)" />
+                <div>
+                  <div className="modal-title">Đánh Giá Chất Lượng Dịch &amp; Chính Xác Ngữ Nghĩa (Google AI)</div>
+                  <div className="modal-sub">
+                    {evalReport
+                      ? `Kiểm định qua ${evalReport.provider} • ${evalReport.items.length} đoạn • ${(evalReport.latency_ms / 1000).toFixed(1)}s`
+                      : "Phân tích sát nghĩa, phát hiện lỗi dịch thuật (MT) vs lỗi nghe nhầm (ASR) & đề xuất câu sửa chuẩn"}
+                  </div>
+                </div>
+              </div>
+              <button className="btn sm icon-only" disabled={evalBusy} onClick={() => setEvalOpen(false)} title="Đóng">
+                <X size={14} />
+              </button>
+            </div>
+
+            <div className="modal-body-pad" style={{ overflowY: "auto", maxHeight: 520 }}>
+              {evalBusy ? (
+                <div style={{ padding: 36, textAlign: "center", color: "var(--text-2)" }}>
+                  <Loader2 size={24} className="spin" style={{ marginBottom: 10, color: "var(--info-text)" }} />
+                  <div style={{ fontWeight: 600, color: "var(--text-0)" }}>
+                    Google AI đang kiểm định ngữ nghĩa toàn bộ cuộc dịch...
+                  </div>
+                  <div style={{ fontSize: 12, marginTop: 4 }}>
+                    Đang đối chiếu câu gốc, ngữ cảnh và kiểm tra lỗi nhận dạng giọng nói (ASR)
+                  </div>
+                </div>
+              ) : evalError ? (
+                <div className="cloud-test-box err" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  <div style={{ fontWeight: 700 }}>{evalError}</div>
+                  {evalMissingKey && (
+                    <div>
+                      <button
+                        className="btn primary sm"
+                        onClick={() => {
+                          setEvalOpen(false);
+                          handleOpenCloudModal("gemini");
+                        }}
+                      >
+                        <Settings size={12} /> Mở cài đặt Google Gemini API Key
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ) : evalReport ? (() => {
+                const issuesCount = evalReport.items.filter((x) => x.score < 85 || x.issue_type !== "ok").length;
+                const shownItems =
+                  evalFilter === "issues"
+                    ? evalReport.items.filter((x) => x.score < 85 || x.issue_type !== "ok")
+                    : evalReport.items;
+                return (
+                  <div className="summary-body">
+                    <div className="eval-score-hero">
+                      <div className={`eval-score-ring ${scoreToneClass(evalReport.overall_score)}`}>
+                        <span className="eval-score-num">{evalReport.overall_score}%</span>
+                        <span className="eval-score-sub">ĐIỂM TỔNG</span>
+                      </div>
+                      <div>
+                        <div className="eval-verdict">{evalReport.verdict}</div>
+                        <div className="eval-summary-txt">{evalReport.summary_vi}</div>
+                      </div>
+                    </div>
+
+                    <div className="eval-bars">
+                      {(
+                        [
+                          ["Chính xác ngữ nghĩa", evalReport.semantic_score],
+                          ["Tự nhiên & ngữ cảnh", evalReport.fluency_score],
+                          ["Đầu vào nghe (ASR)", evalReport.asr_score],
+                        ] as const
+                      ).map(([lbl, val]) => (
+                        <div className="eval-bar-item" key={lbl}>
+                          <div className="eval-bar-top">
+                            <span>{lbl}</span>
+                            <b>{val}%</b>
+                          </div>
+                          <div className="eval-bar-track">
+                            <div
+                              className={`eval-bar-fill ${scoreToneClass(val)}`}
+                              style={{ width: `${Math.max(4, Math.min(100, val))}%` }}
+                            />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {evalReport.glossary_suggestions.length > 0 && (
+                      <div className="eval-glossary-wrap">
+                        <div className="glossary-col-title" style={{ margin: 0 }}>
+                          Gợi ý thêm vào Từ điển (sửa lỗi nghe nhầm ASR tự động cho lần sau)
+                        </div>
+                        <div className="eval-glossary-chips">
+                          {evalReport.glossary_suggestions.map((g, idx) => {
+                            const saved = Boolean(savedGlossKeys[g.wrong.toLowerCase()]);
+                            return (
+                              <span className="eval-glossary-chip" key={`gl-${idx}`}>
+                                <del>{g.wrong}</del> → <strong>{g.correct}</strong>
+                                <button
+                                  className="btn sm"
+                                  style={{ padding: "2px 7px", fontSize: 11 }}
+                                  disabled={saved}
+                                  onClick={() => handleQuickAddGlossaryFix(g.wrong, g.correct)}
+                                >
+                                  {saved ? "✓ Đã lưu" : "+ Thêm Từ điển"}
+                                </button>
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="eval-filter-row">
+                      <div className="row" style={{ gap: 6 }}>
+                        <button
+                          className={`btn sm ${evalFilter === "all" ? "primary" : ""}`}
+                          onClick={() => setEvalFilter("all")}
+                        >
+                          Tất cả ({evalReport.items.length})
+                        </button>
+                        <button
+                          className={`btn sm ${evalFilter === "issues" ? "primary" : ""}`}
+                          onClick={() => setEvalFilter("issues")}
+                        >
+                          Cần chú ý / Sửa ({issuesCount})
+                        </button>
+                      </div>
+                      <span style={{ fontSize: 11.5, color: "var(--text-2)" }}>
+                        Đã dùng {evalReport.chars_used.toLocaleString("vi-VN")} ký tự quota
+                      </span>
+                    </div>
+
+                    {shownItems.length === 0 ? (
+                      <div className="history-item" style={{ color: "var(--green-text)", fontSize: 13 }}>
+                        ✓ Toàn bộ các đoạn trong phiên đều đạt mức chuẩn xác cao (&ge; 85%)!
+                      </div>
+                    ) : (
+                      shownItems.map((evIt) => {
+                        const isApplied = Boolean(appliedEvalIds[evIt.id]);
+                        const diffSuggest =
+                          evIt.suggested_translation.trim().toLowerCase() !==
+                          evIt.translated_text.trim().toLowerCase();
+                        return (
+                          <div className="history-item" key={`ev-${evIt.id}`}>
+                            <div className="history-meta">
+                              <span>{evIt.timestamp || "—"}</span>
+                              <span className={`eval-issue-pill ${evIt.issue_type}`}>
+                                {evIt.score}% • {issueLabelVi(evIt.issue_type)}
+                              </span>
+                            </div>
+                            <div className="history-vi">{evIt.source_text}</div>
+                            <div className="history-tr" style={{ fontSize: 13.5 }}>
+                              {evIt.translated_text}
+                            </div>
+                            <div className="eval-comment" style={{ fontSize: 12 }}>
+                              {evIt.comment_vi}
+                            </div>
+                            {diffSuggest && (
+                              <div className="eval-suggest-box">
+                                <div className="eval-suggest-text">
+                                  Đề xuất chuẩn: {evIt.suggested_translation}
+                                </div>
+                                <button
+                                  className={`btn sm ${isApplied ? "" : "primary"}`}
+                                  style={{ flexShrink: 0 }}
+                                  disabled={isApplied}
+                                  onClick={() =>
+                                    handleApplySuggestedTranslation(evIt.id, evIt.suggested_translation)
+                                  }
+                                >
+                                  <Check size={11} /> {isApplied ? "Đã áp dụng" : "Áp dụng bản sửa"}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                );
+              })() : null}
+            </div>
+
+            <div className="modal-foot">
+              <div className="row" style={{ gap: 6 }}>
+                <button
+                  className="btn sm"
+                  disabled={evalBusy || groupedHistory.length === 0}
+                  onClick={handleEvaluateSession}
+                >
+                  <RefreshCw size={12} /> Chấm lại
+                </button>
+              </div>
+              <div className="row" style={{ gap: 6 }}>
+                {evalReport && (
+                  <button
+                    className="btn sm"
+                    onClick={() => {
+                      const md = [
+                        `# Báo cáo Đánh giá Chất lượng Dịch (${evalReport.overall_score}% — ${evalReport.verdict})`,
+                        `Engine kiểm định: ${evalReport.provider} | Ngữ nghĩa: ${evalReport.semantic_score}% | Tự nhiên: ${evalReport.fluency_score}% | Đầu vào ASR: ${evalReport.asr_score}%`,
+                        "",
+                        evalReport.summary_vi,
+                        "",
+                        "## Chi tiết từng đoạn",
+                        ...evalReport.items.map(
+                          (x) =>
+                            `- [${x.timestamp || "-"}] **${x.score}% (${issueLabelVi(x.issue_type)})**\n  - Gốc: ${x.source_text}\n  - Đã dịch: ${x.translated_text}\n  - Nhận xét: ${x.comment_vi}\n  - Gợi ý chuẩn: ${x.suggested_translation}`
+                        ),
+                      ].join("\n");
+                      handleCopy("eval-md", md);
+                    }}
+                  >
+                    {copiedId === "eval-md" ? <Check size={12} /> : <Copy size={12} />} Chép báo cáo Markdown
+                  </button>
+                )}
+                <button className="btn primary sm" disabled={evalBusy} onClick={() => setEvalOpen(false)}>
                   Đóng
                 </button>
               </div>

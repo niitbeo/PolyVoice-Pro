@@ -274,6 +274,7 @@ export interface PartialEvent {
 export interface TranscriptEntry {
   id: string;
   paragraph_id?: string;
+  item_ids?: string[];
   speaker?: "self" | "remote" | "";
   sentence_count?: number;
   source_text: string;
@@ -286,6 +287,42 @@ export interface TranscriptEntry {
   mt_engine: string;
   timestamp: string;
   log_saved_count?: number;
+}
+
+export type EvaluationIssueType = "ok" | "nuance" | "mt_inaccurate" | "asr_error";
+
+export interface EvaluationItemResult {
+  id: string;
+  timestamp?: string;
+  source_text: string;
+  translated_text: string;
+  source_lang: string;
+  target_lang: string;
+  score: number;
+  issue_type: EvaluationIssueType;
+  comment_vi: string;
+  suggested_translation: string;
+}
+
+export interface GlossarySuggestion {
+  wrong: string;
+  correct: string;
+}
+
+export interface EvaluationReport {
+  provider: string;
+  mode: "semantic_audit" | "google_reference";
+  overall_score: number;
+  semantic_score: number;
+  fluency_score: number;
+  asr_score: number;
+  verdict: string;
+  summary_vi: string;
+  items: EvaluationItemResult[];
+  glossary_suggestions: GlossarySuggestion[];
+  latency_ms: number;
+  chars_used: number;
+  cloud_api?: CloudApiStatus;
 }
 
 /**
@@ -318,10 +355,12 @@ export function groupEntriesByParagraph(chronological: TranscriptEntry[]): Trans
       prev.mt_ms = item.mt_ms;
       prev.mt_engine = item.mt_engine;
       prev.sentence_count = (prev.sentence_count ?? 1) + 1;
+      prev.item_ids = [...(prev.item_ids || []), item.id];
     } else {
       out.push({
         ...item,
         id: item.paragraph_id || item.id,
+        item_ids: [item.id],
         sentence_count: 1,
       });
     }

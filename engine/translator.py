@@ -16,7 +16,9 @@ Multilingual Bidirectional Real-Time Translation Engines.
 from __future__ import annotations
 
 import atexit
+import difflib
 import html
+import json
 import os
 import platform
 import re
@@ -1488,5 +1490,322 @@ def summarize_meeting_entries(
         "overview_tgt": overview_tgt,
         "key_points": key_points,
         "action_items": actions[:6],
+    }
+
+
+def _clamp_score(val: object, default: int = 0) -> int:
+    try:
+        n = int(round(float(val)))
+        return max(0, min(100, n))
+    except Exception:
+        return default
+
+
+def _verdict_from_score(score: int) -> str:
+    if score >= 90:
+        return "Xuất sắc — Chuẩn xác & tự nhiên"
+    if score >= 80:
+        return "Tốt — Đạt chuẩn thực tế"
+    if score >= 65:
+        return "Khá — Hiểu ý chính, nên chỉnh nhẹ"
+    return "Cần kiểm tra — Có đoạn lệch nghĩa hoặc nghe nhầm"
+
+
+def _parse_json_object(raw_text: str) -> dict:
+    txt = (raw_text or "").strip()
+    if txt.startswith("```"):
+        txt = re.sub(r"^```(?:json)?\s*", "", txt, flags=re.IGNORECASE)
+        txt = re.sub(r"\s*```$", "", txt)
+        txt = txt.strip()
+    try:
+        obj = json.loads(txt)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    # Fallback: locate outermost {...}
+    start = txt.find("{")
+    end = txt.rfind("}")
+    if start >= 0 and end > start:
+        obj = json.loads(txt[start : end + 1])
+        if isinstance(obj, dict):
+            return obj
+    raise ValueError("Phản hồi JSON từ Gemini không hợp lệ.")
+
+
+def evaluate_translations_with_gemini(
+    api_key: str,
+    items: list[dict],
+    model: str = "gemini-2.5-flash",
+    timeout_s: float = 35.0,
+) -> dict:
+    """
+    Semantic Translation Quality Audit powered by Official Google Gemini API.
+    - Passes API key strictly via `x-goog-api-key` header (never leaked in URL or logs).
+    - Evaluates semantic accuracy, fluency/context, and ASR input clarity per segment,
+      distinguishing ASR mishearing vs MT mistranslation, and suggests improved translations
+      plus 1-click Glossary fixes for recurring ASR brand/proper-noun errors.
+    """
+    key = (api_key or "").strip()
+    if not key:
+        raise ValueError("Chưa cấu hình Google Gemini API Key.")
+    clean_items = [
+        {
+            "id": str(it.get("id") or f"item-{idx + 1}"),
+            "source_text": str(it.get("source_text") or "").strip(),
+            "translated_text": str(it.get("translated_text") or "").strip(),
+            "source_lang": str(it.get("source_lang") or "vie_Latn"),
+            "target_lang": str(it.get("target_lang") or "eng_Latn"),
+            "timestamp": str(it.get("timestamp") or ""),
+        }
+        for idx, it in enumerate(items)
+        if str(it.get("source_text") or "").strip()
+    ]
+    if not clean_items:
+        raise ValueError("Chưa có câu dịch nào trong lịch sử để đánh giá.")
+
+    # Cap to latest 40 segments so a single Gemini JSON response stays fast (<4s) and never truncates
+    if len(clean_items) > 40:
+        clean_items = clean_items[-40:]
+
+    m = (model or "gemini-2.5-flash").strip()
+    if m in GeminiCloudTranslator._DEPRECATED_MODELS:
+        m = "gemini-2.5-flash"
+
+    def _lang_name(code: str) -> str:
+        meta = get_language(code)
+        return meta.name_en if meta else code
+
+    payload_rows = [
+        {
+            "id": it["id"],
+            "src_lang": _lang_name(it["source_lang"]),
+            "tgt_lang": _lang_name(it["target_lang"]),
+            "source": it["source_text"],
+            "translation": it["translated_text"],
+        }
+        for it in clean_items
+    ]
+    chars_used = sum(len(it["source_text"]) + len(it["translated_text"]) for it in clean_items)
+
+    prompt = (
+        "Bạn là chuyên gia thẩm định chất lượng phiên dịch hội nghị song ngữ (Translation QA Auditor).\n"
+        "Nhiệm vụ: Đánh giá độ chính xác ngữ nghĩa giữa lời nói gốc (`source`, do ASR nhận dạng) và bản dịch (`translation`) cho từng mục sau.\n"
+        "QUY TẮC BẮT BUỘC:\n"
+        "1. Toàn bộ nhận xét (`verdict`, `summary_vi`, `comment_vi`) viết bằng tiếng Việt ngắn gọn, rõ ràng, thực tế.\n"
+        "2. Phân biệt rõ 4 loại `issue_type` cho mỗi mục:\n"
+        "   - \"ok\": Dịch chuẩn xác, sát nghĩa (score 85-100).\n"
+        "   - \"nuance\": Hiểu đúng ý chính nhưng diễn đạt hơi cứng hoặc thiếu tự nhiên (score 70-84).\n"
+        "   - \"mt_inaccurate\": Nguồn nghe rõ nhưng bản dịch sai nghĩa, bỏ sót ý/số liệu hoặc dịch nhầm chủ ngữ (score 0-69).\n"
+        "   - \"asr_error\": Lời gốc `source` bị nhận dạng giọng nói nghe nhầm từ/tên riêng (VD: 'ocbian' thay vì 'Obsidian') dẫn tới bản dịch sai theo.\n"
+        "3. `suggested_translation`: Đưa ra bản dịch chuẩn xác & tự nhiên nhất bằng ngôn ngữ đích (`tgt_lang`). Nếu đã chuẩn (`ok`), vẫn giữ bản dịch tốt nhất.\n"
+        "4. `glossary_suggestions`: CHỈ liệt kê tối đa 6 cặp {\"wrong\": \"...\", \"correct\": \"...\"} khi thấy rõ tên riêng/thuật ngữ bị ASR nghe nhầm trong `source`; nếu không có thì trả mảng rỗng [].\n"
+        "5. Trả về DUY NHẤT một JSON object hợp lệ đúng schema sau (không markdown, không văn bản thừa):\n"
+        "{\n"
+        '  "overall_score": 0-100,\n'
+        '  "semantic_score": 0-100,\n'
+        '  "fluency_score": 0-100,\n'
+        '  "asr_score": 0-100,\n'
+        '  "verdict": "nhận định ngắn 4-8 từ",\n'
+        '  "summary_vi": "2-3 câu tóm tắt chất lượng toàn phiên bằng tiếng Việt",\n'
+        '  "items": [\n'
+        '    {"id": "...", "score": 0-100, "issue_type": "ok|nuance|mt_inaccurate|asr_error", "comment_vi": "nhận xét ngắn 1 câu", "suggested_translation": "..."}\n'
+        "  ],\n"
+        '  "glossary_suggestions": [{"wrong": "...", "correct": "..."}]\n'
+        "}\n\n"
+        f"Dữ liệu cần đánh giá ({len(payload_rows)} mục):\n"
+        + json.dumps(payload_rows, ensure_ascii=False)
+    )
+
+    gen_cfg: dict = {
+        "temperature": 0.1,
+        "maxOutputTokens": 4096,
+        "responseMimeType": "application/json",
+    }
+    if m.startswith(("gemini-2.5-", "gemini-3.1-")):
+        gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent"
+    t0 = time.perf_counter()
+    with httpx.Client(timeout=timeout_s) as client:
+        resp = client.post(
+            url,
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            json={
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": gen_cfg,
+            },
+        )
+    if resp.status_code >= 400:
+        err_msg = ""
+        try:
+            err_msg = resp.json().get("error", {}).get("message", "")
+        except Exception:
+            pass
+        raise RuntimeError(f"Gemini HTTP {resp.status_code}: {err_msg or resp.reason_phrase}")
+
+    data = resp.json()
+    cand_parts = data["candidates"][0]["content"]["parts"]
+    raw_out = "".join(p.get("text", "") for p in cand_parts if not p.get("thought")).strip()
+    parsed = _parse_json_object(raw_out)
+    ms = round((time.perf_counter() - t0) * 1000.0, 1)
+
+    by_id: dict[str, dict] = {}
+    for row in parsed.get("items") or []:
+        if isinstance(row, dict) and row.get("id"):
+            by_id[str(row["id"])] = row
+
+    valid_issues = {"ok", "nuance", "mt_inaccurate", "asr_error"}
+    norm_items: list[dict] = []
+    for idx, src_it in enumerate(clean_items):
+        raw_row = by_id.get(src_it["id"])
+        if raw_row is None and isinstance(parsed.get("items"), list) and idx < len(parsed["items"]):
+            cand = parsed["items"][idx]
+            if isinstance(cand, dict):
+                raw_row = cand
+        raw_row = raw_row or {}
+        sc = _clamp_score(raw_row.get("score"), 80)
+        itype = str(raw_row.get("issue_type") or "").strip().lower()
+        if itype not in valid_issues:
+            itype = "ok" if sc >= 85 else ("nuance" if sc >= 70 else "mt_inaccurate")
+        sugg = str(raw_row.get("suggested_translation") or "").strip() or src_it["translated_text"]
+        comment = str(raw_row.get("comment_vi") or "").strip() or (
+            "Bản dịch sát nghĩa." if sc >= 85 else "Nên xem lại độ sát nghĩa ở câu này."
+        )
+        norm_items.append(
+            {
+                "id": src_it["id"],
+                "timestamp": src_it["timestamp"],
+                "source_text": src_it["source_text"],
+                "translated_text": src_it["translated_text"],
+                "source_lang": src_it["source_lang"],
+                "target_lang": src_it["target_lang"],
+                "score": sc,
+                "issue_type": itype,
+                "comment_vi": comment,
+                "suggested_translation": sugg,
+            }
+        )
+
+    avg_item = int(round(sum(x["score"] for x in norm_items) / max(1, len(norm_items))))
+    overall = _clamp_score(parsed.get("overall_score"), avg_item)
+    semantic = _clamp_score(parsed.get("semantic_score"), overall)
+    fluency = _clamp_score(parsed.get("fluency_score"), overall)
+    asr_sc = _clamp_score(parsed.get("asr_score"), overall)
+    verdict = str(parsed.get("verdict") or "").strip() or _verdict_from_score(overall)
+    summary_vi = str(parsed.get("summary_vi") or "").strip() or (
+        f"Đã kiểm định {len(norm_items)} đoạn hội thoại với điểm trung bình {overall}%."
+    )
+
+    seen_gloss: set[tuple[str, str]] = set()
+    gloss_out: list[dict] = []
+    for g in parsed.get("glossary_suggestions") or []:
+        if not isinstance(g, dict):
+            continue
+        w = str(g.get("wrong") or "").strip()
+        c = str(g.get("correct") or "").strip()
+        if w and c and w.lower() != c.lower():
+            gk = (w.lower(), c.lower())
+            if gk not in seen_gloss:
+                seen_gloss.add(gk)
+                gloss_out.append({"wrong": w, "correct": c})
+        if len(gloss_out) >= 6:
+            break
+
+    return {
+        "provider": f"gemini:{m}",
+        "mode": "semantic_audit",
+        "overall_score": overall,
+        "semantic_score": semantic,
+        "fluency_score": fluency,
+        "asr_score": asr_sc,
+        "verdict": verdict,
+        "summary_vi": summary_vi,
+        "items": norm_items,
+        "glossary_suggestions": gloss_out,
+        "latency_ms": ms,
+        "chars_used": chars_used,
+    }
+
+
+def evaluate_translations_with_google_cloud(
+    api_key: str,
+    items: list[dict],
+    timeout_s: float = 15.0,
+) -> dict:
+    """
+    Fallback Translation Reference Audit using Google Cloud Translation API v2
+    when the user configured a Google Cloud Translate key without a Gemini API key.
+    """
+    clean_items = [
+        {
+            "id": str(it.get("id") or f"item-{idx + 1}"),
+            "source_text": str(it.get("source_text") or "").strip(),
+            "translated_text": str(it.get("translated_text") or "").strip(),
+            "source_lang": str(it.get("source_lang") or "vie_Latn"),
+            "target_lang": str(it.get("target_lang") or "eng_Latn"),
+            "timestamp": str(it.get("timestamp") or ""),
+        }
+        for idx, it in enumerate(items)
+        if str(it.get("source_text") or "").strip()
+    ]
+    if not clean_items:
+        raise ValueError("Chưa có câu dịch nào trong lịch sử để đánh giá.")
+    if len(clean_items) > 25:
+        clean_items = clean_items[-25:]
+
+    t0 = time.perf_counter()
+    gct = GoogleCloudTranslator(api_key=api_key, timeout_s=timeout_s)
+    norm_items: list[dict] = []
+    chars_used = 0
+    try:
+        for it in clean_items:
+            chars_used += len(it["source_text"])
+            ref = gct.translate(it["source_text"], it["source_lang"], it["target_lang"]).translated_text
+            a = re.sub(r"\s+", " ", it["translated_text"].lower()).strip()
+            b = re.sub(r"\s+", " ", ref.lower()).strip()
+            ratio = difflib.SequenceMatcher(None, a, b).ratio() if (a and b) else 0.0
+            sc = _clamp_score(ratio * 100.0, 50)
+            itype = "ok" if sc >= 80 else ("nuance" if sc >= 62 else "mt_inaccurate")
+            comment = (
+                "Khớp sát với bản dịch tham chiếu Google Translate."
+                if sc >= 80
+                else "Có khác biệt về cách diễn đạt/từ vựng so với Google Translate — nên đối chiếu bản gợi ý."
+            )
+            norm_items.append(
+                {
+                    "id": it["id"],
+                    "timestamp": it["timestamp"],
+                    "source_text": it["source_text"],
+                    "translated_text": it["translated_text"],
+                    "source_lang": it["source_lang"],
+                    "target_lang": it["target_lang"],
+                    "score": sc,
+                    "issue_type": itype,
+                    "comment_vi": comment,
+                    "suggested_translation": ref or it["translated_text"],
+                }
+            )
+    finally:
+        gct.close()
+
+    overall = int(round(sum(x["score"] for x in norm_items) / max(1, len(norm_items))))
+    ms = round((time.perf_counter() - t0) * 1000.0, 1)
+    return {
+        "provider": "google-cloud",
+        "mode": "google_reference",
+        "overall_score": overall,
+        "semantic_score": overall,
+        "fluency_score": overall,
+        "asr_score": 85,
+        "verdict": _verdict_from_score(overall),
+        "summary_vi": (
+            f"Đã đối chiếu {len(norm_items)} đoạn với Google Cloud Translate (độ tương đồng trung bình {overall}%). "
+            "Mẹo: cấu hình thêm Google Gemini API để nhận phân tích ngữ nghĩa sâu & phát hiện lỗi nghe nhầm ASR."
+        ),
+        "items": norm_items,
+        "glossary_suggestions": [],
+        "latency_ms": ms,
+        "chars_used": chars_used,
     }
 

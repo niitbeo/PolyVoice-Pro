@@ -131,6 +131,8 @@ from translator import (
     NLLBTranslator,
     OpusMTTranslator,
     TranslationResult,
+    evaluate_translations_with_gemini,
+    evaluate_translations_with_google_cloud,
     find_llama_server,
     summarize_meeting_entries,
 )
@@ -273,6 +275,27 @@ class CloudTestRequest(BaseModel):
 
 class CloudQuotaResetRequest(BaseModel):
     provider: Optional[str] = None
+
+
+class EvaluateItemInput(BaseModel):
+    id: str
+    source_text: str
+    translated_text: str = ""
+    source_lang: str = "vie_Latn"
+    target_lang: str = "eng_Latn"
+    timestamp: str = ""
+
+
+class EvaluateRequest(BaseModel):
+    mode: str = "session"  # "session" | "item"
+    items: Optional[list[EvaluateItemInput]] = None
+
+
+class HistoryUpdateRequest(BaseModel):
+    id: str
+    item_ids: Optional[list[str]] = None
+    translated_text: str
+    source_text: Optional[str] = None
 
 
 _NON_SPACED_SCRIPT_PREFIXES = ("tha_", "lao_", "khm_", "zho_", "jpn_", "mya_")
@@ -2213,6 +2236,116 @@ class EngineRuntime:
         self.glossary.clear_session_entities()
         self.broadcast_threadsafe({"type": "history", "data": []})
 
+    def update_history_entry(
+        self,
+        target_id: str,
+        translated_text: str,
+        item_ids: Optional[list[str]] = None,
+        source_text: Optional[str] = None,
+    ) -> bool:
+        """
+        Apply a Gemini-verified improved translation onto a History entry or merged paragraph,
+        syncing all UI windows and future .TXT/.SRT exports cleanly.
+        """
+        ids_set = {str(x) for x in (item_ids or []) if x}
+        if target_id:
+            ids_set.add(str(target_id))
+        if not ids_set:
+            return False
+
+        matched_indices = [
+            idx
+            for idx, e in enumerate(self._history)
+            if str(e.get("id", "")) in ids_set or str(e.get("paragraph_id", "")) in ids_set
+        ]
+        if not matched_indices:
+            return False
+
+        first_idx = matched_indices[0]
+        if len(matched_indices) == 1:
+            entry = dict(self._history[first_idx])
+            entry["translated_text"] = translated_text.strip()
+            if source_text is not None and source_text.strip():
+                entry["source_text"] = source_text.strip()
+            self._history[first_idx] = entry
+        else:
+            # Merge grouped paragraph entries cleanly into the first entry so exports & UI never duplicate text
+            first = dict(self._history[first_idx])
+            if source_text is not None and source_text.strip():
+                first["source_text"] = source_text.strip()
+            else:
+                merged_src = " ".join(
+                    str(self._history[i].get("source_text", "")).strip()
+                    for i in matched_indices
+                    if str(self._history[i].get("source_text", "")).strip()
+                ).strip()
+                if merged_src:
+                    first["source_text"] = merged_src
+            first["translated_text"] = translated_text.strip()
+            self._history[first_idx] = first
+            for idx in reversed(matched_indices[1:]):
+                self._history.pop(idx)
+
+        self.broadcast_threadsafe({"type": "history", "data": list(self._history)})
+        return True
+
+    def evaluate_translations(self, req: EvaluateRequest) -> dict[str, Any]:
+        """Evaluate semantic translation quality using saved Google Gemini (or fallback Google Cloud) API key."""
+        if req.items:
+            raw_items = [it.model_dump() for it in req.items if it.source_text.strip()]
+        else:
+            raw_items = [
+                {
+                    "id": str(e.get("id", "")),
+                    "source_text": str(e.get("source_text", "")),
+                    "translated_text": str(e.get("translated_text", "")),
+                    "source_lang": str(e.get("source_lang", self.config.source_lang)),
+                    "target_lang": str(e.get("target_lang", self.config.target_lang)),
+                    "timestamp": str(e.get("timestamp", "")),
+                }
+                for e in list(self._history)[-40:]
+                if str(e.get("source_text", "")).strip()
+            ]
+        if not raw_items:
+            raise ValueError("Chưa có câu dịch nào trong lịch sử để đánh giá.")
+
+        gemini_creds = self.cloud_quota.get_credentials("gemini")
+        google_creds = self.cloud_quota.get_credentials("google")
+        gemini_key = str(gemini_creds.get("api_key", "")).strip()
+        google_key = str(google_creds.get("api_key", "")).strip()
+
+        est_chars = sum(len(it["source_text"]) + len(it["translated_text"]) for it in raw_items)
+
+        if gemini_key:
+            if not self.cloud_quota.can_spend("gemini", est_chars):
+                raise RuntimeError(
+                    "Google Gemini API đã chạm giới hạn ký tự tháng này trong mục Cloud API. "
+                    "Hãy tăng hạn mức hoặc reset bộ đếm để tiếp tục đánh giá."
+                )
+            report = evaluate_translations_with_gemini(
+                api_key=gemini_key,
+                items=raw_items,
+                model=str(gemini_creds.get("model") or "gemini-2.5-flash"),
+            )
+            self.cloud_quota.record_usage("gemini", int(report.get("chars_used", est_chars)))
+            report["cloud_api"] = self.cloud_quota.get_public_status()
+            return report
+
+        if google_key:
+            if not self.cloud_quota.can_spend("google", est_chars):
+                raise RuntimeError(
+                    "Google Cloud Translation API đã chạm giới hạn ký tự miễn phí tháng này."
+                )
+            report = evaluate_translations_with_google_cloud(
+                api_key=google_key,
+                items=raw_items,
+            )
+            self.cloud_quota.record_usage("google", int(report.get("chars_used", est_chars)))
+            report["cloud_api"] = self.cloud_quota.get_public_status()
+            return report
+
+        raise LookupError("missing_google_api_key")
+
     def _get_capitalized_glossary_words(self) -> set[str]:
         """Collect lowercased leading tokens of capitalized glossary terms/proper nouns to preserve casing."""
         words: set[str] = set()
@@ -3744,6 +3877,35 @@ def api_session_summarize():
         runtime.config.target_lang,
         translate_fn=lambda txt, s, t: runtime.translate_text(txt, s, t, mt_mode=runtime.config.mt_mode, beam_size=1),
     )
+
+
+@app.post("/api/session/evaluate")
+def api_session_evaluate(req: EvaluateRequest):
+    try:
+        return runtime.evaluate_translations(req)
+    except LookupError:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "missing_google_api_key",
+                "message": "Chưa cấu hình Google Gemini (hoặc Google Cloud) API Key. Hãy dán Key trong mục Cài đặt Cloud API.",
+            },
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Lỗi đánh giá qua Google API: {exc}") from exc
+
+
+@app.post("/api/history/update")
+def api_history_update(req: HistoryUpdateRequest):
+    updated = runtime.update_history_entry(
+        target_id=req.id,
+        translated_text=req.translated_text,
+        item_ids=req.item_ids,
+        source_text=req.source_text,
+    )
+    return {"ok": True, "updated": updated}
 
 
 @app.get("/api/files/progress")
