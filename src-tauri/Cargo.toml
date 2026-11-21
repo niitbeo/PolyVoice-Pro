@@ -1,6 +1,6 @@
 [package]
 name = "voicerecore"
-version = "0.9.4"
+version = "0.9.5"
 description = "PolyVoice Pro — Real-time Bilingual Conference Speech Translation (202 Languages)"
 authors = ["PolyVoice Pro"]
 edition = "2021"
