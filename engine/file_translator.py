@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from languages import PARAKEET_EU_LANGS
 from session_logger import _fmt_srt_time
 
 SAMPLE_RATE = 16000
@@ -526,14 +527,21 @@ def translate_media_file(
         and runtime.model_manager.is_zipformer_en_20m_ready()
         else None
     )
+    parakeet_eu = (
+        runtime.ensure_onnx_asr_loaded("parakeet-eu", lang_code=source_lang)
+        if (not force_whisper)
+        and source_lang in PARAKEET_EU_LANGS
+        and runtime.model_manager.is_parakeet_eu_ready()
+        else None
+    )
     whisper_asr = None
-    if force_whisper or (not use_vi_batch and en_moonshine is None and zf_en is None):
+    if force_whisper or (not use_vi_batch and en_moonshine is None and zf_en is None and parakeet_eu is None):
         if runtime.model_manager.is_whisper_turbo_ready():
             whisper_asr = runtime.ensure_onnx_asr_loaded("whisper-turbo", lang_code=source_lang)
         else:
             raise RuntimeError(
-                "Chưa tải 'Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)' (~540 MB). "
-                "Hãy mở mục 'Mô hình Offline' ở cột trái để tải 1 lần, hoặc chọn Engine 'Tự động'."
+                "Chưa tải 'Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)' (~540 MB) hoặc 'Parakeet-Ultra 25 NN Châu Âu' (~465 MB). "
+                "Hãy mở mục 'Mô hình Offline' ở cột trái để tải Gói 3."
             )
     if cancel_event is not None and cancel_event.is_set():
         raise FileTranslateCancelled("Đã hủy dịch file.")
@@ -541,7 +549,11 @@ def translate_media_file(
     asr_used_label = (
         "Whisper Large-v3-Turbo"
         if whisper_asr is not None
-        else ("VietASR + Zipformer" if use_vi_batch else ("Moonshine-v2" if en_moonshine is not None else "Zipformer-EN"))
+        else (
+            "Parakeet-Ultra 25 NN Châu Âu"
+            if parakeet_eu is not None
+            else ("VietASR + Zipformer" if use_vi_batch else ("Moonshine-v2" if en_moonshine is not None else "Zipformer-EN"))
+        )
     )
 
     protected_terms = runtime._get_glossary_hotwords()
@@ -568,6 +580,8 @@ def translate_media_file(
 
         if whisper_asr is not None:
             text = whisper_asr.transcribe_pcm_isolated(seg_pcm, language=source_lang)
+        elif parakeet_eu is not None:
+            text = parakeet_eu.transcribe_pcm_isolated(seg_pcm, language=source_lang)
         elif use_vi_batch and refiner is not None:
             p1_fallback = ""
             if zf_vi is not None and protected_terms:

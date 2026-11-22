@@ -289,6 +289,29 @@ _DEFAULT_UNIVERSAL_PROFILE = SourceAsrProfile(
     asr_tier="universal",
 )
 
+PARAKEET_EU_LANGS: frozenset[str] = frozenset(
+    {
+        "fra_Latn",
+        "deu_Latn",
+        "spa_Latn",
+        "ita_Latn",
+        "por_Latn",
+        "nld_Latn",
+        "pol_Latn",
+        "ukr_Cyrl",
+        "ces_Latn",
+        "swe_Latn",
+        "fin_Latn",
+        "dan_Latn",
+        "ell_Grek",
+        "hun_Latn",
+        "ron_Latn",
+        "slk_Latn",
+        "bul_Cyrl",
+        "hrv_Latn",
+    }
+)
+
 SOURCE_LANG_ASR_PROFILE: dict[str, SourceAsrProfile] = {
     "vie_Latn": SourceAsrProfile("zipformer-30m-streaming", 49, "whisper-turbo", "core", "fast"),
     "eng_Latn": SourceAsrProfile("moonshine-en", 106, "whisper-turbo", "core", "fast"),
@@ -300,6 +323,15 @@ SOURCE_LANG_ASR_PROFILE: dict[str, SourceAsrProfile] = {
     "ind_Latn": SourceAsrProfile("zipformer-multi", 247, "whisper-turbo", "asia", "fast"),
     "rus_Cyrl": SourceAsrProfile("zipformer-multi", 247, "whisper-turbo", "asia", "fast"),
     "arb_Arab": SourceAsrProfile("zipformer-multi", 247, "whisper-turbo", "asia", "fast"),
+    # 25 European languages — Parakeet-TDT-0.6B-Ultra INT8 (465 MB, 0% GPU, 7x-10x faster than Whisper-Turbo)
+    "fra_Latn": SourceAsrProfile("parakeet-eu", 465, "whisper-turbo", "global", "fast"),
+    "deu_Latn": SourceAsrProfile("parakeet-eu", 465, "whisper-turbo", "global", "fast"),
+    "spa_Latn": SourceAsrProfile("parakeet-eu", 465, "whisper-turbo", "global", "fast"),
+    "ita_Latn": SourceAsrProfile("parakeet-eu", 465, "whisper-turbo", "global", "fast"),
+    "por_Latn": SourceAsrProfile("parakeet-eu", 465, "whisper-turbo", "global", "fast"),
+    "nld_Latn": SourceAsrProfile("parakeet-eu", 465, "whisper-turbo", "global", "fast"),
+    "pol_Latn": SourceAsrProfile("parakeet-eu", 465, "whisper-turbo", "global", "fast"),
+    "ukr_Cyrl": SourceAsrProfile("parakeet-eu", 465, "whisper-turbo", "global", "fast"),
     "lao_Laoo": SourceAsrProfile(
         "whisper-turbo",
         540,

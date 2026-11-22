@@ -65,6 +65,7 @@ export interface ModelsStatus {
   asr_moonshine_en?: ModelState;
   asr_moonshine_ja?: ModelState;
   asr_moonshine_ko?: ModelState;
+  asr_parakeet_eu?: ModelState;
   asr_whisper_turbo?: ModelState;
   asr_vietasr: ModelState;
   mt_hymt2?: ModelState;
@@ -82,6 +83,7 @@ export type AsrEngineId =
   | "moonshine-en"
   | "moonshine-ja"
   | "moonshine-ko"
+  | "parakeet-eu"
   | "apple-native"
   | "whisper-turbo"
   | "zipformer-30m-streaming"
@@ -254,6 +256,7 @@ export interface EngineStatus {
   moonshine_en_ready?: boolean;
   moonshine_ja_ready?: boolean;
   moonshine_ko_ready?: boolean;
+  parakeet_eu_ready?: boolean;
   whisper_turbo_ready?: boolean;
   hymt2_ready?: boolean;
   hymt2_loaded?: boolean;

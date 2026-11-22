@@ -100,6 +100,7 @@ type DownloadableModelId =
   | "moonshine-en"
   | "moonshine-ja"
   | "moonshine-ko"
+  | "parakeet-eu"
   | "whisper-turbo"
   | "opus-vi-en"
   | "opus-en-vi"
@@ -112,6 +113,7 @@ const MODEL_DISPLAY_NAMES: Record<string, string> = {
   "moonshine-en": "Nghe Tiếng Anh (Moonshine-v2)",
   "moonshine-ja": "Nghe Tiếng Nhật Siêu tốc (Moonshine-v2 JA)",
   "moonshine-ko": "Nghe Tiếng Hàn Siêu tốc (Moonshine-v2 KO)",
+  "parakeet-eu": "Nghe 25 NN Châu Âu Siêu tốc (Parakeet-Ultra)",
   "whisper-turbo": "Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)",
   envit5: "Dịch Việt ⇄ Anh (EnViT5)",
   "nllb-600m": "Dịch Lào & 202 NN (NLLB-600M)",
@@ -138,6 +140,8 @@ function applyModelStateUpdate(prev: ModelsStatus | null, prog: ModelState): Mod
     return { ...prev, asr_moonshine_ja: prog };
   if (prog.model_id === "moonshine-ko")
     return { ...prev, asr_moonshine_ko: prog };
+  if (prog.model_id === "parakeet-eu")
+    return { ...prev, asr_parakeet_eu: prog };
   if (prog.model_id === "whisper-turbo")
     return { ...prev, asr_whisper_turbo: prog };
   if (prog.model_id === "opus-vi-en") return { ...prev, mt_opus_vi_en: prog };
@@ -1814,6 +1818,8 @@ export default function App() {
           return models.asr_moonshine_ko;
         case "zipformer-multi":
           return models.asr_zipformer_multi;
+        case "parakeet-eu":
+          return models.asr_parakeet_eu;
         case "whisper-turbo":
           return models.asr_whisper_turbo;
         case "zipformer-en-20m":
@@ -1922,8 +1928,20 @@ export default function App() {
     }
   };
 
+  const handleDownloadGlobalPack = async () => {
+    setErrorMsg("");
+    setShowAdvanced(true);
+    const packIds: Array<"parakeet-eu" | "whisper-turbo"> = ["parakeet-eu", "whisper-turbo"];
+    for (const id of packIds) {
+      const st = getModelStateById(id);
+      if (st?.status !== "ready" && st?.status !== "downloading") {
+        await handleDownloadModel(id);
+      }
+    }
+  };
+
   const handleDeleteModel = async (
-    modelId: "hy-mt2" | "moonshine-en" | "moonshine-ja" | "moonshine-ko" | "zipformer-multi" | "zipformer-en-20m" | "nllb-600m" | "whisper-turbo"
+    modelId: "hy-mt2" | "moonshine-en" | "moonshine-ja" | "moonshine-ko" | "zipformer-multi" | "parakeet-eu" | "zipformer-en-20m" | "nllb-600m" | "whisper-turbo"
   ) => {
     if (
       modelId === "hy-mt2" &&
@@ -2108,6 +2126,7 @@ export default function App() {
         ["Nghe Tiếng Nhật Siêu tốc (Moonshine-v2 JA • ~120ms)", models?.asr_moonshine_ja, "moonshine-ja", "99 MB"],
         ["Nghe Tiếng Hàn Siêu tốc (Moonshine-v2 KO • ~150ms)", models?.asr_moonshine_ko, "moonshine-ko", "47 MB"],
         ["Nghe Thái / Trung / Indo Siêu tốc (Zipformer • ~15ms)", models?.asr_zipformer_multi, "zipformer-multi", "247 MB"],
+        ["Nghe 25 NN Châu Âu Siêu tốc (Parakeet-Ultra • ~0.3s)", models?.asr_parakeet_eu, "parakeet-eu", "465 MB"],
         ["Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)", models?.asr_whisper_turbo, "whisper-turbo", "540 MB"],
         ["Dịch Chuyên sâu 38 NN (Hy-MT2 • Nặng GPU)", models?.mt_hymt2, "hy-mt2", "1.05 GB"],
         ["Nghe Tiếng Anh Siêu nhẹ (Zipformer-20M)", models?.asr_zipformer_en_20m, "zipformer-en-20m", "130 MB"],
@@ -2176,11 +2195,11 @@ export default function App() {
       ),
       buildPack(
         "global",
-        "Gói 3: Toàn cầu 99 Ngôn ngữ",
-        "540 MB • 0% GPU",
-        "Lưới an toàn offline cho Pháp, Đức, TBN, Ý, Hindi, Khmer & 90+ ngôn ngữ phát sinh.",
-        ["whisper-turbo"],
-        () => handleDownloadModel("whisper-turbo")
+        "Gói 3: Toàn cầu & Châu Âu siêu tốc",
+        "~1.0 GB • 0% GPU",
+        "Parakeet-Ultra 25 NN Châu Âu (~0.3s: Pháp, Đức, TBN, Ý, Hà Lan, Ba Lan, Ukraina...) + Whisper 99 NN (Hindi, Khmer...).",
+        ["parakeet-eu", "whisper-turbo"],
+        handleDownloadGlobalPack
       ),
     ];
   }, [models, getModelStateById]);
@@ -3147,6 +3166,9 @@ export default function App() {
                 </option>
                 <option value="zipformer-multi" disabled={!status?.zipformer_multi_ready}>
                   Zipformer Đa ngôn ngữ (Thái, Trung, Indo • ~15ms • 0% GPU)
+                </option>
+                <option value="parakeet-eu" disabled={!status?.parakeet_eu_ready}>
+                  Parakeet-Ultra 25 NN Châu Âu (Pháp, Đức, TBN, Ý... • ~0.3s • 0% GPU)
                 </option>
                 <option value="whisper-turbo" disabled={!status?.whisper_turbo_ready}>
                   Whisper-Turbo 99 NN (Thái, Nhật, Trung, Hàn, Pháp, Đức • Offline)

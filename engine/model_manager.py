@@ -167,6 +167,12 @@ ZIPFORMER_MULTI_URL = (
 )
 ZIPFORMER_MULTI_DIRNAME = "sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh-2025-02-10"
 
+PARAKEET_EU_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "sherpa-onnx-nemo-parakeet-tdt-0.6b-ultra-int8.tar.bz2"
+)
+PARAKEET_EU_DIRNAME = "sherpa-onnx-nemo-parakeet-tdt-0.6b-ultra-int8"
+
 WHISPER_TURBO_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
     "sherpa-onnx-whisper-turbo.tar.bz2"
@@ -194,6 +200,7 @@ _KNOWN_MODEL_SUBDIRS = (
     MOONSHINE_JA_DIRNAME,
     MOONSHINE_KO_DIRNAME,
     ZIPFORMER_MULTI_DIRNAME,
+    PARAKEET_EU_DIRNAME,
     WHISPER_TURBO_DIRNAME,
     "envit5-translation-ct2-int8",
     "nllb-200-distilled-600M-ct2-int8",
@@ -413,6 +420,10 @@ class ModelManager:
         return self.models_dir / ZIPFORMER_MULTI_DIRNAME
 
     @property
+    def parakeet_eu_dir(self) -> Path:
+        return self.models_dir / PARAKEET_EU_DIRNAME
+
+    @property
     def whisper_turbo_dir(self) -> Path:
         return self.models_dir / WHISPER_TURBO_DIRNAME
 
@@ -420,6 +431,7 @@ class ModelManager:
     def silero_vad_path(self) -> Path:
         for candidate in (
             self.whisper_turbo_dir / "silero_vad_v5.onnx",
+            self.parakeet_eu_dir / "silero_vad_v5.onnx",
             self.moonshine_en_dir / "silero_vad_v5.onnx",
             self.moonshine_ja_dir / "silero_vad_v5.onnx",
             self.moonshine_ko_dir / "silero_vad_v5.onnx",
@@ -549,6 +561,23 @@ class ModelManager:
             and _file_ok(joi, 1_000_000)
             and _file_ok(d / "tokens.txt", 100)
         )
+
+    def _parakeet_eu_has_weights(self) -> bool:
+        d = self.parakeet_eu_dir
+        if not _dir_not_downloading(d):
+            return False
+        enc = next(d.glob("encoder*.int8.onnx"), d / "encoder.int8.onnx")
+        dec = next(d.glob("decoder*.int8.onnx"), d / "decoder.int8.onnx")
+        joi = next(d.glob("joiner*.int8.onnx"), d / "joiner.int8.onnx")
+        return (
+            _file_ok(enc, 200_000_000)
+            and _file_ok(dec, 5_000_000)
+            and _file_ok(joi, 1_000_000)
+            and _file_ok(d / "tokens.txt", 100)
+        )
+
+    def is_parakeet_eu_ready(self) -> bool:
+        return self._parakeet_eu_has_weights() and _file_ok(self.silero_vad_path, 500_000)
 
     def _whisper_turbo_has_weights(self) -> bool:
         d = self.whisper_turbo_dir
@@ -691,6 +720,19 @@ class ModelManager:
                     else "Chưa tải (~247 MB)",
                 ),
             )
+            parakeet_eu_state = self._states.get(
+                "parakeet-eu",
+                DownloadState(
+                    model_id="parakeet-eu",
+                    status="ready" if self.is_parakeet_eu_ready() else "missing",
+                    progress=100.0 if self.is_parakeet_eu_ready() else 0.0,
+                    total_mb=465.0,
+                    downloaded_mb=465.0 if self.is_parakeet_eu_ready() else 0.0,
+                    message="Sẵn sàng (Parakeet-Ultra 25 NN Châu Âu • ~0.3s • 0% GPU)"
+                    if self.is_parakeet_eu_ready()
+                    else "Chưa tải (~465 MB)",
+                ),
+            )
             whisper_turbo_state = self._states.get(
                 "whisper-turbo",
                 DownloadState(
@@ -777,6 +819,7 @@ class ModelManager:
                 "asr_moonshine_ja": asdict(moonshine_ja_state),
                 "asr_moonshine_ko": asdict(moonshine_ko_state),
                 "asr_zipformer_multi": asdict(zf_multi_state),
+                "asr_parakeet_eu": asdict(parakeet_eu_state),
                 "asr_whisper_turbo": asdict(whisper_turbo_state),
                 "asr_vietasr": {
                     "model_id": "viet-asr",
@@ -1227,6 +1270,56 @@ class ModelManager:
             on_progress=on_progress,
         )
 
+    def ensure_parakeet_eu(self, on_progress: Optional[Callable[[dict], None]] = None) -> Path:
+        if self.is_parakeet_eu_ready():
+            self._update_state("parakeet-eu", on_progress, status="ready", progress=100.0)
+            return self.parakeet_eu_dir
+
+        if self._parakeet_eu_has_weights() and not _file_ok(self.silero_vad_path, 500_000):
+            self._update_state(
+                "parakeet-eu",
+                on_progress,
+                status="downloading",
+                progress=92.0,
+                downloaded_mb=462.0,
+                total_mb=465.0,
+                message="Đang tải Silero VAD v5 (~2.2 MB)...",
+            )
+            try:
+                with self._make_http_client() as client:
+                    self._download_file_resumable(
+                        client,
+                        SILERO_VAD_URL,
+                        self.parakeet_eu_dir / "silero_vad_v5.onnx",
+                        expected_bytes=2_313_101,
+                    )
+                _mark_ready(self.parakeet_eu_dir)
+                self._update_state(
+                    "parakeet-eu",
+                    on_progress,
+                    status="ready",
+                    progress=100.0,
+                    downloaded_mb=465.0,
+                    total_mb=465.0,
+                    message="Sẵn sàng (Parakeet-Ultra 25 NN Châu Âu • ~0.3s • 0% GPU)",
+                )
+                return self.parakeet_eu_dir
+            except Exception as exc:
+                self._update_state("parakeet-eu", on_progress, status="error", message=f"Lỗi tải Silero VAD: {exc}")
+                raise
+
+        return self._download_and_extract_tar_bz2(
+            model_id="parakeet-eu",
+            url=PARAKEET_EU_URL,
+            dirname=PARAKEET_EU_DIRNAME,
+            dest_dir=self.parakeet_eu_dir,
+            expected_mb=465.0,
+            start_msg="Đang tải Parakeet-TDT-0.6B-Ultra 25 NN Châu Âu + Silero VAD (~465 MB • ~0.3s)...",
+            ready_msg="Sẵn sàng (Parakeet-Ultra 25 NN Châu Âu • ~0.3s • 0% GPU)",
+            on_progress=on_progress,
+            extra_files=[("silero_vad_v5.onnx", SILERO_VAD_URL, 2_313_101)],
+        )
+
     def ensure_whisper_turbo(self, on_progress: Optional[Callable[[dict], None]] = None) -> Path:
         if self.is_whisper_turbo_ready():
             self._update_state("whisper-turbo", on_progress, status="ready", progress=100.0)
@@ -1531,6 +1624,7 @@ class ModelManager:
             "opus-en-vi": self.opus_en_vi_dir,
             "envit5": self.envit5_dir,
             "whisper-turbo": self.whisper_turbo_dir,
+            "parakeet-eu": self.parakeet_eu_dir,
             "moonshine-en": self.moonshine_en_dir,
             "moonshine-ja": self.moonshine_ja_dir,
             "moonshine-ko": self.moonshine_ko_dir,

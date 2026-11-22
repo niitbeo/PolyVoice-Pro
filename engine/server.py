@@ -89,6 +89,7 @@ from asr_engine import (
     MoonshineEnStreamingEngine,
     MoonshineJaStreamingEngine,
     MoonshineV2EnRefiner,
+    ParakeetEuStreamingEngine,
     VietASRBatchRefiner,
     VietASRStreamingEngine,
     WhisperTurboStreamingEngine,
@@ -518,6 +519,8 @@ class EngineRuntime:
         self._asr_moonshine_ko_remote: Optional[MoonshineJaStreamingEngine] = None
         self._asr_zf_multi: Optional[ZipformerStreamingMultiEngine] = None
         self._asr_zf_multi_remote: Optional[ZipformerStreamingMultiEngine] = None
+        self._asr_parakeet_eu: Optional[ParakeetEuStreamingEngine] = None
+        self._asr_parakeet_eu_remote: Optional[ParakeetEuStreamingEngine] = None
         self._asr_viet: Optional[VietASRStreamingEngine] = None
         self._asr_whisper: Optional[WhisperTurboStreamingEngine] = None
         self._asr_whisper_remote: Optional[WhisperTurboStreamingEngine] = None
@@ -1032,6 +1035,27 @@ class EngineRuntime:
                     slot.set_language(lang_code or "tha_Thai")
                 return slot
 
+            if engine_name == "parakeet-eu":
+                if not self.model_manager.is_parakeet_eu_ready():
+                    raise RuntimeError(
+                        "Model Parakeet-Ultra 25 NN Châu Âu chưa được tải (~465 MB). "
+                        "Hãy bấm nút 'Tải ~465 MB' ngay dưới ô chọn ngôn ngữ hoặc tải Gói 3."
+                    )
+                use_remote_slot = remote and self._active_asr_label == "parakeet-eu"
+                slot = self._asr_parakeet_eu_remote if use_remote_slot else self._asr_parakeet_eu
+                if slot is None:
+                    slot = ParakeetEuStreamingEngine(
+                        self.model_manager.parakeet_eu_dir,
+                        vad_model=self.model_manager.silero_vad_path,
+                        sample_rate=SAMPLE_RATE,
+                        num_threads=min(4, _adaptive_mt_threads()),
+                    )
+                    if use_remote_slot:
+                        self._asr_parakeet_eu_remote = slot
+                    else:
+                        self._asr_parakeet_eu = slot
+                return slot
+
             if engine_name == "whisper-turbo":
                 if not self.model_manager.is_whisper_turbo_ready():
                     raise RuntimeError(
@@ -1442,6 +1466,8 @@ class EngineRuntime:
             return self.model_manager.is_moonshine_ko_ready() and self.model_manager.is_silero_vad_ready()
         if model_id == "zipformer-multi":
             return self.model_manager.is_zipformer_multi_ready()
+        if model_id == "parakeet-eu":
+            return self.model_manager.is_parakeet_eu_ready()
         if model_id == "whisper-turbo":
             return self.model_manager.is_whisper_turbo_ready()
         return False
@@ -1544,7 +1570,7 @@ class EngineRuntime:
             "listening": self._listening,
             "active_asr_label": self._active_asr_label,
             "remote_asr_label": self._remote_asr_label,
-            "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_en is not None) or (self._asr_zf_multi is not None) or (self._asr_hybrid_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_moonshine_ja is not None) or (self._asr_moonshine_ko is not None) or (self._asr_whisper is not None),
+            "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_en is not None) or (self._asr_zf_multi is not None) or (self._asr_hybrid_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_moonshine_ja is not None) or (self._asr_moonshine_ko is not None) or (self._asr_parakeet_eu is not None) or (self._asr_whisper is not None),
             "pass2_loaded": self._pass2_refiner is not None,
             "hotwords_active": self._asr_zf_vi._hotwords_count if self._asr_zf_vi is not None else 0,
             "zipformer_ready": self.model_manager.is_zipformer_streaming_ready(),
@@ -1553,6 +1579,7 @@ class EngineRuntime:
             "moonshine_en_ready": self.model_manager.is_moonshine_en_ready(),
             "moonshine_ja_ready": self.model_manager.is_moonshine_ja_ready(),
             "moonshine_ko_ready": self.model_manager.is_moonshine_ko_ready(),
+            "parakeet_eu_ready": self.model_manager.is_parakeet_eu_ready(),
             "whisper_turbo_ready": self.model_manager.is_whisper_turbo_ready(),
             "hymt2_ready": self.model_manager.is_hymt2_ready() and self._llama_server_ready,
             "hymt2_loaded": self._hymt2 is not None and self._hymt2.is_running,
@@ -1620,6 +1647,9 @@ class EngineRuntime:
             elif model_id == "zipformer-multi":
                 self._asr_zf_multi = None
                 self._asr_zf_multi_remote = None
+            elif model_id == "parakeet-eu":
+                self._asr_parakeet_eu = None
+                self._asr_parakeet_eu_remote = None
             elif model_id == "whisper-turbo":
                 for w in (self._asr_whisper, self._asr_whisper_remote):
                     if w is not None:
@@ -1700,6 +1730,8 @@ class EngineRuntime:
                     self.model_manager.ensure_moonshine_ko(on_progress=_on_progress)
                 elif model_id == "zipformer-multi":
                     self.model_manager.ensure_zipformer_multi(on_progress=_on_progress)
+                elif model_id == "parakeet-eu":
+                    self.model_manager.ensure_parakeet_eu(on_progress=_on_progress)
                 elif model_id == "whisper-turbo":
                     self.model_manager.ensure_whisper_turbo(on_progress=_on_progress)
                 elif model_id == "opus-vi-en":
@@ -1853,6 +1885,11 @@ class EngineRuntime:
                 if self._asr_zf_multi is not None or self._asr_zf_multi_remote is not None:
                     self._asr_zf_multi = None
                     self._asr_zf_multi_remote = None
+                    released = True
+            if "parakeet-eu" not in keep_asr:
+                if self._asr_parakeet_eu is not None or self._asr_parakeet_eu_remote is not None:
+                    self._asr_parakeet_eu = None
+                    self._asr_parakeet_eu_remote = None
                     released = True
             if "en-pass2" not in keep_pass2 and "hybrid-en" not in keep_asr and self._en_pass2_refiner is not None:
                 self._en_pass2_refiner = None
@@ -2303,6 +2340,14 @@ class EngineRuntime:
             self._asr_hybrid_en_remote = None
             self._asr_moonshine_en = None
             self._asr_moonshine_en_remote = None
+            self._asr_moonshine_ja = None
+            self._asr_moonshine_ja_remote = None
+            self._asr_moonshine_ko = None
+            self._asr_moonshine_ko_remote = None
+            self._asr_zf_multi = None
+            self._asr_zf_multi_remote = None
+            self._asr_parakeet_eu = None
+            self._asr_parakeet_eu_remote = None
             self._asr_whisper = None
             self._asr_whisper_remote = None
 
@@ -3161,6 +3206,7 @@ class EngineRuntime:
                 is_sentence_asr = (
                     ((out.provider.startswith("whisper-turbo") or out.provider in ("moonshine-v2-ja", "moonshine-v2-ko")) and not is_short_unpunctuated_cjk)
                     or out.provider == "moonshine-v2-en"
+                    or (out.provider == "parakeet-tdt-0.6b-ultra" and (wc >= 5 or is_stop_flush))
                     or (out.provider == "hybrid-en-vad-moonshine" and wc >= 5 and not is_incomplete_en)
                 )
                 if is_sentence_asr:
@@ -4036,6 +4082,7 @@ def api_download_model(model_id: str):
         "moonshine-en",
         "moonshine-ja",
         "moonshine-ko",
+        "parakeet-eu",
         "whisper-turbo",
         "opus-vi-en",
         "opus-en-vi",
