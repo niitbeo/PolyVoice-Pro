@@ -87,11 +87,13 @@ from asr_engine import (
     ASROutput,
     HybridEnStreamingEngine,
     MoonshineEnStreamingEngine,
+    MoonshineJaStreamingEngine,
     MoonshineV2EnRefiner,
     VietASRBatchRefiner,
     VietASRStreamingEngine,
     WhisperTurboStreamingEngine,
     ZipformerStreamingEnEngine,
+    ZipformerStreamingMultiEngine,
     ZipformerStreamingViEngine,
     restore_vietnamese_casing,
 )
@@ -112,6 +114,7 @@ from glossary import GlossaryManager
 from languages import (
     get_hymt2_lang_name,
     get_language,
+    get_source_asr_profile,
     get_source_language,
     get_whisper_lang_code,
     list_languages,
@@ -509,6 +512,12 @@ class EngineRuntime:
         self._asr_hybrid_en_remote: Optional[HybridEnStreamingEngine] = None
         self._asr_moonshine_en: Optional[MoonshineEnStreamingEngine] = None
         self._asr_moonshine_en_remote: Optional[MoonshineEnStreamingEngine] = None
+        self._asr_moonshine_ja: Optional[MoonshineJaStreamingEngine] = None
+        self._asr_moonshine_ja_remote: Optional[MoonshineJaStreamingEngine] = None
+        self._asr_moonshine_ko: Optional[MoonshineJaStreamingEngine] = None
+        self._asr_moonshine_ko_remote: Optional[MoonshineJaStreamingEngine] = None
+        self._asr_zf_multi: Optional[ZipformerStreamingMultiEngine] = None
+        self._asr_zf_multi_remote: Optional[ZipformerStreamingMultiEngine] = None
         self._asr_viet: Optional[VietASRStreamingEngine] = None
         self._asr_whisper: Optional[WhisperTurboStreamingEngine] = None
         self._asr_whisper_remote: Optional[WhisperTurboStreamingEngine] = None
@@ -958,12 +967,70 @@ class EngineRuntime:
                         self._asr_moonshine_en = slot
                 return slot
 
+            if engine_name == "moonshine-ja":
+                if not (self.model_manager.is_moonshine_ja_ready() and self.model_manager.is_silero_vad_ready()):
+                    raise RuntimeError("Model tiếng Nhật Moonshine-v2 chưa được tải. Hãy bấm tải trong mục Mô hình Offline (~99 MB).")
+                use_remote_slot = remote and self._active_asr_label == "moonshine-ja"
+                slot = self._asr_moonshine_ja_remote if use_remote_slot else self._asr_moonshine_ja
+                if slot is None:
+                    slot = MoonshineJaStreamingEngine(
+                        self.model_manager.moonshine_ja_dir,
+                        vad_model=self.model_manager.silero_vad_path,
+                        sample_rate=SAMPLE_RATE,
+                        num_threads=min(4, _adaptive_mt_threads()),
+                        language="ja",
+                    )
+                    if use_remote_slot:
+                        self._asr_moonshine_ja_remote = slot
+                    else:
+                        self._asr_moonshine_ja = slot
+                return slot
+
+            if engine_name == "moonshine-ko":
+                if not (self.model_manager.is_moonshine_ko_ready() and self.model_manager.is_silero_vad_ready()):
+                    raise RuntimeError("Model tiếng Hàn Moonshine-v2 chưa được tải. Hãy bấm tải trong mục Mô hình Offline (~47 MB).")
+                use_remote_slot = remote and self._active_asr_label == "moonshine-ko"
+                slot = self._asr_moonshine_ko_remote if use_remote_slot else self._asr_moonshine_ko
+                if slot is None:
+                    slot = MoonshineJaStreamingEngine(
+                        self.model_manager.moonshine_ko_dir,
+                        vad_model=self.model_manager.silero_vad_path,
+                        sample_rate=SAMPLE_RATE,
+                        num_threads=min(4, _adaptive_mt_threads()),
+                        language="ko",
+                    )
+                    if use_remote_slot:
+                        self._asr_moonshine_ko_remote = slot
+                    else:
+                        self._asr_moonshine_ko = slot
+                return slot
+
             if engine_name == "zipformer-en-20m":
                 if self._asr_zf_en is None:
                     if not self.model_manager.is_zipformer_en_20m_ready():
                         raise RuntimeError("Model tiếng Anh Zipformer-20M chưa được tải. Hãy bấm tải hoặc chọn Apple Neural Engine.")
                     self._asr_zf_en = ZipformerStreamingEnEngine(self.model_manager.zipformer_en_20m_dir)
                 return self._asr_zf_en
+
+            if engine_name == "zipformer-multi":
+                if not self.model_manager.is_zipformer_multi_ready():
+                    raise RuntimeError("Model Zipformer Streaming Đa ngôn ngữ (Thái/Trung/Indo) chưa được tải (~247 MB).")
+                use_remote_slot = remote and self._active_asr_label == "zipformer-multi"
+                slot = self._asr_zf_multi_remote if use_remote_slot else self._asr_zf_multi
+                if slot is None:
+                    slot = ZipformerStreamingMultiEngine(
+                        self.model_manager.zipformer_multi_dir,
+                        language=lang_code or "tha_Thai",
+                        sample_rate=SAMPLE_RATE,
+                        num_threads=min(4, _adaptive_mt_threads()),
+                    )
+                    if use_remote_slot:
+                        self._asr_zf_multi_remote = slot
+                    else:
+                        self._asr_zf_multi = slot
+                else:
+                    slot.set_language(lang_code or "tha_Thai")
+                return slot
 
             if engine_name == "whisper-turbo":
                 if not self.model_manager.is_whisper_turbo_ready():
@@ -980,7 +1047,7 @@ class EngineRuntime:
                         vad_model=self.model_manager.silero_vad_path,
                         language=iso,
                         sample_rate=SAMPLE_RATE,
-                        num_threads=_adaptive_mt_threads(),
+                        num_threads=min(4, _adaptive_mt_threads()),
                     )
                     if use_remote_slot:
                         self._asr_whisper_remote = slot
@@ -1364,40 +1431,98 @@ class EngineRuntime:
         nllb = self.ensure_nllb_loaded(prefer_13b=(mt_mode == "nllb-1.3b"))
         return _finish(nllb.translate(masked, source_lang, target_lang, beam_size=eff_beam))
 
+    def _is_asr_model_ready(self, model_id: str) -> bool:
+        if model_id == "zipformer-30m-streaming":
+            return self.model_manager.is_zipformer_streaming_ready()
+        if model_id == "moonshine-en":
+            return self.model_manager.is_moonshine_en_ready()
+        if model_id == "moonshine-ja":
+            return self.model_manager.is_moonshine_ja_ready() and self.model_manager.is_silero_vad_ready()
+        if model_id == "moonshine-ko":
+            return self.model_manager.is_moonshine_ko_ready() and self.model_manager.is_silero_vad_ready()
+        if model_id == "zipformer-multi":
+            return self.model_manager.is_zipformer_multi_ready()
+        if model_id == "whisper-turbo":
+            return self.model_manager.is_whisper_turbo_ready()
+        return False
+
+    def get_source_readiness(self, lang_code: str) -> dict[str, Any]:
+        """Return declarative 3-tier readiness metadata for any source language."""
+        prof = get_source_asr_profile(lang_code)
+        pref_ready = self._is_asr_model_ready(prof.preferred_model)
+        # Vietnamese also has built-in viet-asr; English can fall back to zipformer-en-20m
+        if lang_code == "vie_Latn":
+            pref_ready = pref_ready or True
+        fallback_ready = self._is_asr_model_ready(prof.fallback_model)
+        apple_ready = (self.mac_helper is not None) and (lang_code not in ("lao_Laoo", "khm_Khmr", "mya_Mymr"))
+
+        if pref_ready:
+            active_tier = prof.asr_tier
+            ready = True
+        elif lang_code == "eng_Latn" and self.model_manager.is_zipformer_en_20m_ready():
+            active_tier = "fast"
+            ready = True
+        elif fallback_ready:
+            active_tier = "experimental" if prof.asr_tier == "experimental" else "universal"
+            ready = True
+        elif apple_ready:
+            active_tier = "apple"
+            ready = True
+        else:
+            active_tier = "missing"
+            ready = False
+
+        return {
+            "lang_code": lang_code,
+            "ready": ready,
+            "preferred_ready": pref_ready,
+            "fallback_ready": fallback_ready,
+            "active_tier": active_tier,
+            "preferred_model": prof.preferred_model,
+            "preferred_model_mb": prof.preferred_model_mb,
+            "fallback_model": prof.fallback_model,
+            "recommended_pack": prof.recommended_pack,
+            "asr_tier": prof.asr_tier,
+            "note": prof.asr_note,
+        }
+
     def _resolve_asr_choice_for_lang(self, lang_code: str, forced_engine: str = "auto") -> str:
-        """Pick optimal ASR backend given language code and OS."""
+        """Pick optimal ASR backend via 3-tier declarative registry: Fast-Lane -> Universal 99 NN -> OS Native."""
         if forced_engine != "auto":
             return forced_engine
 
+        prof = get_source_asr_profile(lang_code)
+
+        # Tier 1: Fast-Lane dedicated streaming models (30-400ms, 0% GPU)
         if lang_code == "vie_Latn":
-            if self.model_manager.is_zipformer_streaming_ready():
-                return "zipformer-30m-streaming"
-            return "viet-asr"
+            return "zipformer-30m-streaming" if self.model_manager.is_zipformer_streaming_ready() else "viet-asr"
 
         if lang_code == "eng_Latn":
-            # v0.9.1 Zero-Overlap Silero VAD v5 + Moonshine-v2 (0% duplicates, 0 mid-word cuts, 1.8% WER previews!)
             if self.model_manager.is_moonshine_en_ready() and self.model_manager.is_silero_vad_ready():
                 return "hybrid-en"
             if self.model_manager.is_zipformer_en_20m_ready():
                 return "zipformer-en-20m"
             if self.model_manager.is_moonshine_en_ready():
                 return "moonshine-en"
-            if self.model_manager.is_whisper_turbo_ready():
-                return "whisper-turbo"
-            if self.mac_helper is not None:
-                return "apple-native"
-            raise RuntimeError("Chưa có model nhận dạng tiếng Anh (hãy tải Zipformer-20M EN hoặc Moonshine-v2 EN).")
+        elif prof.preferred_model != "whisper-turbo" and self._is_asr_model_ready(prof.preferred_model):
+            return prof.preferred_model
 
-        # For Lao, Thai, Japanese, Chinese, Korean, Khmer, French, German, etc.:
-        # Prefer cross-platform Whisper Large-v3-Turbo + Silero VAD v5 when downloaded (100% offline Win & Mac, incl. Lao!)
+        # Tier 2: Universal 99-language cross-platform safety net (Whisper Large-v3-Turbo + Silero VAD v5)
         if self.model_manager.is_whisper_turbo_ready():
             return "whisper-turbo"
-        if self.mac_helper is not None and lang_code not in ("lao_Laoo", "khm_Khmr"):
+
+        # Tier 3: macOS Apple Neural Engine fallback (~60 system locales)
+        if self.mac_helper is not None and lang_code not in ("lao_Laoo", "khm_Khmr", "mya_Mymr"):
             return "apple-native"
+
         src_meta = get_source_language(lang_code)
         lang_label = src_meta.name_vi if src_meta else lang_code
+        if prof.preferred_model != "whisper-turbo":
+            raise RuntimeError(
+                f"Chưa tải gói nghe offline cho {lang_label}. Hãy bấm nút 'Tải ngay (~{prof.preferred_model_mb} MB)' hoặc tải Gói Toàn cầu 99 NN."
+            )
         raise RuntimeError(
-            f"Để nhận dạng giọng nói {lang_label} offline (Windows & macOS), hãy mở 'Mô hình Offline' và tải 'Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)' (~540 MB)."
+            f"Để nhận dạng giọng nói {lang_label} offline (Windows & macOS), hãy bấm tải 'Gói Toàn cầu 99 NN (Whisper-Turbo • 540 MB)'."
         )
 
     def _resolve_asr_choice(self, cfg: SessionConfig) -> str:
@@ -1419,12 +1544,15 @@ class EngineRuntime:
             "listening": self._listening,
             "active_asr_label": self._active_asr_label,
             "remote_asr_label": self._remote_asr_label,
-            "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_en is not None) or (self._asr_hybrid_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_whisper is not None),
+            "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_en is not None) or (self._asr_zf_multi is not None) or (self._asr_hybrid_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_moonshine_ja is not None) or (self._asr_moonshine_ko is not None) or (self._asr_whisper is not None),
             "pass2_loaded": self._pass2_refiner is not None,
             "hotwords_active": self._asr_zf_vi._hotwords_count if self._asr_zf_vi is not None else 0,
             "zipformer_ready": self.model_manager.is_zipformer_streaming_ready(),
             "zipformer_en_ready": self.model_manager.is_zipformer_en_20m_ready(),
+            "zipformer_multi_ready": self.model_manager.is_zipformer_multi_ready(),
             "moonshine_en_ready": self.model_manager.is_moonshine_en_ready(),
+            "moonshine_ja_ready": self.model_manager.is_moonshine_ja_ready(),
+            "moonshine_ko_ready": self.model_manager.is_moonshine_ko_ready(),
             "whisper_turbo_ready": self.model_manager.is_whisper_turbo_ready(),
             "hymt2_ready": self.model_manager.is_hymt2_ready() and self._llama_server_ready,
             "hymt2_loaded": self._hymt2 is not None and self._hymt2.is_running,
@@ -1441,6 +1569,7 @@ class EngineRuntime:
             "apple_caps": self.apple_caps,
             "config": cfg_public,
             "source_lang_meta": asdict(src) if src else None,
+            "active_source_readiness": self.get_source_readiness(self.config.source_lang),
             "target_lang_meta": asdict(tgt) if tgt else None,
             "logs": self.logger.get_status(),
             "audience": self.get_audience_summary(),
@@ -1482,6 +1611,15 @@ class EngineRuntime:
                 self._asr_hybrid_en_remote = None
                 self._asr_moonshine_en = None
                 self._asr_moonshine_en_remote = None
+            elif model_id == "moonshine-ja":
+                self._asr_moonshine_ja = None
+                self._asr_moonshine_ja_remote = None
+            elif model_id == "moonshine-ko":
+                self._asr_moonshine_ko = None
+                self._asr_moonshine_ko_remote = None
+            elif model_id == "zipformer-multi":
+                self._asr_zf_multi = None
+                self._asr_zf_multi_remote = None
             elif model_id == "whisper-turbo":
                 for w in (self._asr_whisper, self._asr_whisper_remote):
                     if w is not None:
@@ -1556,6 +1694,12 @@ class EngineRuntime:
                 elif model_id == "moonshine-en":
                     self.model_manager.ensure_moonshine_en(on_progress=_on_progress)
                     _try_warm_load(self.ensure_en_pass2_refiner)
+                elif model_id == "moonshine-ja":
+                    self.model_manager.ensure_moonshine_ja(on_progress=_on_progress)
+                elif model_id == "moonshine-ko":
+                    self.model_manager.ensure_moonshine_ko(on_progress=_on_progress)
+                elif model_id == "zipformer-multi":
+                    self.model_manager.ensure_zipformer_multi(on_progress=_on_progress)
                 elif model_id == "whisper-turbo":
                     self.model_manager.ensure_whisper_turbo(on_progress=_on_progress)
                 elif model_id == "opus-vi-en":
@@ -1694,6 +1838,21 @@ class EngineRuntime:
                 if self._asr_moonshine_en is not None or self._asr_moonshine_en_remote is not None:
                     self._asr_moonshine_en = None
                     self._asr_moonshine_en_remote = None
+                    released = True
+            if "moonshine-ja" not in keep_asr:
+                if self._asr_moonshine_ja is not None or self._asr_moonshine_ja_remote is not None:
+                    self._asr_moonshine_ja = None
+                    self._asr_moonshine_ja_remote = None
+                    released = True
+            if "moonshine-ko" not in keep_asr:
+                if self._asr_moonshine_ko is not None or self._asr_moonshine_ko_remote is not None:
+                    self._asr_moonshine_ko = None
+                    self._asr_moonshine_ko_remote = None
+                    released = True
+            if "zipformer-multi" not in keep_asr:
+                if self._asr_zf_multi is not None or self._asr_zf_multi_remote is not None:
+                    self._asr_zf_multi = None
+                    self._asr_zf_multi_remote = None
                     released = True
             if "en-pass2" not in keep_pass2 and "hybrid-en" not in keep_asr and self._en_pass2_refiner is not None:
                 self._en_pass2_refiner = None
@@ -2373,6 +2532,8 @@ class EngineRuntime:
         merged = clean_parts[0]
         for nxt in clean_parts[1:]:
             if merged.endswith((".", "!", "?", "…")):
+                if nxt and nxt[0].islower():
+                    nxt = nxt[0].upper() + nxt[1:]
                 merged = f"{merged} {nxt}"
             else:
                 words_nxt = nxt.split()
@@ -2389,8 +2550,13 @@ class EngineRuntime:
                     nxt_norm = nxt[0].lower() + nxt[1:]
                 else:
                     nxt_norm = nxt
-                # Avoid awkward commas after connectors ("to the, cloud") or before 1-2 word tails ("triệu, đồng")
-                if cls._ends_with_connector(merged) or len(nxt_norm.split()) <= 2:
+                # Avoid awkward commas after connectors ("Liệu rằng, thành công" / "to the, cloud"),
+                # before Vietnamese relative/subordinating linkers ("điều, mà"), or 1-2 word tails ("triệu, đồng")
+                nxt_first_low = first_clean.lower()
+                no_comma_before = nxt_first_low in {
+                    "mà", "rằng", "là", "của", "cho", "về", "với", "trong", "để", "nên", "thì",
+                }
+                if cls._ends_with_connector(merged) or no_comma_before or len(nxt_norm.split()) <= 2:
                     merged = f"{merged} {nxt_norm}"
                 else:
                     merged = f"{merged}, {nxt_norm}"
@@ -2480,9 +2646,74 @@ class EngineRuntime:
         res = re.sub(r"\s+([,.;:!?])", r"\1", res)
         if source_lang == "vie_Latn":
             res = restore_vietnamese_casing(res)
+        elif source_lang == "eng_Latn":
+            # Polish common STEM dimension tokens (e.g. "3d world" -> "3D world", "2d screen" -> "2D screen")
+            res = re.sub(r"\b([234])d\b", r"\1D", res)
         if had_leading_cap and res and res[0].islower():
             res = res[0].upper() + res[1:]
         return res
+
+    @staticmethod
+    def _capitalize_sentence_start(text: str) -> str:
+        """Capitalize sentence-initial lowercase letter while preserving camelCase brands (iPhone, iOS, macOS)."""
+        s = (text or "").strip()
+        if not s or not s[0].islower():
+            return s
+        first_tok = s.split(None, 1)[0].strip(".,!?;:\"'()[]")
+        if len(first_tok) > 1 and any(ch.isupper() for ch in first_tok[1:]):
+            return s
+        return s[0].upper() + s[1:]
+
+    @staticmethod
+    def _ends_with_open_en_modifier(text: str) -> bool:
+        """
+        Detect unpunctuated English fragments ending mid-noun-phrase on `<determiner> <adjective/adverb>`
+        (e.g. '...and enter a vibrant' before 'physical 3D world.'), so brief VAD pauses don't split
+        an adjective from its noun and make MT hallucinate a missing noun.
+        """
+        stripped = (text or "").strip()
+        if not stripped or stripped.endswith((".", "!", "?", "…")):
+            return False
+        words = stripped.rstrip(",;: ").split()
+        if len(words) < 2:
+            return False
+        det = words[-2].lower().strip("\"'()[]")
+        mod = words[-1].lower().strip("\"'()[],;:")
+        if det not in {
+            "a", "an", "the", "this", "that", "these", "those",
+            "my", "our", "your", "their", "his", "her", "its",
+        }:
+            return False
+        if not mod or not mod.isalpha():
+            return False
+        open_mods = {
+            "new", "old", "big", "small", "large", "great", "good", "bad", "high", "low",
+            "long", "short", "fast", "slow", "smart", "deep", "wide", "full", "whole",
+            "next", "first", "last", "same", "other", "real", "true", "main", "key",
+            "major", "minor", "modern", "global", "national", "human", "physical",
+            "digital", "virtual", "vibrant", "brilliant", "brave", "separate", "complex",
+            "simple", "single", "double", "special", "specific", "certain", "entire",
+            "unique", "common", "clear", "strong", "weak", "early", "late", "young",
+            "free", "open", "safe", "clean", "pure", "rich", "poor", "dark", "bright",
+            "sharp", "smooth", "soft", "hard", "heavy", "huge", "vast", "tiny", "massive",
+            "rapid", "quick", "steady", "broad", "narrow", "direct", "exact", "complete",
+            "proper", "solid", "stable", "very", "more", "most", "really", "truly",
+            "highly", "deeply", "largely", "totally", "fully", "nearly", "almost",
+            "important", "different", "powerful", "beautiful", "wonderful", "amazing",
+            "exciting", "surprising", "interesting", "intelligent", "autonomous",
+            "mechanical", "electrical", "chemical", "biological", "medical", "technical",
+            "practical", "academic", "scientific", "economic", "social", "cultural",
+            "political", "historical", "environmental", "educational", "international",
+            "largest", "smallest", "biggest", "greatest", "highest", "lowest", "best",
+            "worst", "fastest", "smartest", "strongest", "richest", "deepest",
+        }
+        if mod in open_mods:
+            return True
+        if len(mod) >= 5 and mod.endswith(("ous", "ful", "less")):
+            return True
+        if len(mod) >= 6 and mod.endswith(("able", "ible")) and mod not in {"vegetable", "timetable", "syllable"}:
+            return True
+        return False
 
     @staticmethod
     def _ends_with_connector(text: str) -> bool:
@@ -2493,7 +2724,7 @@ class EngineRuntime:
             "và", "hoặc", "nhưng", "mà", "thì", "là", "của", "vì", "nếu", "để",
             "nên", "với", "cho", "trong", "khi", "cũng", "hay", "như", "tại",
             "cái", "những", "các", "một", "đôi", "sẽ", "đang", "có", "bị", "được",
-            "tận", "cả", "đối",
+            "tận", "cả", "đối", "rằng", "liệu", "tuy", "dù", "mặc", "bởi", "chứ",
             "and", "but", "so", "to", "that", "because", "with", "the", "of", "in", "for", "or", "a", "an",
         }
         if words[-1] in single_connectors:
@@ -2516,7 +2747,34 @@ class EngineRuntime:
         """
         words = text.split()
         n = len(words)
-        if n <= min_words or not cls._ends_with_connector(text):
+        if n <= min_words:
+            return text, ""
+
+        # 0) If a long Vietnamese clause opens a contrastive/conditional sub-clause in its last 2..6 words
+        #    without a closing "thì"/"nên" yet (e.g. "...có hạnh phúc, thế nhưng không có tiền"),
+        #    split cleanly right BEFORE that opener so both halves translate as complete sentences!
+        if n >= min_words + 4:
+            open_pairs = {
+                ("thế", "nhưng"),
+                ("nhưng", "mà"),
+                ("tuy", "nhiên"),
+                ("nếu", "như"),
+                ("và", "khi"),
+            }
+            search_start = max(min_words, n - 7)
+            for i in range(n - 2, search_start - 1, -1):
+                w_a = words[i].lower().strip(".,!?;:\"'()[]")
+                w_b = words[i + 1].lower().strip(".,!?;:\"'()[]")
+                if (w_a, w_b) in open_pairs:
+                    tail_words = words[i:]
+                    tail_low = {w.lower().strip(".,!?;:\"'()[]") for w in tail_words[2:]}
+                    if 2 <= len(tail_words) <= 7 and "thì" not in tail_low and "nên" not in tail_low:
+                        head = " ".join(words[:i]).rstrip(" ,;")
+                        tail = " ".join(tail_words).strip()
+                        if head and tail:
+                            return head, tail
+
+        if not cls._ends_with_connector(text):
             return text, ""
 
         # Search backwards up to 10 words for a clean boundary while keeping >= min_words
@@ -2760,11 +3018,17 @@ class EngineRuntime:
             return
 
         prot_terms = set(self._get_glossary_hotwords())
-        display_text = self._clean_verbatim(
-            self.glossary.apply_asr_fixes(full_text),
-            src_lang,
-            protected_terms=prot_terms,
+        display_text = self._capitalize_sentence_start(
+            self._clean_verbatim(
+                self.glossary.apply_asr_fixes(full_text),
+                src_lang,
+                protected_terms=prot_terms,
+            )
         )
+        # On Stop, drop an orphaned 1-word trailing connector/filler (e.g. "Là" -> "Is") so
+        # Spotlight & History never end on a stray fragment when the user stops mid-sentence.
+        if is_stop_flush and len(display_text.split()) == 1 and self._ends_with_connector(display_text):
+            return
         speaker_tag = "self" if self.config.audio_source == "dual" else ""
         self.broadcast_threadsafe(
             {
@@ -2878,12 +3142,27 @@ class EngineRuntime:
                 self._para_has_active_partial = False
                 self._para_parts.append(out.text)
                 combined = self._join_fragments(self._para_parts, preserve_case=self._get_capitalized_glossary_words())
-                is_sentence_asr = (
-                    out.provider.startswith("whisper-turbo")
-                    or out.provider == "moonshine-v2-en"
-                    or (out.provider == "hybrid-en-vad-moonshine" and len(combined.split()) >= 5)
-                )
+                wc = len(combined.split())
                 is_non_spaced = src_lang.startswith(_NON_SPACED_SCRIPT_PREFIXES)
+                is_short_unpunctuated_cjk = (
+                    (out.provider.startswith("whisper-turbo") or out.provider == "moonshine-v2-ja")
+                    and is_non_spaced
+                    and not is_stop_flush
+                    and len(combined.strip()) <= 6
+                    and not combined.strip().endswith(("。", "！", "？", ".", "!", "?", "…"))
+                )
+                is_incomplete_en = (
+                    out.provider == "hybrid-en-vad-moonshine"
+                    and not is_stop_flush
+                    and wc < 24
+                    and not combined.rstrip().endswith((".", "!", "?", "…"))
+                    and (self._ends_with_connector(combined) or self._ends_with_open_en_modifier(combined))
+                )
+                is_sentence_asr = (
+                    ((out.provider.startswith("whisper-turbo") or out.provider in ("moonshine-v2-ja", "moonshine-v2-ko")) and not is_short_unpunctuated_cjk)
+                    or out.provider == "moonshine-v2-en"
+                    or (out.provider == "hybrid-en-vad-moonshine" and wc >= 5 and not is_incomplete_en)
+                )
                 if is_sentence_asr:
                     # Moonshine-v2 & Whisper-Turbo already commit clean punctuated sentences -> flush immediately!
                     self._flush_paragraph_locked(allow_carry_over=False, is_stop_flush=is_stop_flush)
@@ -2894,17 +3173,35 @@ class EngineRuntime:
                     if len(stripped) >= 14 or stripped.endswith(("。", "！", "？", ".", "!", "?")):
                         self._flush_paragraph_locked(allow_carry_over=False)
                         return
+                    if is_short_unpunctuated_cjk:
+                        # Hold ultra-short CJK fragment (e.g. "今私は" / "しりとりとは") 1 beat so it joins cleanly
+                        seg_id = self._current_segment_id
+                        self.broadcast_threadsafe(
+                            {
+                                "type": "partial",
+                                "data": {
+                                    "id": seg_id,
+                                    "source_text": stripped,
+                                    "source_lang": src_lang,
+                                    "target_lang": tgt_lang,
+                                    "asr_ms": out.latency_ms,
+                                },
+                            }
+                        )
+                        return
 
-                wc = len(combined.split())
                 min_words, target_words, _ = self._paragraph_thresholds()
 
                 should_commit = (
-                    wc >= target_words
-                    or (wc >= min_words and not self._ends_with_connector(combined))
-                    or (
-                        wc >= 6
-                        and combined.endswith((".", "!", "?"))
-                        and not self._ends_with_connector(combined)
+                    not is_incomplete_en
+                    and (
+                        wc >= target_words
+                        or (wc >= min_words and not self._ends_with_connector(combined))
+                        or (
+                            wc >= 6
+                            and combined.endswith((".", "!", "?"))
+                            and not self._ends_with_connector(combined)
+                        )
                     )
                 )
 
@@ -3156,10 +3453,18 @@ class EngineRuntime:
                     self._remote_parts,
                     preserve_case=self._get_capitalized_glossary_words(),
                 )
+                wc = len(combined.split())
+                is_incomplete_en = (
+                    out.provider == "hybrid-en-vad-moonshine"
+                    and wc < 24
+                    and not combined.rstrip().endswith((".", "!", "?", "…"))
+                    and (self._ends_with_connector(combined) or self._ends_with_open_en_modifier(combined))
+                )
                 is_sentence_asr = (
                     out.provider.startswith("whisper-turbo")
                     or out.provider == "moonshine-v2-en"
-                    or (out.provider == "hybrid-en-vad-moonshine" and len(combined.split()) >= 5)
+                    or out.provider in ("moonshine-v2-ja", "moonshine-v2-ko")
+                    or (out.provider == "hybrid-en-vad-moonshine" and wc >= 5 and not is_incomplete_en)
                 )
                 is_non_spaced = r_src.startswith(_NON_SPACED_SCRIPT_PREFIXES)
                 if is_sentence_asr:
@@ -3170,9 +3475,10 @@ class EngineRuntime:
                     if len(stripped) >= 14 or stripped.endswith(("。", "！", "？", ".", "!", "?")):
                         self._remote_flush_locked()
                         return
-                wc = len(combined.split())
                 min_words, target_words, _ = self._paragraph_thresholds()
-                if wc >= target_words or (wc >= min_words and not self._ends_with_connector(combined)):
+                if not is_incomplete_en and (
+                    wc >= target_words or (wc >= min_words and not self._ends_with_connector(combined))
+                ):
                     self._remote_flush_locked()
 
     def _append_remote_pcm(self, chunk: np.ndarray) -> None:
@@ -3349,6 +3655,7 @@ class EngineRuntime:
                     protected_terms=set(self._get_glossary_hotwords()),
                 )
                 source_text = self.glossary.normalize_session_entities(source_text, item["source_lang"])
+                source_text = self._capitalize_sentence_start(source_text)
                 eff_wc = (
                     max(len(source_text.split()), len(source_text) // 4)
                     if item["source_lang"].startswith(_NON_SPACED_SCRIPT_PREFIXES)
@@ -3453,9 +3760,9 @@ class EngineRuntime:
                 if seg_id in self._committed_seg_ids:
                     continue
 
-            # When Finals also run on CPU CTranslate2 (default auto-offline), yield briefly while a Final
-            # sentence is actively translating so drafts never pile onto the same lock or spike CPU!
-            if cfg.mt_mode != "hy-mt2" and (self._final_mt_busy or not self._final_mt_queue.empty()):
+            # Always yield draft MT while any Final sentence is translating or queued (including Hy-MT2 single-slot!)
+            # so Finals never wait behind live drafts!
+            if self._final_mt_busy or not self._final_mt_queue.empty():
                 with self._partial_lock:
                     if self._pending_partial is None and seg_id not in self._committed_seg_ids:
                         self._pending_partial = partial_job
@@ -3725,7 +4032,10 @@ def api_download_model(model_id: str):
         "nllb-600m",
         "zipformer-30m-streaming",
         "zipformer-en-20m",
+        "zipformer-multi",
         "moonshine-en",
+        "moonshine-ja",
+        "moonshine-ko",
         "whisper-turbo",
         "opus-vi-en",
         "opus-en-vi",
@@ -3929,6 +4239,8 @@ async def api_files_translate(
     target_lang: str = Form("eng_Latn"),
     mt_mode: str = Form("auto-offline"),
     job_id: str = Form(""),
+    asr_mode: str = Form("auto"),
+    normalize_audio: bool = Form(True),
 ):
     with runtime._file_job_lock:
         if runtime._file_job_busy:
@@ -3992,6 +4304,8 @@ async def api_files_translate(
             _on_file_progress,
             cancel_ev,
             active_job_id,
+            asr_mode,
+            normalize_audio,
         )
         return result
     except FileTranslateCancelled:

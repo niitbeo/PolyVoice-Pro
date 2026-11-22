@@ -930,6 +930,14 @@ OBS_HTML = (
       transition: opacity 0.35s ease;
     }
     .box.hidden { opacity: 0; }
+    .prev {
+      color: rgba(241, 245, 249, 0.78); font-weight: 600; line-height: 1.35;
+      padding-bottom: 8px; margin-bottom: 8px;
+      border-bottom: 1px dashed rgba(255, 255, 255, 0.18);
+      text-shadow: 0 1px 5px rgba(0,0,0,0.8);
+      display: none;
+    }
+    .prev.show { display: block; }
     .src { color: #cbd5e1; font-weight: 500; margin-bottom: 6px; text-shadow: 0 2px 6px rgba(0,0,0,0.85); }
     .tgt { color: #ffffff; font-weight: 800; line-height: 1.35; text-shadow: 0 2px 8px rgba(0,0,0,0.9); }
     .tgt.draft { color: #fecaca; }
@@ -938,6 +946,7 @@ OBS_HTML = (
 <body>
   <div class="stage">
     <div class="box hidden" id="box">
+      <div class="prev" id="prev"></div>
       <div class="src" id="src"></div>
       <div class="tgt" id="tgt"></div>
     </div>
@@ -948,22 +957,36 @@ OBS_HTML = (
     const showSrc = qp.get("bilingual") !== "0";
     const lang = qp.get("lang") || "follow";
     const box = document.getElementById("box");
+    const prevEl = document.getElementById("prev");
     const srcEl = document.getElementById("src");
     const tgtEl = document.getElementById("tgt");
-    srcEl.style.fontSize = Math.round(size * 0.65) + "px";
+    prevEl.style.fontSize = Math.max(15, Math.round(size * 0.70)) + "px";
+    srcEl.style.fontSize = Math.round(size * 0.62) + "px";
     tgtEl.style.fontSize = size + "px";
     if (!showSrc) srcEl.style.display = "none";
 
     let hideTimer = null;
     let activeId = "";
-    function show(src, tgt, isDraft) {
+    let pendingSrc = "";
+    let lastFinal = null;
+    let prevFinal = null;
+    let dwellHoldUntil = 0;
+
+    function render(prevTgt, src, tgt, isDraft) {
       if (!src && !tgt) return;
+      if (prevTgt) {
+        prevEl.textContent = prevTgt;
+        prevEl.classList.add("show");
+      } else {
+        prevEl.textContent = "";
+        prevEl.classList.remove("show");
+      }
       srcEl.textContent = src || "";
       tgtEl.textContent = tgt || "...";
       tgtEl.classList.toggle("draft", Boolean(isDraft));
       box.classList.remove("hidden");
       if (hideTimer) clearTimeout(hideTimer);
-      hideTimer = setTimeout(() => box.classList.add("hidden"), 12000);
+      hideTimer = setTimeout(() => box.classList.add("hidden"), 18000);
     }
     function connect() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -974,12 +997,28 @@ OBS_HTML = (
           if (m.type === "partial") {
             const same = m.data.id === activeId;
             activeId = m.data.id;
-            show(m.data.source_text, same ? tgtEl.textContent : "...", true);
+            pendingSrc = m.data.source_text || "";
+            // Atomic hold: NEVER wipe out the previous sentence with "..." before new MT arrives!
+            if (same && tgtEl.textContent && tgtEl.textContent !== "...") {
+              render(lastFinal ? lastFinal.translated_text : "", pendingSrc, tgtEl.textContent, true);
+            } else if (!lastFinal) {
+              render("", pendingSrc, "...", true);
+            }
           } else if (m.type === "partial_mt" && m.data.id === activeId) {
-            show(srcEl.textContent, m.data.translated_text, true);
+            const draftTgt = m.data.translated_text || "";
+            const wc = draftTgt.trim().split(/\s+/).filter(Boolean).length;
+            if (lastFinal && Date.now() < dwellHoldUntil && wc < 6) {
+              return;
+            }
+            render(lastFinal ? lastFinal.translated_text : "", pendingSrc, draftTgt, true);
           } else if (m.type === "final") {
             activeId = "";
-            show(m.data.source_text, m.data.translated_text, false);
+            pendingSrc = "";
+            prevFinal = lastFinal;
+            lastFinal = { source_text: m.data.source_text || "", translated_text: m.data.translated_text || "" };
+            const wc = lastFinal.translated_text.trim().split(/\s+/).filter(Boolean).length;
+            dwellHoldUntil = Date.now() + Math.min(2400, Math.max(1200, wc * 85));
+            render(prevFinal ? prevFinal.translated_text : "", lastFinal.source_text, lastFinal.translated_text, false);
           }
         } catch {}
       };

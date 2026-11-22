@@ -358,7 +358,7 @@ class MicrophoneStream:
         self._channel_mode = (channel_mode or "mix").lower()
         self._cond = AudioConditioner(gain_db=gain_db, auto_gain=auto_gain)
 
-        self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=64)
+        self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=200)
         self._stream: Optional[sd.InputStream] = None
         self._reader_thread: Optional[threading.Thread] = None
         self._running = threading.Event()
@@ -573,7 +573,7 @@ class MacSystemAudioStream:
         self.on_error = on_error
         self.on_meter = on_meter
         self._cond = AudioConditioner(gain_db=gain_db, auto_gain=auto_gain)
-        self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=64)
+        self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=200)
         self._proc: Optional[subprocess.Popen] = None
         self._reader_thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
@@ -751,7 +751,7 @@ class WindowsLoopbackStream:
         self.on_meter = on_meter
         self.loopback_device_id = loopback_device_id
         self._cond = AudioConditioner(gain_db=gain_db, auto_gain=auto_gain)
-        self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=64)
+        self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=200)
         self._running = threading.Event()
         self._stop_ev = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -1039,7 +1039,7 @@ class MixedAudioStream:
         self.on_level = on_level
         self.on_meter = on_meter
         self._cond = AudioConditioner(gain_db=gain_db, auto_gain=auto_gain)
-        self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=64)
+        self._queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=200)
         self._running = threading.Event()
         self._mic_buf: deque[np.ndarray] = deque(maxlen=12)
         self._sys_buf: deque[np.ndarray] = deque(maxlen=12)

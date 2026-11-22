@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
@@ -11,6 +12,8 @@ const ENGINE_PORT: u16 = 18765;
 
 struct EngineProcess(Mutex<Option<Child>>);
 struct SavedOverlayBounds(Mutex<Option<(tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>)>>);
+struct AllowAppExit(AtomicBool);
+struct FrontendReady(AtomicBool);
 
 fn engine_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], ENGINE_PORT))
@@ -281,6 +284,35 @@ fn stop_local_engine(state: tauri::State<'_, EngineProcess>) -> Result<(), Strin
 }
 
 #[tauri::command]
+fn mark_frontend_ready(ready: tauri::State<'_, FrontendReady>) {
+    ready.0.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn set_allow_exit(allow_exit: tauri::State<'_, AllowAppExit>, allow: bool) {
+    allow_exit.0.store(allow, Ordering::SeqCst);
+}
+
+#[tauri::command]
+async fn confirm_exit_app(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(flag) = app.try_state::<AllowAppExit>() {
+        flag.0.store(true, Ordering::SeqCst);
+    }
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.destroy();
+    }
+    let app_for_stop = app.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        if let Some(state) = app_for_stop.try_state::<EngineProcess>() {
+            stop_engine_internal(&state);
+        }
+    })
+    .await;
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
 fn toggle_overlay(app: tauri::AppHandle) -> Result<bool, String> {
     let win = app
         .get_webview_window("overlay")
@@ -356,6 +388,8 @@ pub fn run() {
     let app = tauri::Builder::default()
         .manage(EngineProcess(Mutex::new(None)))
         .manage(SavedOverlayBounds(Mutex::new(None)))
+        .manage(AllowAppExit(AtomicBool::new(false)))
+        .manage(FrontendReady(AtomicBool::new(false)))
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
@@ -382,8 +416,23 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if window.label() == "main" {
-                if let WindowEvent::CloseRequested { .. } = event {
+                if let WindowEvent::CloseRequested { api, .. } = event {
                     let app_handle = window.app_handle();
+                    let allow = app_handle
+                        .try_state::<AllowAppExit>()
+                        .map(|s| s.0.load(Ordering::SeqCst))
+                        .unwrap_or(false);
+                    let fe_ready = app_handle
+                        .try_state::<FrontendReady>()
+                        .map(|s| s.0.load(Ordering::SeqCst))
+                        .unwrap_or(false);
+                    if !allow && fe_ready {
+                        api.prevent_close();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                        let _ = window.emit("app-close-requested", ());
+                        return;
+                    }
                     if let Some(overlay) = app_handle.get_webview_window("overlay") {
                         let _ = overlay.destroy();
                     }
@@ -397,6 +446,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_engine_url,
             stop_local_engine,
+            mark_frontend_ready,
+            set_allow_exit,
+            confirm_exit_app,
             toggle_overlay,
             set_overlay_clickthrough,
             set_overlay_always_on_top,

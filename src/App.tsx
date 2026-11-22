@@ -20,6 +20,7 @@ import {
   Headphones,
   Layers,
   Loader2,
+  LogOut,
   Mic,
   MicOff,
   MonitorSpeaker,
@@ -89,10 +90,28 @@ const APP_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "
 const GITHUB_REPO = "niitbeo/PolyVoice-Pro";
 const VU_BARS = 18;
 
+type DownloadableModelId =
+  | "hy-mt2"
+  | "nllb-1.3b"
+  | "nllb-600m"
+  | "zipformer-30m-streaming"
+  | "zipformer-en-20m"
+  | "zipformer-multi"
+  | "moonshine-en"
+  | "moonshine-ja"
+  | "moonshine-ko"
+  | "whisper-turbo"
+  | "opus-vi-en"
+  | "opus-en-vi"
+  | "envit5";
+
 const MODEL_DISPLAY_NAMES: Record<string, string> = {
   "zipformer-30m-streaming": "Nghe Tiếng Việt (+Hotwords)",
   "zipformer-en-20m": "Nghe Tiếng Anh (Nháp live)",
+  "zipformer-multi": "Nghe Thái / Trung / Indo Siêu tốc (Zipformer-Multi)",
   "moonshine-en": "Nghe Tiếng Anh (Moonshine-v2)",
+  "moonshine-ja": "Nghe Tiếng Nhật Siêu tốc (Moonshine-v2 JA)",
+  "moonshine-ko": "Nghe Tiếng Hàn Siêu tốc (Moonshine-v2 KO)",
   "whisper-turbo": "Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)",
   envit5: "Dịch Việt ⇄ Anh (EnViT5)",
   "nllb-600m": "Dịch Lào & 202 NN (NLLB-600M)",
@@ -111,8 +130,14 @@ function applyModelStateUpdate(prev: ModelsStatus | null, prog: ModelState): Mod
     return { ...prev, asr_zipformer_streaming: prog };
   if (prog.model_id === "zipformer-en-20m")
     return { ...prev, asr_zipformer_en_20m: prog };
+  if (prog.model_id === "zipformer-multi")
+    return { ...prev, asr_zipformer_multi: prog };
   if (prog.model_id === "moonshine-en")
     return { ...prev, asr_moonshine_en: prog };
+  if (prog.model_id === "moonshine-ja")
+    return { ...prev, asr_moonshine_ja: prog };
+  if (prog.model_id === "moonshine-ko")
+    return { ...prev, asr_moonshine_ko: prog };
   if (prog.model_id === "whisper-turbo")
     return { ...prev, asr_whisper_turbo: prog };
   if (prog.model_id === "opus-vi-en") return { ...prev, mt_opus_vi_en: prog };
@@ -210,6 +235,7 @@ export default function App() {
   const [theme, setTheme] = useState<ThemeMode>(() => getInitialTheme());
   const [showAllLangs, setShowAllLangs] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showModelDetails, setShowModelDetails] = useState(false);
 
   useEffect(() => {
     applyTheme(theme);
@@ -246,6 +272,9 @@ export default function App() {
   const fileProgUpdatedAtRef = useRef<number>(0);
   const lastFileProgKeyRef = useRef<string>("");
   const [fileResult, setFileResult] = useState<FileTranslateResult | null>(null);
+  const [fileAsrMode, setFileAsrMode] = useState<"auto" | "whisper-turbo">("auto");
+  const [fileNormalizeAudio, setFileNormalizeAudio] = useState(true);
+  const [fileSrtFormat, setFileSrtFormat] = useState<"bilingual" | "target" | "source">("bilingual");
   const [setupBannerDismissed, setSetupBannerDismissed] = useState(false);
 
   const [summaryOpen, setSummaryOpen] = useState(false);
@@ -299,9 +328,14 @@ export default function App() {
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateProgress, setUpdateProgress] = useState(0);
   const [updateProgressText, setUpdateProgressText] = useState("");
+  const [exitConfirmOpen, setExitConfirmOpen] = useState(false);
+  const [exitBusy, setExitBusy] = useState(false);
 
   const [level, setLevel] = useState(0);
   const [partial, setPartial] = useState<PartialEvent | null>(null);
+  const [inflightPartial, setInflightPartial] = useState<PartialEvent | null>(null);
+  const [spotDwellHoldUntil, setSpotDwellHoldUntil] = useState(0);
+  const [, setSpotDwellTick] = useState(0);
   const [history, setHistory] = useState<TranscriptEntry[]>([]);
   const [errorMsg, setErrorMsg] = useState("");
   const [cloudNotice, setCloudNotice] = useState("");
@@ -315,6 +349,8 @@ export default function App() {
   ttsRef.current = ttsEnabled;
   const listeningRef = useRef(false);
   listeningRef.current = Boolean(status?.listening);
+  const updateInstallingRef = useRef(false);
+  updateInstallingRef.current = updateInstalling;
   const toggleListeningRef = useRef<() => void>(() => {});
   const copyTimerRef = useRef<number | undefined>(undefined);
   const llmDebounceRef = useRef<number | undefined>(undefined);
@@ -322,6 +358,7 @@ export default function App() {
   const activeDownloadsRef = useRef<Set<string>>(new Set());
   const modelSuccessTimerRef = useRef<number | undefined>(undefined);
   const justDownloadedTimersRef = useRef<Record<string, number>>({});
+  const spotDwellTimerRef = useRef<number | undefined>(undefined);
 
   const isMacOs = useMemo(() => {
     if (status?.platform?.os) return status.platform.os === "Darwin";
@@ -425,6 +462,7 @@ export default function App() {
           const msg = JSON.parse(ev.data);
           if (msg.type === "status") {
             syncStatusToLocalState(msg.data, false);
+            if (!msg.data?.listening) setInflightPartial(null);
             fetch(`${ENGINE_HTTP}/api/models/status`)
               .then((r) => (r.ok ? r.json() : null))
               .then((d) => {
@@ -442,6 +480,14 @@ export default function App() {
             const d = msg.data;
             setPartial((prev) => {
               const same = Boolean(prev && prev.id === d.id && prev.target_lang === d.target_lang);
+              if (
+                !same &&
+                prev &&
+                prev.id !== d.id &&
+                (prev.translated_text || prev.stable_text || prev.unstable_text)
+              ) {
+                setInflightPartial(prev);
+              }
               return {
                 id: d.id,
                 speaker: d.speaker,
@@ -458,6 +504,7 @@ export default function App() {
             });
           } else if (msg.type === "partial_mt") {
             const d = msg.data;
+            setInflightPartial((cur) => (cur && cur.id !== d.id ? null : cur));
             setPartial((prev) =>
               prev && prev.id === d.id
                 ? {
@@ -473,10 +520,21 @@ export default function App() {
           } else if (msg.type === "final") {
             const entry: TranscriptEntry = msg.data;
             setPartial((prev) => (prev && prev.id === entry.id ? null : prev));
+            setInflightPartial((prev) => (prev && prev.id === entry.id ? null : prev));
             setHistory((prev) => {
               if (prev.some((x) => x.id === entry.id)) return prev;
               return [entry, ...prev].slice(0, 200);
             });
+            // Adaptive reading-comfort grace hold (1.2s–2.0s) so a newly finalized sentence
+            // stays calm in the primary slot before promoting smoothly to the upper tier
+            const wc = (entry.translated_text || entry.source_text || "").trim().split(/\s+/).filter(Boolean).length;
+            const holdMs = Math.min(2000, Math.max(1200, wc * 75));
+            setSpotDwellHoldUntil(Date.now() + holdMs);
+            if (spotDwellTimerRef.current) clearTimeout(spotDwellTimerRef.current);
+            spotDwellTimerRef.current = window.setTimeout(() => {
+              spotDwellTimerRef.current = undefined;
+              setSpotDwellTick((n) => n + 1);
+            }, holdMs + 30);
             if (typeof entry.log_saved_count === "number") {
               setSavedLogCount(entry.log_saved_count);
             }
@@ -486,7 +544,10 @@ export default function App() {
           } else if (msg.type === "history") {
             const list: TranscriptEntry[] = msg.data || [];
             setHistory([...list].reverse());
-            if (list.length === 0) setPartial(null);
+            if (list.length === 0) {
+              setPartial(null);
+              setInflightPartial(null);
+            }
           } else if (msg.type === "audience_count") {
             const cnt = Number(msg.data?.connected_count || 0);
             setAudienceCount(cnt);
@@ -662,14 +723,15 @@ export default function App() {
   }, [startListening, stopListening]);
   toggleListeningRef.current = toggleListening;
 
-  // Listen for Tauri global hotkey & overlay state sync (mounted once with cancellation guard)
+  // Listen for Tauri global hotkey, overlay sync & close-confirmation prompt (mounted once)
   useEffect(() => {
     if (!isTauriEnv()) return;
     let cancelled = false;
     let unlistenToggle: (() => void) | undefined;
     let unlistenOverlay: (() => void) | undefined;
-    import("@tauri-apps/api/event")
-      .then(({ listen }) => {
+    let unlistenCloseReq: (() => void) | undefined;
+    Promise.all([import("@tauri-apps/api/event"), import("@tauri-apps/api/core")])
+      .then(([{ listen }, { invoke }]) => {
         listen("toggle-listening", () => {
           toggleListeningRef.current();
         })
@@ -686,12 +748,29 @@ export default function App() {
             else unlistenOverlay = fn;
           })
           .catch(() => {});
+        listen("app-close-requested", () => {
+          if (updateInstallingRef.current) {
+            invoke("confirm_exit_app").catch(() => {});
+            return;
+          }
+          setExitConfirmOpen(true);
+        })
+          .then((fn) => {
+            if (cancelled) {
+              fn();
+            } else {
+              unlistenCloseReq = fn;
+              invoke("mark_frontend_ready").catch(() => {});
+            }
+          })
+          .catch(() => {});
       })
       .catch(() => {});
     return () => {
       cancelled = true;
       unlistenToggle?.();
       unlistenOverlay?.();
+      unlistenCloseReq?.();
     };
   }, []);
 
@@ -699,7 +778,8 @@ export default function App() {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        if (glossaryOpen) setGlossaryOpen(false);
+        if (exitConfirmOpen && !exitBusy) setExitConfirmOpen(false);
+        else if (glossaryOpen) setGlossaryOpen(false);
         else if (qrOpen) setQrOpen(false);
         else if (summaryOpen) setSummaryOpen(false);
         else if (evalOpen) setEvalOpen(false);
@@ -722,6 +802,8 @@ export default function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
+    exitConfirmOpen,
+    exitBusy,
     glossaryOpen,
     qrOpen,
     summaryOpen,
@@ -740,6 +822,7 @@ export default function App() {
       if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
       if (llmDebounceRef.current) clearTimeout(llmDebounceRef.current);
       if (modelSuccessTimerRef.current) clearTimeout(modelSuccessTimerRef.current);
+      if (spotDwellTimerRef.current) clearTimeout(spotDwellTimerRef.current);
       for (const tid of Object.values(justDownloadedTimersRef.current)) {
         clearTimeout(tid);
       }
@@ -1030,6 +1113,8 @@ export default function App() {
       fd.append("target_lang", targetLang);
       fd.append("mt_mode", mtMode);
       fd.append("job_id", jobId);
+      fd.append("asr_mode", fileAsrMode);
+      fd.append("normalize_audio", fileNormalizeAudio ? "true" : "false");
       const res = await fetch(`${ENGINE_HTTP}/api/files/translate`, {
         method: "POST",
         body: fd,
@@ -1198,6 +1283,54 @@ export default function App() {
     }
   };
 
+  const handleEvaluateFileResult = async () => {
+    if (!fileResult || fileResult.segments.length === 0) return;
+    setFileModalOpen(false);
+    setEvalOpen(true);
+    setEvalBusy(true);
+    setEvalError("");
+    setEvalMissingKey(false);
+    setEvalFilter("all");
+    try {
+      const srcL = fileResult.source_lang || sourceLang;
+      const tgtL = fileResult.target_lang || targetLang;
+      const payloadItems = fileResult.segments.slice(0, 40).map((seg) => ({
+        id: `file-seg-${seg.index}`,
+        source_text: seg.source_text,
+        translated_text: seg.translated_text,
+        source_lang: srcL,
+        target_lang: tgtL,
+        timestamp: seg.start_srt.slice(0, 8),
+      }));
+      const res = await fetch(`${ENGINE_HTTP}/api/session/evaluate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "session", items: payloadItems }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data?.detail;
+        if (detail && typeof detail === "object" && detail.code === "missing_google_api_key") {
+          setEvalMissingKey(true);
+          setEvalError(detail.message || "Chưa cấu hình Google Gemini API Key.");
+        } else {
+          setEvalError(typeof detail === "string" ? detail : "Không thể đánh giá chất lượng bản dịch file.");
+        }
+        return;
+      }
+      const rep = data as EvaluationReport;
+      setEvalReport(rep);
+      if (rep.cloud_api) {
+        setCloudStatus(rep.cloud_api);
+        setStatus((prev) => (prev ? { ...prev, cloud_api: rep.cloud_api } : prev));
+      }
+    } catch (e) {
+      setEvalError(`Lỗi kết nối đánh giá: ${String(e)}`);
+    } finally {
+      setEvalBusy(false);
+    }
+  };
+
   const handleApplySuggestedTranslation = async (
     targetId: string,
     suggestedText: string,
@@ -1205,6 +1338,59 @@ export default function App() {
   ) => {
     const cleanText = suggestedText.trim();
     if (!cleanText) return;
+
+    // If patching a translated file segment, update fileResult and regenerate .SRT / .TXT cleanly
+    if (targetId.startsWith("file-seg-")) {
+      const segIdx = Number(targetId.replace("file-seg-", ""));
+      setFileResult((prev) => {
+        if (!prev) return prev;
+        const nextSegs = prev.segments.map((s) =>
+          s.index === segIdx ? { ...s, translated_text: cleanText } : s
+        );
+        const srtBi = nextSegs
+          .map((s) => `${s.index}\n${s.start_srt} --> ${s.end_srt}\n${s.translated_text}\n${s.source_text}\n`)
+          .join("\n");
+        const srtTgt = nextSegs
+          .map((s) => `${s.index}\n${s.start_srt} --> ${s.end_srt}\n${s.translated_text}\n`)
+          .join("\n");
+        const srtSrc = nextSegs
+          .map((s) => `${s.index}\n${s.start_srt} --> ${s.end_srt}\n${s.source_text}\n`)
+          .join("\n");
+        const txtBody = [
+          `=== PolyVoice Pro — Dịch File Offline: ${prev.filename} (${prev.duration_s}s) ===`,
+          `Tổng: ${nextSegs.length} đoạn (đã cập nhật theo kiểm định Google AI)`,
+          "=".repeat(64),
+          "",
+          ...nextSegs.flatMap((s) => [
+            `[${s.start_srt} --> ${s.end_srt}]`,
+            `Gốc : ${s.source_text}`,
+            `Dịch: ${s.translated_text}`,
+            "",
+          ]),
+        ].join("\n");
+        return {
+          ...prev,
+          segments: nextSegs,
+          srt_content: srtBi,
+          srt_target_content: srtTgt,
+          srt_source_content: srtSrc,
+          txt_content: txtBody,
+        };
+      });
+      setAppliedEvalIds((prev) => ({ ...prev, [targetId]: true }));
+      setEvalReport((prev) =>
+        prev
+          ? {
+              ...prev,
+              items: prev.items.map((it) =>
+                it.id === targetId ? { ...it, translated_text: cleanText } : it
+              ),
+            }
+          : prev
+      );
+      return;
+    }
+
     const matchGrp = groupedHistory.find((g) => g.id === targetId);
     const ids = itemIds && itemIds.length > 0 ? itemIds : matchGrp?.item_ids || [targetId];
     const idsSet = new Set([...ids, targetId]);
@@ -1552,6 +1738,7 @@ export default function App() {
       if (isTauriEnv()) {
         try {
           const { invoke } = await import("@tauri-apps/api/core");
+          await invoke("set_allow_exit", { allow: true }).catch(() => {});
           await invoke("stop_local_engine").catch(() => {});
         } catch {
           // ignore
@@ -1583,25 +1770,68 @@ export default function App() {
       const { relaunch } = await import("@tauri-apps/plugin-process");
       await relaunch();
     } catch (e) {
+      if (isTauriEnv()) {
+        import("@tauri-apps/api/core")
+          .then(({ invoke }) => invoke("set_allow_exit", { allow: false }).catch(() => {}))
+          .catch(() => {});
+      }
       setUpdateInstalling(false);
       setUpdateProgressText("");
       setErrorMsg(`Lỗi cập nhật tự động: ${String(e)}`);
     }
   };
 
-  const handleDownloadModel = async (
-    modelId:
-      | "hy-mt2"
-      | "nllb-1.3b"
-      | "nllb-600m"
-      | "zipformer-30m-streaming"
-      | "zipformer-en-20m"
-      | "moonshine-en"
-      | "whisper-turbo"
-      | "opus-vi-en"
-      | "opus-en-vi"
-      | "envit5"
-  ) => {
+  const handleConfirmExitApp = async () => {
+    if (exitBusy) return;
+    setExitBusy(true);
+    try {
+      if (listeningRef.current) {
+        await stopListening();
+      }
+      if (isTauriEnv()) {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("confirm_exit_app");
+      } else {
+        setExitConfirmOpen(false);
+        window.close();
+      }
+    } catch {
+      setExitBusy(false);
+    }
+  };
+
+  const getModelStateById = useCallback(
+    (id: string): ModelState | undefined => {
+      if (!models) return undefined;
+      switch (id) {
+        case "zipformer-30m-streaming":
+          return models.asr_zipformer_streaming;
+        case "moonshine-en":
+          return models.asr_moonshine_en;
+        case "moonshine-ja":
+          return models.asr_moonshine_ja;
+        case "moonshine-ko":
+          return models.asr_moonshine_ko;
+        case "zipformer-multi":
+          return models.asr_zipformer_multi;
+        case "whisper-turbo":
+          return models.asr_whisper_turbo;
+        case "zipformer-en-20m":
+          return models.asr_zipformer_en_20m;
+        case "envit5":
+          return models.mt_envit5;
+        case "nllb-600m":
+          return models.mt_nllb_600m;
+        case "hy-mt2":
+          return models.mt_hymt2;
+        default:
+          return undefined;
+      }
+    },
+    [models]
+  );
+
+  const handleDownloadModel = async (modelId: DownloadableModelId) => {
     setErrorMsg("");
     activeDownloadsRef.current.add(modelId);
     setJustDownloadedIds((prev) => {
@@ -1675,8 +1905,25 @@ export default function App() {
     }
   };
 
+  const handleDownloadAsiaPack = async () => {
+    setErrorMsg("");
+    setShowAdvanced(true);
+    const packIds: Array<"moonshine-ja" | "moonshine-ko" | "zipformer-multi" | "hy-mt2"> = [
+      "moonshine-ja",
+      "moonshine-ko",
+      "zipformer-multi",
+      "hy-mt2",
+    ];
+    for (const id of packIds) {
+      const st = getModelStateById(id);
+      if (st?.status !== "ready" && st?.status !== "downloading") {
+        await handleDownloadModel(id);
+      }
+    }
+  };
+
   const handleDeleteModel = async (
-    modelId: "hy-mt2" | "moonshine-en" | "zipformer-en-20m" | "nllb-600m" | "whisper-turbo"
+    modelId: "hy-mt2" | "moonshine-en" | "moonshine-ja" | "moonshine-ko" | "zipformer-multi" | "zipformer-en-20m" | "nllb-600m" | "whisper-turbo"
   ) => {
     if (
       modelId === "hy-mt2" &&
@@ -1848,7 +2095,7 @@ export default function App() {
     () =>
       [
         ["Nghe Tiếng Việt (+Hotwords)", models?.asr_zipformer_streaming, "zipformer-30m-streaming", "49 MB"],
-        ["Nghe Tiếng Anh (Moonshine-v2)", models?.asr_moonshine_en, "moonshine-en", "135 MB"],
+        ["Nghe Tiếng Anh (Moonshine-v2)", models?.asr_moonshine_en, "moonshine-en", "106 MB"],
         ["Dịch Việt ⇄ Anh (EnViT5 • Nhẹ)", models?.mt_envit5, "envit5", "266 MB"],
         ["Dịch Lào & 202 NN (NLLB-600M)", models?.mt_nllb_600m, "nllb-600m", "604 MB"],
       ] as const,
@@ -1858,6 +2105,9 @@ export default function App() {
   const optionalModelRows = useMemo(
     () =>
       [
+        ["Nghe Tiếng Nhật Siêu tốc (Moonshine-v2 JA • ~120ms)", models?.asr_moonshine_ja, "moonshine-ja", "99 MB"],
+        ["Nghe Tiếng Hàn Siêu tốc (Moonshine-v2 KO • ~150ms)", models?.asr_moonshine_ko, "moonshine-ko", "47 MB"],
+        ["Nghe Thái / Trung / Indo Siêu tốc (Zipformer • ~15ms)", models?.asr_zipformer_multi, "zipformer-multi", "247 MB"],
         ["Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)", models?.asr_whisper_turbo, "whisper-turbo", "540 MB"],
         ["Dịch Chuyên sâu 38 NN (Hy-MT2 • Nặng GPU)", models?.mt_hymt2, "hy-mt2", "1.05 GB"],
         ["Nghe Tiếng Anh Siêu nhẹ (Zipformer-20M)", models?.asr_zipformer_en_20m, "zipformer-en-20m", "130 MB"],
@@ -1865,9 +2115,79 @@ export default function App() {
     [models]
   );
 
-  const readyCoreCount = useMemo(
-    () => coreModelRows.filter(([, st]) => st?.status === "ready").length,
-    [coreModelRows]
+  const modelPacks = useMemo(() => {
+    const buildPack = (
+      id: "core" | "asia" | "global",
+      title: string,
+      sizeLabel: string,
+      desc: string,
+      ids: readonly DownloadableModelId[],
+      onDownload: () => void
+    ) => {
+      const states = ids.map((mid) => getModelStateById(mid));
+      const readyCount = states.filter((st) => st?.status === "ready").length;
+      const downloading = states.find((st) => st?.status === "downloading");
+      const hasError = !downloading && states.some((st) => st?.status === "error");
+      const pct = downloading
+        ? Math.max(
+            0,
+            Math.min(
+              100,
+              Math.round(
+                states.reduce(
+                  (acc, st) => acc + (st?.status === "ready" ? 100 : st?.status === "downloading" ? st.progress ?? 0 : 0),
+                  0
+                ) / ids.length
+              )
+            )
+          )
+        : 0;
+      return {
+        id,
+        title,
+        sizeLabel,
+        desc,
+        readyCount,
+        totalCount: ids.length,
+        isReady: readyCount === ids.length,
+        downloading,
+        hasError,
+        pct,
+        onDownload,
+      };
+    };
+
+    return [
+      buildPack(
+        "core",
+        "Gói 1: Cốt lõi Việt ⇄ Anh & 202 NN",
+        "~1.05 GB • 0% GPU",
+        "Nghe Việt/Anh siêu mượt (30–120ms) + dịch 202 ngôn ngữ (gồm Việt → Lào).",
+        ["zipformer-30m-streaming", "moonshine-en", "envit5", "nllb-600m"],
+        handleDownloadCoreModels
+      ),
+      buildPack(
+        "asia",
+        "Gói 2: Hội nghị Châu Á siêu mượt",
+        "~1.44 GB",
+        "Nghe live Nhật, Hàn, Trung, Thái, Indo, Nga, Ả Rập (~45–350ms) + dịch Hy-MT2 38 NN.",
+        ["moonshine-ja", "moonshine-ko", "zipformer-multi", "hy-mt2"],
+        handleDownloadAsiaPack
+      ),
+      buildPack(
+        "global",
+        "Gói 3: Toàn cầu 99 Ngôn ngữ",
+        "540 MB • 0% GPU",
+        "Lưới an toàn offline cho Pháp, Đức, TBN, Ý, Hindi, Khmer & 90+ ngôn ngữ phát sinh.",
+        ["whisper-turbo"],
+        () => handleDownloadModel("whisper-turbo")
+      ),
+    ];
+  }, [models, getModelStateById]);
+
+  const readyPacksCount = useMemo(
+    () => modelPacks.filter((p) => p.isReady).length,
+    [modelPacks]
   );
 
   const filteredLanguages = useMemo(() => {
@@ -1901,36 +2221,58 @@ export default function App() {
   const prevHistoryItem = history[1] || null;
   const isDraft = Boolean(partial);
   const isLiveSession = Boolean(status?.listening || isDraft);
-  const partialHasMt = Boolean(
+  const rawPartialHasMt = Boolean(
     partial && (partial.translated_text || partial.stable_text || partial.unstable_text)
   );
+  // Prevent backwards Spotlight rollback when a new sentence starts speaking before the
+  // just-flushed previous sentence finishes final MT (e.g. Hy-MT2 1.5-3s): keep showing the
+  // in-flight translated draft smoothly until either its final OR the new sentence's draft arrives.
+  const activePartial: PartialEvent | null = rawPartialHasMt
+    ? partial
+    : inflightPartial && (!latestItem || inflightPartial.id !== latestItem.id)
+      ? inflightPartial
+      : partial;
+  const partialHasMt = Boolean(
+    activePartial && (activePartial.translated_text || activePartial.stable_text || activePartial.unstable_text)
+  );
   // Continuous 2-tier Top-to-Bottom Flow inside Spotlight:
-  // - Hold the finished sentence clearly in the active lower slot for ~150ms until the next
-  //   sentence's first live draft translation arrives (zero dimming bleach & zero EN/VI mismatch).
-  // - When the next sentence is ready, the finished sentence promotes gently upward into
-  //   `flowPrevItem` while the new sentence flows smoothly in below (`flowCurrId`).
+  // - Hold a freshly finalized sentence calmly in the active lower slot for 1.2s–2.0s while the
+  //   next sentence only has a few words (< 5) so the viewer's eye never feels rushed.
+  // - Once ready, the finished sentence promotes gently upward into `flowPrevItem` (crisp 0.82
+  //   contrast, up to 3 lines) and stays readable for the ENTIRE next sentence!
   // - Because backend keeps `partial.id === final.id`, finalizing a sentence NEVER changes
   //   either key -> 0 DOM remounts, 0 flashes, 0 flicker!
+  const partialWords = (activePartial?.translated_text || activePartial?.source_text || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  const holdFreshSpotFinal = Boolean(
+    latestItem?.translated_text &&
+      activePartial &&
+      activePartial.id !== latestItem.id &&
+      Date.now() < spotDwellHoldUntil &&
+      partialWords < 5
+  );
   const showPartialAsActive = Boolean(
-    partial && (partialHasMt || !translatePartials || !latestItem?.translated_text)
+    activePartial && !holdFreshSpotFinal && (partialHasMt || !translatePartials || !latestItem?.translated_text)
   );
   const partialIsNewSentence = Boolean(
-    showPartialAsActive && partial && (!latestItem || partial.id !== latestItem.id)
+    showPartialAsActive && activePartial && (!latestItem || activePartial.id !== latestItem.id)
   );
   const flowPrevItem: TranscriptEntry | null = partialIsNewSentence
     ? latestItem
     : prevHistoryItem;
-  const flowCurrId = showPartialAsActive && partial ? partial.id : latestItem?.id || "empty";
+  const flowCurrId = showPartialAsActive && activePartial ? activePartial.id : latestItem?.id || "empty";
   const flowCurrSource =
-    showPartialAsActive && partial ? partial.source_text : latestItem?.source_text || "";
+    showPartialAsActive && activePartial ? activePartial.source_text : latestItem?.source_text || "";
   const flowCurrTarget =
-    showPartialAsActive && partial ? partial.translated_text : latestItem?.translated_text || "";
+    showPartialAsActive && activePartial ? activePartial.translated_text : latestItem?.translated_text || "";
   const flowCurrIsDraft = showPartialAsActive;
-  const spotPendingDraft = Boolean(showPartialAsActive && partial && !partialHasMt);
+  const spotPendingDraft = Boolean(showPartialAsActive && activePartial && !partialHasMt);
   const spotAsrMs =
-    showPartialAsActive && partial ? partial.asr_ms : latestItem?.asr_ms ?? partial?.asr_ms ?? 0;
+    showPartialAsActive && activePartial ? activePartial.asr_ms : latestItem?.asr_ms ?? activePartial?.asr_ms ?? 0;
   const spotMtMs =
-    showPartialAsActive && partial ? partial.mt_ms : latestItem?.mt_ms ?? partial?.mt_ms ?? 0;
+    showPartialAsActive && activePartial ? activePartial.mt_ms : latestItem?.mt_ms ?? activePartial?.mt_ms ?? 0;
   const litBars = Math.round(level * VU_BARS);
 
   return (
@@ -2385,6 +2727,151 @@ export default function App() {
               </button>
             </div>
 
+            {/* Just-In-Time Source Language Readiness Banner (3-Tier Declarative Routing) */}
+            {connected &&
+              models !== null &&
+              (() => {
+                const prefId = (currentSrcObj?.preferred_model || "whisper-turbo") as DownloadableModelId;
+                const prefMb = currentSrcObj?.preferred_model_mb || 540;
+                const tier = currentSrcObj?.asr_tier || (sourceLang === "vie_Latn" || sourceLang === "eng_Latn" ? "fast" : "universal");
+                const prefSt = getModelStateById(prefId);
+                const wtSt = models.asr_whisper_turbo;
+                const prefReady = sourceLang === "vie_Latn" ? true : prefSt?.status === "ready";
+                const wtReady = wtSt?.status === "ready";
+                const srcName = currentSrcObj?.name_vi || sourceLang;
+
+                // 1) Experimental spoken language (e.g. Lao): always show honest, calm advisory
+                if (tier === "experimental") {
+                  const isDl = wtSt?.status === "downloading";
+                  const pct = Math.max(0, Math.min(100, Math.round(wtSt?.progress ?? 0)));
+                  return (
+                    <div className="lang-readiness-banner warn">
+                      <div className="lang-readiness-row">
+                        <AlertTriangle size={12.5} style={{ flexShrink: 0, marginTop: 1 }} />
+                        <span>
+                          {currentSrcObj?.asr_note ||
+                            `Nghe trực tiếp ${srcName} Offline hiện còn hạn chế độ chính xác; chiều Việt → ${shortLangName(sourceLang, srcName)} hoạt động tốt 100% Offline.`}
+                        </span>
+                      </div>
+                      {!wtReady && (
+                        <div className="lang-readiness-action">
+                          <button
+                            type="button"
+                            className={`btn sm ${isDl ? "downloading" : ""}`}
+                            disabled={isDl}
+                            onClick={() => handleDownloadModel("whisper-turbo")}
+                          >
+                            {isDl ? (
+                              <>
+                                <Loader2 size={11} className="spin" /> {pct}%
+                              </>
+                            ) : (
+                              <>
+                                <Download size={11} /> Tải Gói 99 NN (540 MB)
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                }
+
+                // 2) Fast-Lane language already ready -> keep UI 100% clean!
+                if (tier === "fast" && prefReady) {
+                  return null;
+                }
+
+                // 3) Fast-Lane language missing dedicated model -> 1-click download right here
+                if (tier === "fast" && !prefReady) {
+                  const isDl = prefSt?.status === "downloading";
+                  const pct = Math.max(0, Math.min(100, Math.round(prefSt?.progress ?? 0)));
+                  return (
+                    <div className={`lang-readiness-banner ${wtReady ? "info" : "warn"}`}>
+                      <div className="lang-readiness-row">
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          {isDl
+                            ? `Đang tải gói siêu mượt cho ${srcName} (${pct}%)...`
+                            : wtReady
+                            ? `Đang dùng gói dự phòng 99 NN. Tải gói siêu mượt cho ${srcName} (~${prefMb} MB) để chạy <0.4s.`
+                            : `Cần tải gói nghe ${srcName} (~${prefMb} MB • 0% GPU) để chạy 100% Offline.`}
+                        </div>
+                        <button
+                          type="button"
+                          className={`btn sm ${isDl ? "downloading" : "primary"}`}
+                          style={{ flexShrink: 0 }}
+                          disabled={isDl}
+                          onClick={() => handleDownloadModel(prefId)}
+                        >
+                          {isDl ? (
+                            <>
+                              <Loader2 size={11} className="spin" /> {pct}%
+                            </>
+                          ) : (
+                            <>
+                              <Download size={11} /> Tải ~{prefMb} MB
+                            </>
+                          )}
+                        </button>
+                      </div>
+                      {isDl && (
+                        <div className="progress-track">
+                          <div className="progress-fill" style={{ width: `${Math.max(4, pct)}%` }} />
+                        </div>
+                      )}
+                    </div>
+                  );
+                }
+
+                // 4) Universal 99-language fallback (FR/DE/ES/IT/HI/KM/MS/TL/MY...)
+                if (wtReady) {
+                  return (
+                    <div className="lang-readiness-banner ready">
+                      <div className="lang-readiness-row">
+                        <CheckCircle2 size={12} style={{ flexShrink: 0 }} />
+                        <span>Sẵn sàng Offline — Gói Toàn cầu 99 NN (Whisper-Turbo)</span>
+                      </div>
+                    </div>
+                  );
+                }
+
+                const isDl = wtSt?.status === "downloading";
+                const pct = Math.max(0, Math.min(100, Math.round(wtSt?.progress ?? 0)));
+                return (
+                  <div className="lang-readiness-banner warn">
+                    <div className="lang-readiness-row">
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        {isDl
+                          ? `Đang tải Gói Toàn cầu 99 NN (${pct}%)...`
+                          : `Cần tải Gói Toàn cầu 99 NN (540 MB) cho ${srcName} offline.`}
+                      </div>
+                      <button
+                        type="button"
+                        className={`btn sm ${isDl ? "downloading" : "primary"}`}
+                        style={{ flexShrink: 0 }}
+                        disabled={isDl}
+                        onClick={() => handleDownloadModel("whisper-turbo")}
+                      >
+                        {isDl ? (
+                          <>
+                            <Loader2 size={11} className="spin" /> {pct}%
+                          </>
+                        ) : (
+                          <>
+                            <Download size={11} /> Tải ngay
+                          </>
+                        )}
+                      </button>
+                    </div>
+                    {isDl && (
+                      <div className="progress-track">
+                        <div className="progress-fill" style={{ width: `${Math.max(4, pct)}%` }} />
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
             {/* Clean 4x2 Uniform Grid of Top 8 Languages */}
             <div className="pin-grid">
               {pinnedLanguages.map((lang) => (
@@ -2570,6 +3057,70 @@ export default function App() {
                   </option>
                   <option value="local-llm">Local LLM nâng cao (Ollama / llama.cpp)</option>
                 </select>
+                {mtMode === "auto-offline" &&
+                  sourceLang !== "lao_Laoo" &&
+                  targetLang !== "lao_Laoo" &&
+                  ((sourceLang !== "vie_Latn" && sourceLang !== "eng_Latn") ||
+                    (targetLang !== "vie_Latn" && targetLang !== "eng_Latn")) && (
+                    <div
+                      style={{
+                        marginTop: 6,
+                        padding: "6px 8px",
+                        borderRadius: 8,
+                        border: "1px solid rgba(234, 179, 8, 0.35)",
+                        background: "rgba(234, 179, 8, 0.08)",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 8,
+                        fontSize: 11,
+                        lineHeight: 1.35,
+                        color: "var(--text-1)",
+                      }}
+                    >
+                      <span>
+                        {status?.hymt2_ready
+                          ? "Đa ngôn ngữ (Nhật/Hàn/Trung/Thái/Pháp/Đức...): Dùng Hy-MT2 1.8B dịch chuẩn xác hơn NLLB."
+                          : "Mẹo: Tải Gói 2 (Hội nghị Châu Á) hoặc Hy-MT2 1.8B để dịch đa ngôn ngữ sát nghĩa hơn."}
+                      </span>
+                      {status?.hymt2_ready ? (
+                        <button
+                          type="button"
+                          className="btn"
+                          style={{
+                            padding: "3px 8px",
+                            fontSize: 11,
+                            whiteSpace: "nowrap",
+                            flexShrink: 0,
+                          }}
+                          onClick={() => {
+                            setMtMode("hy-mt2");
+                            setLastOfflineMtMode("hy-mt2");
+                            hotUpdateConfig({ mt_mode: "hy-mt2" });
+                          }}
+                        >
+                          Chuyển ngay
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="btn"
+                          style={{
+                            padding: "3px 8px",
+                            fontSize: 11,
+                            whiteSpace: "nowrap",
+                            flexShrink: 0,
+                          }}
+                          disabled={models?.mt_hymt2?.status === "downloading"}
+                          onClick={() => handleDownloadModel("hy-mt2")}
+                        >
+                          {models?.mt_hymt2?.status === "downloading"
+                            ? `${Math.round(models.mt_hymt2.progress ?? 0)}%`
+                            : "Tải Hy-MT2"}
+                        </button>
+                      )}
+                    </div>
+                  )}
               </label>
             )}
 
@@ -2587,6 +3138,15 @@ export default function App() {
                 <option value="auto">Tự động tối ưu theo ngôn ngữ (Khuyên dùng)</option>
                 <option value="moonshine-en" disabled={!status?.moonshine_en_ready}>
                   Moonshine-v2 Tiếng Anh (Streaming dấu câu chuẩn YouTube)
+                </option>
+                <option value="moonshine-ja" disabled={!status?.moonshine_ja_ready}>
+                  Moonshine-v2 Tiếng Nhật (Streaming siêu mượt ~120ms • 0% GPU)
+                </option>
+                <option value="moonshine-ko" disabled={!status?.moonshine_ko_ready}>
+                  Moonshine-v2 Tiếng Hàn (Streaming siêu mượt ~150ms • 0% GPU)
+                </option>
+                <option value="zipformer-multi" disabled={!status?.zipformer_multi_ready}>
+                  Zipformer Đa ngôn ngữ (Thái, Trung, Indo • ~15ms • 0% GPU)
                 </option>
                 <option value="whisper-turbo" disabled={!status?.whisper_turbo_ready}>
                   Whisper-Turbo 99 NN (Thái, Nhật, Trung, Hàn, Pháp, Đức • Offline)
@@ -2660,7 +3220,7 @@ export default function App() {
             </label>
           </div>
 
-          {/* Advanced & Models */}
+          {/* Advanced & 3-Pack Offline Model Manager */}
           <div className="card">
             <div
               className="card-title"
@@ -2673,11 +3233,11 @@ export default function App() {
               <span className="row" style={{ gap: 4, textTransform: "none", letterSpacing: 0 }}>
                 <span
                   style={{
-                    color: readyCoreCount === 0 ? "var(--amber)" : "var(--green-text)",
+                    color: readyPacksCount === 0 ? "var(--amber)" : "var(--green-text)",
                     fontWeight: 600,
                   }}
                 >
-                  {readyCoreCount}/{coreModelRows.length} cốt lõi
+                  {readyPacksCount}/{modelPacks.length} gói
                 </span>
                 {showAdvanced ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
               </span>
@@ -2685,7 +3245,213 @@ export default function App() {
 
             {showAdvanced && (
               <>
-                <label className="toggle-row">
+                <div className="pack-list">
+                  {modelPacks.map((pack) => {
+                    const isDl = Boolean(pack.downloading);
+                    return (
+                      <div className={`pack-card ${pack.isReady ? "ready" : ""}`} key={pack.id}>
+                        <div className="pack-head">
+                          <div style={{ minWidth: 0, flex: 1 }}>
+                            <div className="pack-title">{pack.title}</div>
+                            <div className="pack-meta">{pack.sizeLabel}</div>
+                          </div>
+                          {pack.isReady ? (
+                            <span className="model-done-badge">
+                              <CheckCircle2 size={11.5} /> Sẵn sàng
+                            </span>
+                          ) : isDl ? (
+                            <button className="btn sm downloading" disabled>
+                              <Loader2 size={11.5} className="spin" /> {pack.pct}%
+                            </button>
+                          ) : (
+                            <button className="btn primary sm" onClick={pack.onDownload}>
+                              <Download size={11.5} /> {pack.hasError ? "Thử lại" : "Tải gói"}
+                            </button>
+                          )}
+                        </div>
+                        <div className="pack-desc">{pack.desc}</div>
+                        {isDl && pack.downloading && (
+                          <>
+                            <div className="progress-track">
+                              <div className="progress-fill" style={{ width: `${Math.max(4, pack.pct)}%` }} />
+                            </div>
+                            <div className="model-progress-meta">
+                              <span>{pack.downloading.message || "Đang tải gói..."}</span>
+                              <span>
+                                {pack.readyCount}/{pack.totalCount} • {pack.pct}%
+                              </span>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <button
+                  type="button"
+                  className="pack-details-toggle"
+                  onClick={() => setShowModelDetails((v) => !v)}
+                >
+                  <span>Chi tiết từng model (Xóa / Tải lẻ)</span>
+                  {showModelDetails ? <ChevronUp size={12.5} /> : <ChevronDown size={12.5} />}
+                </button>
+
+                {showModelDetails && (
+                  <>
+                    {models?.models_dir && (
+                      <div className="models-dir-hint" title={models.models_dir}>
+                        <FolderOpen size={11} style={{ flexShrink: 0 }} />
+                        <span>{models.models_dir}</span>
+                      </div>
+                    )}
+
+                    <div className="hint" style={{ marginTop: 2, fontWeight: 700, color: "var(--text-1)" }}>
+                      <span>Gói 1 — Cốt lõi (~1.05 GB)</span>
+                      <span style={{ color: "var(--text-2)", fontWeight: 500 }}>4 model 0% GPU</span>
+                    </div>
+
+                    {coreModelRows.map(([label, st, id, sz]) => {
+                      const isDownloading = st?.status === "downloading";
+                      const isError = st?.status === "error";
+                      const isJustDone = st?.status === "ready" && Boolean(justDownloadedIds[id]);
+                      const pct = Math.max(0, Math.min(100, Math.round(st?.progress ?? 0)));
+                      return (
+                        <div className={`model-row ${isJustDone ? "success" : ""}`} key={id}>
+                          <div className="model-top">
+                            <span>{label}</span>
+                            {st?.status === "ready" ? (
+                              <div className="row" style={{ gap: 5 }}>
+                                {isJustDone ? (
+                                  <span className="model-done-badge">
+                                    <CheckCircle2 size={12} /> Tải thành công
+                                  </span>
+                                ) : (
+                                  <span style={{ color: "var(--green-text)", fontSize: 11, whiteSpace: "nowrap" }}>
+                                    ✓ {sz}
+                                  </span>
+                                )}
+                                {id === "nllb-600m" && (
+                                  <button
+                                    className="btn sm icon-only"
+                                    style={{ width: 22, height: 22, minWidth: 22, padding: 3 }}
+                                    onClick={() => handleDeleteModel("nllb-600m")}
+                                    title="Xóa NLLB-600M (604 MB) nếu bạn chỉ dùng Việt ⇄ Anh"
+                                  >
+                                    <Trash2 size={11} />
+                                  </button>
+                                )}
+                              </div>
+                            ) : isDownloading ? (
+                              <button className="btn sm downloading" disabled>
+                                <Loader2 size={11.5} className="spin" /> {pct}%
+                              </button>
+                            ) : (
+                              <button
+                                className="btn primary sm"
+                                onClick={() => handleDownloadModel(id)}
+                              >
+                                <Download size={11.5} /> {isError ? "Thử lại" : sz}
+                              </button>
+                            )}
+                          </div>
+                          {isDownloading && (
+                            <>
+                              <div className="progress-track">
+                                <div className="progress-fill" style={{ width: `${Math.max(3, pct)}%` }} />
+                              </div>
+                              <div className="model-progress-meta">
+                                <span>{st.message || "Đang tải..."}</span>
+                                <span>
+                                  {st.total_mb > 0
+                                    ? `${st.downloaded_mb.toFixed(1)} / ${st.total_mb.toFixed(0)} MB`
+                                    : `${pct}%`}
+                                </span>
+                              </div>
+                            </>
+                          )}
+                          {isError && st?.message && (
+                            <div className="model-error-msg" title={st.message}>
+                              {st.message}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+
+                    <div className="hint" style={{ marginTop: 4, fontWeight: 700, color: "var(--text-1)" }}>
+                      <span>Gói 2 &amp; 3 — Mở rộng Đa ngôn ngữ</span>
+                    </div>
+
+                    {optionalModelRows.map(([label, st, id, sz]) => {
+                      const isDownloading = st?.status === "downloading";
+                      const isError = st?.status === "error";
+                      const isJustDone = st?.status === "ready" && Boolean(justDownloadedIds[id]);
+                      const pct = Math.max(0, Math.min(100, Math.round(st?.progress ?? 0)));
+                      return (
+                        <div className={`model-row ${isJustDone ? "success" : ""}`} key={id}>
+                          <div className="model-top">
+                            <span>{label}</span>
+                            {st?.status === "ready" ? (
+                              <div className="row" style={{ gap: 5 }}>
+                                {isJustDone ? (
+                                  <span className="model-done-badge">
+                                    <CheckCircle2 size={12} /> Tải thành công
+                                  </span>
+                                ) : (
+                                  <span style={{ color: "var(--green-text)", fontSize: 11, whiteSpace: "nowrap" }}>
+                                    ✓ {sz}
+                                  </span>
+                                )}
+                                <button
+                                  className="btn sm icon-only"
+                                  style={{ width: 22, height: 22, minWidth: 22, padding: 3 }}
+                                  onClick={() => handleDeleteModel(id)}
+                                  title={`Xóa ${label} (${sz}) để giải phóng dung lượng ổ cứng`}
+                                >
+                                  <Trash2 size={11} />
+                                </button>
+                              </div>
+                            ) : isDownloading ? (
+                              <button className="btn sm downloading" disabled>
+                                <Loader2 size={11.5} className="spin" /> {pct}%
+                              </button>
+                            ) : (
+                              <button
+                                className="btn primary sm"
+                                onClick={() => handleDownloadModel(id)}
+                              >
+                                <Download size={11.5} /> {isError ? "Thử lại" : sz}
+                              </button>
+                            )}
+                          </div>
+                          {isDownloading && (
+                            <>
+                              <div className="progress-track">
+                                <div className="progress-fill" style={{ width: `${Math.max(3, pct)}%` }} />
+                              </div>
+                              <div className="model-progress-meta">
+                                <span>{st.message || "Đang tải..."}</span>
+                                <span>
+                                  {st.total_mb > 0
+                                    ? `${st.downloaded_mb.toFixed(1)} / ${st.total_mb.toFixed(0)} MB`
+                                    : `${pct}%`}
+                                </span>
+                              </div>
+                            </>
+                          )}
+                          {isError && st?.message && (
+                            <div className="model-error-msg" title={st.message}>
+                              {st.message}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </>
+                )}
+
+                <label className="toggle-row" style={{ marginTop: 4 }}>
                   <span>Dịch ngay khi đang nói</span>
                   <span className="switch">
                     <input
@@ -2741,149 +3507,6 @@ export default function App() {
                     />
                   </>
                 )}
-
-                <div className="hint" style={{ marginTop: 2, fontWeight: 700, color: "var(--text-1)" }}>
-                  <span>Gói Cốt lõi (~1.6 GB)</span>
-                  <span style={{ color: "var(--text-2)", fontWeight: 500 }}>5 model chuẩn 2 tầng</span>
-                </div>
-
-                {coreModelRows.map(([label, st, id, sz]) => {
-                  const isDownloading = st?.status === "downloading";
-                  const isError = st?.status === "error";
-                  const isJustDone = st?.status === "ready" && Boolean(justDownloadedIds[id]);
-                  const pct = Math.max(0, Math.min(100, Math.round(st?.progress ?? 0)));
-                  return (
-                    <div className={`model-row ${isJustDone ? "success" : ""}`} key={id}>
-                      <div className="model-top">
-                        <span>{label}</span>
-                        {st?.status === "ready" ? (
-                          <div className="row" style={{ gap: 5 }}>
-                            {isJustDone ? (
-                              <span className="model-done-badge">
-                                <CheckCircle2 size={12} /> Tải thành công
-                              </span>
-                            ) : (
-                              <span style={{ color: "var(--green-text)", fontSize: 11, whiteSpace: "nowrap" }}>
-                                ✓ {sz}
-                              </span>
-                            )}
-                            {id === "nllb-600m" && (
-                              <button
-                                className="btn sm icon-only"
-                                style={{ width: 22, height: 22, minWidth: 22, padding: 3 }}
-                                onClick={() => handleDeleteModel("nllb-600m")}
-                                title="Xóa NLLB-600M (604 MB) nếu bạn chỉ dùng Việt ⇄ Anh"
-                              >
-                                <Trash2 size={11} />
-                              </button>
-                            )}
-                          </div>
-                        ) : isDownloading ? (
-                          <button className="btn sm downloading" disabled>
-                            <Loader2 size={11.5} className="spin" /> {pct}%
-                          </button>
-                        ) : (
-                          <button
-                            className="btn primary sm"
-                            onClick={() => handleDownloadModel(id)}
-                          >
-                            <Download size={11.5} /> {isError ? "Thử lại" : sz}
-                          </button>
-                        )}
-                      </div>
-                      {isDownloading && (
-                        <>
-                          <div className="progress-track">
-                            <div className="progress-fill" style={{ width: `${Math.max(3, pct)}%` }} />
-                          </div>
-                          <div className="model-progress-meta">
-                            <span>{st.message || "Đang tải..."}</span>
-                            <span>
-                              {st.total_mb > 0
-                                ? `${st.downloaded_mb.toFixed(1)} / ${st.total_mb.toFixed(0)} MB`
-                                : `${pct}%`}
-                            </span>
-                          </div>
-                        </>
-                      )}
-                      {isError && st?.message && (
-                        <div className="model-error-msg" title={st.message}>
-                          {st.message}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-
-                <div className="hint" style={{ marginTop: 4, fontWeight: 700, color: "var(--text-1)" }}>
-                  <span>Mở rộng Đa ngôn ngữ &amp; Chuyên sâu (Tùy chọn)</span>
-                </div>
-
-                {optionalModelRows.map(([label, st, id, sz]) => {
-                  const isDownloading = st?.status === "downloading";
-                  const isError = st?.status === "error";
-                  const isJustDone = st?.status === "ready" && Boolean(justDownloadedIds[id]);
-                  const pct = Math.max(0, Math.min(100, Math.round(st?.progress ?? 0)));
-                  return (
-                    <div className={`model-row ${isJustDone ? "success" : ""}`} key={id}>
-                      <div className="model-top">
-                        <span>{label}</span>
-                        {st?.status === "ready" ? (
-                          <div className="row" style={{ gap: 5 }}>
-                            {isJustDone ? (
-                              <span className="model-done-badge">
-                                <CheckCircle2 size={12} /> Tải thành công
-                              </span>
-                            ) : (
-                              <span style={{ color: "var(--green-text)", fontSize: 11, whiteSpace: "nowrap" }}>
-                                ✓ {sz}
-                              </span>
-                            )}
-                            <button
-                              className="btn sm icon-only"
-                              style={{ width: 22, height: 22, minWidth: 22, padding: 3 }}
-                              onClick={() => handleDeleteModel(id)}
-                              title={`Xóa ${label} (${sz}) để giải phóng dung lượng ổ cứng`}
-                            >
-                              <Trash2 size={11} />
-                            </button>
-                          </div>
-                        ) : isDownloading ? (
-                          <button className="btn sm downloading" disabled>
-                            <Loader2 size={11.5} className="spin" /> {pct}%
-                          </button>
-                        ) : (
-                          <button
-                            className="btn primary sm"
-                            onClick={() => handleDownloadModel(id)}
-                          >
-                            <Download size={11.5} /> {isError ? "Thử lại" : sz}
-                          </button>
-                        )}
-                      </div>
-                      {isDownloading && (
-                        <>
-                          <div className="progress-track">
-                            <div className="progress-fill" style={{ width: `${Math.max(3, pct)}%` }} />
-                          </div>
-                          <div className="model-progress-meta">
-                            <span>{st.message || "Đang tải..."}</span>
-                            <span>
-                              {st.total_mb > 0
-                                ? `${st.downloaded_mb.toFixed(1)} / ${st.total_mb.toFixed(0)} MB`
-                                : `${pct}%`}
-                            </span>
-                          </div>
-                        </>
-                      )}
-                      {isError && st?.message && (
-                        <div className="model-error-msg" title={st.message}>
-                          {st.message}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
 
                 {/* App Version & Manual Auto-Update Check */}
                 <div className="update-footer-row">
@@ -3030,63 +3653,6 @@ export default function App() {
               );
             })()}
 
-          {connected &&
-            models !== null &&
-            sourceLang !== "vie_Latn" &&
-            sourceLang !== "eng_Latn" &&
-            models.asr_whisper_turbo?.status !== "ready" &&
-            (() => {
-              const wt = models.asr_whisper_turbo;
-              const isDl = wt?.status === "downloading";
-              const pct = Math.max(0, Math.min(100, Math.round(wt?.progress ?? 0)));
-              const srcName = currentSrcObj?.name_vi || sourceLang;
-              return (
-                <div className="banner-setup">
-                  <div className="row" style={{ gap: 8, minWidth: 0, flex: 1 }}>
-                    {isDl ? (
-                      <Loader2 size={15} className="spin" style={{ flexShrink: 0 }} />
-                    ) : (
-                      <Download size={15} style={{ flexShrink: 0 }} />
-                    )}
-                    <div style={{ minWidth: 0, flex: 1 }}>
-                      <div style={{ fontWeight: 700, fontSize: 12.5 }}>
-                        {isDl
-                          ? `Đang tải Whisper-Turbo 99 ngôn ngữ (${pct}%)...`
-                          : `Nghe ${srcName} offline 100% trên cả Windows & macOS`}
-                      </div>
-                      <div style={{ fontSize: 11.5, color: "var(--text-2)", marginTop: 1 }}>
-                        {isDl
-                          ? wt?.message || "Đang tải Whisper Large-v3-Turbo + Silero VAD..."
-                          : "Tải 1 lần Whisper-Turbo + Silero VAD (~540 MB) để nhận dạng 99 ngôn ngữ (Thái, Nhật, Trung, Hàn, Pháp, Đức...) kèm dấu câu."}
-                      </div>
-                      {isDl && (
-                        <div className="progress-track" style={{ marginTop: 6 }}>
-                          <div className="progress-fill" style={{ width: `${Math.max(3, pct)}%` }} />
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                  <div className="row" style={{ gap: 6, flexShrink: 0 }}>
-                    <button
-                      className={`btn sm ${isDl ? "downloading" : "primary"}`}
-                      disabled={isDl}
-                      onClick={() => handleDownloadModel("whisper-turbo")}
-                    >
-                      {isDl ? (
-                        <>
-                          <Loader2 size={12} className="spin" /> {pct}%
-                        </>
-                      ) : (
-                        <>
-                          <Download size={12} /> Tải Whisper-Turbo (540 MB)
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
-              );
-            })()}
-
           {/* Live Spotlight — Smooth Continuous Top-to-Bottom 2-Tier Flow */}
           <section className={`spotlight ${status?.listening ? "live" : ""}`}>
             <div className="spotlight-head">
@@ -3155,14 +3721,14 @@ export default function App() {
 
                 <div className={`spot-target ${flowCurrIsDraft ? "draft" : ""}`}>
                   {flowCurrTarget ? (
-                    flowCurrIsDraft && partial && (partial.stable_text || partial.unstable_text) ? (
+                    flowCurrIsDraft && activePartial && (activePartial.stable_text || activePartial.unstable_text) ? (
                       <>
-                        {partial.stable_text && (
-                          <span className="mt-stable">{partial.stable_text}</span>
+                        {activePartial.stable_text && (
+                          <span className="mt-stable">{activePartial.stable_text}</span>
                         )}
-                        {partial.stable_text && partial.unstable_text ? " " : null}
-                        {partial.unstable_text && (
-                          <span className="mt-unstable">{partial.unstable_text}</span>
+                        {activePartial.stable_text && activePartial.unstable_text ? " " : null}
+                        {activePartial.unstable_text && (
+                          <span className="mt-unstable">{activePartial.unstable_text}</span>
                         )}
                         <span className="live-caret" aria-hidden="true" />
                       </>
@@ -3869,48 +4435,117 @@ export default function App() {
                   );
                 })()
               ) : (
-                <label
-                  className="dropzone"
-                  onDragOver={(e) => e.preventDefault()}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    const f = e.dataTransfer.files?.[0];
-                    if (f && !fileBusy) handleUploadMediaFile(f);
-                  }}
-                >
-                  <input
-                    type="file"
-                    accept="audio/*,video/*,.wav,.mp3,.m4a,.mp4,.mov,.webm,.ogg,.flac"
-                    style={{ display: "none" }}
-                    disabled={fileBusy}
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      if (f) handleUploadMediaFile(f);
-                      e.target.value = "";
+                <>
+                  <div className="file-options-bar">
+                    <label className="file-opt-group">
+                      <span className="file-opt-label">Engine nhận dạng (ASR)</span>
+                      <select
+                        className="select file-opt-select"
+                        value={fileAsrMode}
+                        onChange={(e) => setFileAsrMode(e.target.value as "auto" | "whisper-turbo")}
+                      >
+                        <option value="auto">Tự động tối ưu (Nhanh • VietASR / Moonshine)</option>
+                        <option value="whisper-turbo">
+                          Whisper Large-v3-Turbo (Chuẩn tạp âm / nói chen
+                          {models?.asr_whisper_turbo?.status === "ready" ? " • Sẵn sàng" : " • Cần tải 540 MB"})
+                        </option>
+                      </select>
+                    </label>
+                    <label
+                      className="toggle-row file-opt-toggle"
+                      title="Áp dụng bộ lọc dynaudnorm để nâng giọng nói xa micro trước khi tách VAD — tránh bỏ sót câu nhỏ"
+                    >
+                      <span>Cân bằng giọng nhỏ (dynaudnorm)</span>
+                      <span className="switch">
+                        <input
+                          type="checkbox"
+                          checked={fileNormalizeAudio}
+                          onChange={(e) => setFileNormalizeAudio(e.target.checked)}
+                        />
+                        <span className="switch-track" />
+                      </span>
+                    </label>
+                  </div>
+
+                  <label
+                    className="dropzone"
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      const f = e.dataTransfer.files?.[0];
+                      if (f && !fileBusy) handleUploadMediaFile(f);
                     }}
-                  />
-                  <Upload size={22} color="var(--info)" />
-                  <div style={{ fontWeight: 700, fontSize: 13.5 }}>
-                    Bấm chọn file hoặc kéo thả file .MP3 / .WAV / .M4A / .MP4 vào đây
-                  </div>
-                  <div style={{ fontSize: 11.5, color: "var(--text-2)" }}>
-                    Tự động lưu sẵn file .TXT &amp; .SRT song ngữ vào thư mục Biên bản
-                  </div>
-                </label>
+                  >
+                    <input
+                      type="file"
+                      accept="audio/*,video/*,.wav,.mp3,.m4a,.mp4,.mov,.webm,.ogg,.flac"
+                      style={{ display: "none" }}
+                      disabled={fileBusy}
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (f) handleUploadMediaFile(f);
+                        e.target.value = "";
+                      }}
+                    />
+                    <Upload size={22} color="var(--info)" />
+                    <div style={{ fontWeight: 700, fontSize: 13.5 }}>
+                      Bấm chọn file hoặc kéo thả file .MP3 / .WAV / .M4A / .MP4 vào đây
+                    </div>
+                    <div style={{ fontSize: 11.5, color: "var(--text-2)" }}>
+                      Tự động chuẩn hóa âm lượng, tách câu bằng VAD &amp; lưu sẵn .TXT / .SRT vào thư mục Biên bản
+                    </div>
+                  </label>
+                </>
               )}
 
               {fileResult && (
                 <div className="summary-body" style={{ marginTop: 12 }}>
-                  <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap" }}>
-                    <span className="autosave-badge">
-                      ✓ {fileResult.filename} ({fileResult.duration_s}s) • Xong trong {fileResult.elapsed_s}s ({fileResult.speed_x}×) • {fileResult.segment_count} đoạn
-                    </span>
-                    <div className="row">
+                  <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+                    <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
+                      <span className="autosave-badge">
+                        ✓ {fileResult.filename} ({fileResult.duration_s}s) • {fileResult.elapsed_s}s ({fileResult.speed_x}×) • {fileResult.segment_count} đoạn
+                      </span>
+                      {fileResult.asr_used && (
+                        <span className="file-meta-pill">{fileResult.asr_used}</span>
+                      )}
+                      {fileResult.vad_used && (
+                        <span className="file-meta-pill">Silero VAD</span>
+                      )}
+                      {fileResult.normalized && (
+                        <span className="file-meta-pill">dynaudnorm</span>
+                      )}
+                    </div>
+                    <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
+                      <select
+                        className="select file-srt-select"
+                        value={fileSrtFormat}
+                        onChange={(e) =>
+                          setFileSrtFormat(e.target.value as "bilingual" | "target" | "source")
+                        }
+                        title="Chọn định dạng phụ đề .SRT"
+                      >
+                        <option value="bilingual">.SRT Song ngữ</option>
+                        <option value="target">.SRT Chỉ bản dịch</option>
+                        <option value="source">.SRT Chỉ văn bản gốc</option>
+                      </select>
                       <button
                         className="btn primary sm"
-                        onClick={() =>
-                          handleDownloadBlob(`${stripFileExtension(fileResult.filename)}.srt`, fileResult.srt_content)
-                        }
+                        onClick={() => {
+                          const stem = stripFileExtension(fileResult.filename);
+                          const content =
+                            fileSrtFormat === "target"
+                              ? fileResult.srt_target_content || fileResult.srt_content
+                              : fileSrtFormat === "source"
+                              ? fileResult.srt_source_content || fileResult.srt_content
+                              : fileResult.srt_content;
+                          const suffix =
+                            fileSrtFormat === "target"
+                              ? "-translated"
+                              : fileSrtFormat === "source"
+                              ? "-source"
+                              : "";
+                          handleDownloadBlob(`${stem}${suffix}.srt`, content);
+                        }}
                       >
                         <Download size={12} /> Tải .SRT
                       </button>
@@ -3921,6 +4556,14 @@ export default function App() {
                         }
                       >
                         <FileText size={12} /> Tải .TXT
+                      </button>
+                      <button
+                        className="btn sm eval-btn"
+                        disabled={fileResult.segments.length === 0}
+                        onClick={handleEvaluateFileResult}
+                        title="Rà soát lỗi dấu thanh, tên riêng & độ sát nghĩa của file bằng Google AI (Gemini)"
+                      >
+                        <ShieldCheck size={12.5} /> Đánh giá Google AI
                       </button>
                     </div>
                   </div>
@@ -4234,13 +4877,35 @@ export default function App() {
 
             <div className="modal-foot">
               <div className="row" style={{ gap: 6 }}>
-                <button
-                  className="btn sm"
-                  disabled={evalBusy || groupedHistory.length === 0}
-                  onClick={handleEvaluateSession}
-                >
-                  <RefreshCw size={12} /> Chấm lại
-                </button>
+                {evalReport?.items?.[0]?.id?.startsWith("file-seg-") ? (
+                  <>
+                    <button
+                      className="btn sm"
+                      disabled={evalBusy || !fileResult}
+                      onClick={handleEvaluateFileResult}
+                    >
+                      <RefreshCw size={12} /> Chấm lại File
+                    </button>
+                    <button
+                      className="btn sm"
+                      disabled={evalBusy}
+                      onClick={() => {
+                        setEvalOpen(false);
+                        setFileModalOpen(true);
+                      }}
+                    >
+                      <FileAudio size={12} /> Quay lại Dịch File (tải .SRT)
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    className="btn sm"
+                    disabled={evalBusy || groupedHistory.length === 0}
+                    onClick={handleEvaluateSession}
+                  >
+                    <RefreshCw size={12} /> Chấm lại
+                  </button>
+                )}
               </div>
               <div className="row" style={{ gap: 6 }}>
                 {evalReport && (
@@ -4585,6 +5250,114 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Safe Exit Confirmation Modal (intercepts main window Close X button) */}
+      {exitConfirmOpen && (() => {
+        const anyModelDownloading = Boolean(
+          models &&
+            [
+              models.asr_zipformer_streaming,
+              models.asr_zipformer_en_20m,
+              models.asr_moonshine_en,
+              models.asr_whisper_turbo,
+              models.mt_envit5,
+              models.mt_nllb_600m,
+              models.mt_hymt2,
+              models.mt_nllb_13b,
+            ].some((m) => m?.status === "downloading")
+        );
+        const isLive = Boolean(status?.listening);
+        return (
+          <div
+            className="modal-backdrop exit-confirm-backdrop"
+            onClick={() => !exitBusy && setExitConfirmOpen(false)}
+          >
+            <div
+              className="modal-card exit-confirm-card"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="exit-confirm-title"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="modal-head">
+                <div className="row" style={{ gap: 10 }}>
+                  <div className="exit-warn-icon" aria-hidden="true">
+                    <AlertTriangle size={18} />
+                  </div>
+                  <div>
+                    <div id="exit-confirm-title" className="modal-title">
+                      Bạn có chắc muốn thoát chương trình?
+                    </div>
+                    <div className="modal-sub">PolyVoice Pro v{APP_VERSION}</div>
+                  </div>
+                </div>
+                <button
+                  className="btn sm icon-only"
+                  disabled={exitBusy}
+                  onClick={() => setExitConfirmOpen(false)}
+                  title="Ở lại"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+
+              <div className="modal-body-pad">
+                {(isLive || fileBusy || anyModelDownloading) && (
+                  <div className="exit-status-pill">
+                    <span className="exit-status-dot" aria-hidden="true" />
+                    <span>
+                      {isLive
+                        ? "Đang phiên dịch trực tiếp"
+                        : fileBusy
+                        ? "Đang dịch file ghi âm / video"
+                        : "Đang tải mô hình offline"}
+                    </span>
+                  </div>
+                )}
+
+                <p className="exit-confirm-desc">
+                  {isLive
+                    ? "Phiên dịch trực tiếp đang hoạt động. Nếu thoát ngay bây giờ, quá trình thu âm, cửa sổ Phụ đề nổi và kết nối QR khán giả sẽ dừng lại. Biên bản hội thoại đã được tự động lưu an toàn."
+                    : fileBusy || anyModelDownloading
+                    ? "Hiện đang có tác vụ xử lý chạy ngầm. Nếu đóng chương trình lúc này, tác vụ đang chạy sẽ bị dừng lại."
+                    : "Toàn bộ biên bản đã tự lưu, Từ điển họp, API Key và các mô hình offline trên máy vẫn sẽ được giữ nguyên cho lần mở tiếp theo."}
+                </p>
+              </div>
+
+              <div className="modal-foot">
+                <span style={{ fontSize: 11.5, color: "var(--text-2)" }}>
+                  Nhấn <b>Esc</b> để hủy và tiếp tục sử dụng
+                </span>
+                <div className="row" style={{ gap: 8 }}>
+                  <button
+                    className="btn sm"
+                    disabled={exitBusy}
+                    autoFocus
+                    onClick={() => setExitConfirmOpen(false)}
+                  >
+                    Ở lại
+                  </button>
+                  <button
+                    className="btn primary sm"
+                    disabled={exitBusy}
+                    onClick={handleConfirmExitApp}
+                  >
+                    {exitBusy ? (
+                      <>
+                        <Loader2 size={13} className="spin" /> Đang thoát...
+                      </>
+                    ) : (
+                      <>
+                        <LogOut size={13} /> Thoát ứng dụng
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }

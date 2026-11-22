@@ -362,7 +362,7 @@ class EnViT5Translator:
         if cached is not None:
             return TranslationResult(clean, cached, src_lang, tgt_lang, 0.0, "vietai-envit5", True)
 
-        chunks = _split_semantic_sentences(clean, max_words=32)
+        chunks = _split_semantic_sentences(clean, max_words=60)
         batch_tokens = [self._sp.encode(f"{prefix}: {c}", out_type=str) + ["</s>"] for c in chunks]
         max_src_len = max(len(toks) for toks in batch_tokens)
         is_short_src = len(clean.split()) <= 6
@@ -472,7 +472,7 @@ class NLLBTranslator:
         if cached is not None:
             return TranslationResult(clean, cached, src_lang, tgt_lang, 0.0, self.engine_name, True)
 
-        chunks = _split_semantic_sentences(clean, max_words=32)
+        chunks = _split_semantic_sentences(clean, max_words=60)
         batch_tokens = [[src_lang, *self._sp.encode(c, out_type=str), "</s>"] for c in chunks]
         max_src_len = max(len(toks) for toks in batch_tokens)
 
@@ -1034,7 +1034,7 @@ class HyMT2Translator:
                     "model": "hy-mt2-1.8b",
                     "temperature": 0.0,
                     "top_p": 0.6,
-                    "max_tokens": min(384, max(96, len(clean.split()) * 6)),
+                    "max_tokens": min(384, max(96, len(clean.split()) * 6, len(clean) * 2)),
                     "messages": [{"role": "user", "content": prompt}],
                 },
             )

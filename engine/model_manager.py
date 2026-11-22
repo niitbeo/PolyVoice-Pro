@@ -117,31 +117,6 @@ def _windows_short_path(path: Path) -> Optional[Path]:
     return None
 
 
-def _resolve_default_models_dir() -> Path:
-    """
-    Resolve default local model cache directory.
-    On Windows with non-ASCII usernames (e.g. `C:\\Users\\Nguyễn Văn A`), C++ model
-    loaders (CTranslate2 / sherpa-onnx) using `std::ifstream` fail on UTF-8 paths under
-    the default Active Code Page. Prefer Windows 8.3 ASCII short path, falling back to
-    `%PUBLIC%\\PolyVoicePro\\models` (always ASCII and standard-user writable).
-    """
-    env_dir = os.environ.get("VOICERECORE_MODEL_DIR")
-    if env_dir:
-        return Path(env_dir)
-
-    default_dir = Path.home() / ".cache" / "voicerecore" / "models"
-    if os.name == "nt" and not str(default_dir).isascii():
-        short = _windows_short_path(default_dir)
-        if short is not None:
-            return short
-        pub_root = Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "PolyVoicePro" / "models"
-        if str(pub_root).isascii():
-            return pub_root
-    return default_dir
-
-
-DEFAULT_MODELS_DIR = _resolve_default_models_dir()
-
 NLLB_600M_REPO = "mijuanlo/nllb-200-distilled-600M-ct2-int8"
 NLLB_600M_FALLBACK_REPO = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
 NLLB_REQUIRED_FILES = [
@@ -174,6 +149,24 @@ MOONSHINE_EN_URL = (
 )
 MOONSHINE_EN_DIRNAME = "sherpa-onnx-moonshine-base-en-quantized-2026-02-27"
 
+MOONSHINE_JA_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "sherpa-onnx-moonshine-base-ja-quantized-2026-02-27.tar.bz2"
+)
+MOONSHINE_JA_DIRNAME = "sherpa-onnx-moonshine-base-ja-quantized-2026-02-27"
+
+MOONSHINE_KO_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "sherpa-onnx-moonshine-tiny-ko-quantized-2026-02-27.tar.bz2"
+)
+MOONSHINE_KO_DIRNAME = "sherpa-onnx-moonshine-tiny-ko-quantized-2026-02-27"
+
+ZIPFORMER_MULTI_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh-2025-02-10.tar.bz2"
+)
+ZIPFORMER_MULTI_DIRNAME = "sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh-2025-02-10"
+
 WHISPER_TURBO_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
     "sherpa-onnx-whisper-turbo.tar.bz2"
@@ -193,6 +186,150 @@ NLLB_13B_REPO = "JustFrederik/nllb-200-distilled-1.3B-ct2-int8"
 
 _DOWNLOADING_MARKER = ".downloading"
 _READY_SENTINEL = ".ready"
+
+_KNOWN_MODEL_SUBDIRS = (
+    "zipformer-30m-streaming-vi",
+    ZIPFORMER_EN_20M_DIRNAME,
+    MOONSHINE_EN_DIRNAME,
+    MOONSHINE_JA_DIRNAME,
+    MOONSHINE_KO_DIRNAME,
+    ZIPFORMER_MULTI_DIRNAME,
+    WHISPER_TURBO_DIRNAME,
+    "envit5-translation-ct2-int8",
+    "nllb-200-distilled-600M-ct2-int8",
+    "nllb-200-distilled-1.3B-ct2-int8",
+    "hy-mt2-1.8b-gguf",
+    "opus-mt-vi-en-ct2-int8",
+    "opus-mt-en-vi-ct2-int8",
+)
+
+
+def _has_model_weights(model_subdir: Path) -> bool:
+    """Return True if `model_subdir` contains at least one non-trivial model weight file."""
+    if not model_subdir.is_dir():
+        return False
+    try:
+        for p in model_subdir.iterdir():
+            if (
+                p.is_file()
+                and p.suffix.lower() in (".bin", ".onnx", ".ort", ".gguf")
+                and p.stat().st_size >= 5_000_000
+            ):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _count_existing_models(root: Path) -> int:
+    if not root.is_dir():
+        return 0
+    return sum(1 for sub in _KNOWN_MODEL_SUBDIRS if _has_model_weights(root / sub))
+
+
+def _is_dir_writable(root: Path) -> bool:
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / f".pv_write_test_{os.getpid()}"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _migrate_missing_models(src_root: Path, dst_root: Path) -> int:
+    """
+    Safely recover/migrate downloaded model folders from `src_root` into `dst_root`
+    when Windows username encoding or UAC elevation shifts `Path.home()` across updates.
+    Never overwrites a model that already exists in `dst_root`.
+    """
+    if not src_root.is_dir():
+        return 0
+    try:
+        if dst_root.exists() and src_root.resolve() == dst_root.resolve():
+            return 0
+    except OSError:
+        pass
+    moved = 0
+    try:
+        dst_root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return 0
+    for sub in _KNOWN_MODEL_SUBDIRS:
+        src_sub = src_root / sub
+        dst_sub = dst_root / sub
+        if not _has_model_weights(src_sub) or _has_model_weights(dst_sub):
+            continue
+        try:
+            if dst_sub.exists():
+                shutil.rmtree(dst_sub, ignore_errors=True)
+            shutil.move(str(src_sub), str(dst_sub))
+            (dst_sub / _DOWNLOADING_MARKER).unlink(missing_ok=True)
+            moved += 1
+        except Exception:
+            try:
+                shutil.copytree(str(src_sub), str(dst_sub), dirs_exist_ok=True)
+                (dst_sub / _DOWNLOADING_MARKER).unlink(missing_ok=True)
+                moved += 1
+            except Exception:
+                pass
+    return moved
+
+
+def _resolve_default_models_dir() -> Path:
+    """
+    Resolve default local model cache directory.
+    On Windows:
+      - Handles non-ASCII usernames (e.g. `C:\\Users\\Nguyễn Văn A`) where C++ loaders fail on UTF-8 paths.
+      - Handles UAC / MSI elevation shifts (Standard User vs Administrator) so auto-updates NEVER lose models.
+      - Automatically recovers/migrates existing models between `~/.cache/voicerecore/models` and
+        `%PUBLIC%\\PolyVoicePro\\models`.
+      - For brand-new Windows installs with no prior models, prefers `%PUBLIC%\\PolyVoicePro\\models`
+        (always 100% ASCII, standard-user writable, and shared across Standard & Elevated Admin sessions).
+    """
+    env_dir = os.environ.get("VOICERECORE_MODEL_DIR")
+    if env_dir:
+        return Path(env_dir)
+
+    default_dir = Path.home() / ".cache" / "voicerecore" / "models"
+    if os.name != "nt":
+        return default_dir
+
+    pub_root = Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "PolyVoicePro" / "models"
+    ascii_user_dir: Optional[Path] = (
+        default_dir if str(default_dir).isascii() else _windows_short_path(default_dir)
+    )
+    user_cnt = _count_existing_models(default_dir)
+    pub_cnt = _count_existing_models(pub_root)
+
+    # 1. Non-ASCII Windows username without 8.3 short paths -> must use ASCII %PUBLIC% dir,
+    #    and auto-migrate any models previously downloaded into `default_dir`.
+    if ascii_user_dir is None:
+        if str(pub_root).isascii() and _is_dir_writable(pub_root):
+            if user_cnt > 0:
+                _migrate_missing_models(default_dir, pub_root)
+            return pub_root
+        return default_dir
+
+    # 2. Existing models live in %PUBLIC% while user home cache is empty (e.g. after MSI/UAC update)
+    if pub_cnt > 0 and user_cnt == 0 and str(pub_root).isascii() and _is_dir_writable(pub_root):
+        return pub_root
+
+    # 3. Existing models already live in the user's cache -> preserve them and merge any extras from %PUBLIC%
+    if user_cnt > 0:
+        if pub_cnt > 0:
+            _migrate_missing_models(pub_root, ascii_user_dir)
+        return ascii_user_dir
+
+    # 4. Fresh Windows install (0 models in both): store in %PUBLIC%\PolyVoicePro\models so
+    #    future MSI/NSIS updates (even under UAC Admin) and Unicode usernames never lose models!
+    if str(pub_root).isascii() and _is_dir_writable(pub_root):
+        return pub_root
+    return ascii_user_dir
+
+
+DEFAULT_MODELS_DIR = _resolve_default_models_dir()
 
 
 def _file_ok(path: Path, min_bytes: int = 1) -> bool:
@@ -235,6 +372,15 @@ class ModelManager:
     def __init__(self, models_dir: Path | None = None) -> None:
         self.models_dir = Path(models_dir or DEFAULT_MODELS_DIR)
         self.models_dir.mkdir(parents=True, exist_ok=True)
+        # Clear any stale `.downloading` markers left over from an abrupt exit or app update:
+        # no download thread can exist yet at startup, and every `is_*_ready()` verifies real weight files.
+        for sub in _KNOWN_MODEL_SUBDIRS:
+            stale = self.models_dir / sub / _DOWNLOADING_MARKER
+            if stale.exists():
+                try:
+                    stale.unlink(missing_ok=True)
+                except OSError:
+                    pass
         self._lock = threading.Lock()
         self._states: dict[str, DownloadState] = {}
 
@@ -255,6 +401,18 @@ class ModelManager:
         return self.models_dir / MOONSHINE_EN_DIRNAME
 
     @property
+    def moonshine_ja_dir(self) -> Path:
+        return self.models_dir / MOONSHINE_JA_DIRNAME
+
+    @property
+    def moonshine_ko_dir(self) -> Path:
+        return self.models_dir / MOONSHINE_KO_DIRNAME
+
+    @property
+    def zipformer_multi_dir(self) -> Path:
+        return self.models_dir / ZIPFORMER_MULTI_DIRNAME
+
+    @property
     def whisper_turbo_dir(self) -> Path:
         return self.models_dir / WHISPER_TURBO_DIRNAME
 
@@ -263,6 +421,8 @@ class ModelManager:
         for candidate in (
             self.whisper_turbo_dir / "silero_vad_v5.onnx",
             self.moonshine_en_dir / "silero_vad_v5.onnx",
+            self.moonshine_ja_dir / "silero_vad_v5.onnx",
+            self.moonshine_ko_dir / "silero_vad_v5.onnx",
             self.models_dir / "silero_vad_v5.onnx",
         ):
             if _file_ok(candidate, 500_000):
@@ -353,6 +513,40 @@ class ModelManager:
         return (
             _file_ok(d / "encoder_model.ort", 5_000_000)
             and _file_ok(d / "decoder_model_merged.ort", 5_000_000)
+            and _file_ok(d / "tokens.txt", 100)
+        )
+
+    def is_moonshine_ja_ready(self) -> bool:
+        d = self.moonshine_ja_dir
+        if not _dir_not_downloading(d):
+            return False
+        return (
+            _file_ok(d / "encoder_model.ort", 5_000_000)
+            and _file_ok(d / "decoder_model_merged.ort", 5_000_000)
+            and _file_ok(d / "tokens.txt", 100)
+        )
+
+    def is_moonshine_ko_ready(self) -> bool:
+        d = self.moonshine_ko_dir
+        if not _dir_not_downloading(d):
+            return False
+        return (
+            _file_ok(d / "encoder_model.ort", 5_000_000)
+            and _file_ok(d / "decoder_model_merged.ort", 5_000_000)
+            and _file_ok(d / "tokens.txt", 100)
+        )
+
+    def is_zipformer_multi_ready(self) -> bool:
+        d = self.zipformer_multi_dir
+        if not _dir_not_downloading(d):
+            return False
+        enc = next(d.glob("encoder*.int8.onnx"), d / "encoder.int8.onnx")
+        dec = next(d.glob("decoder*.onnx"), d / "decoder.onnx")
+        joi = next(d.glob("joiner*.int8.onnx"), d / "joiner.int8.onnx")
+        return (
+            _file_ok(enc, 50_000_000)
+            and _file_ok(dec, 5_000_000)
+            and _file_ok(joi, 1_000_000)
             and _file_ok(d / "tokens.txt", 100)
         )
 
@@ -458,6 +652,45 @@ class ModelManager:
                     else "Chưa tải (~106 MB)",
                 ),
             )
+            moonshine_ja_state = self._states.get(
+                "moonshine-ja",
+                DownloadState(
+                    model_id="moonshine-ja",
+                    status="ready" if self.is_moonshine_ja_ready() else "missing",
+                    progress=100.0 if self.is_moonshine_ja_ready() else 0.0,
+                    total_mb=99.0,
+                    downloaded_mb=99.0 if self.is_moonshine_ja_ready() else 0.0,
+                    message="Sẵn sàng (Moonshine-v2 Tiếng Nhật • ~120ms Streaming • 0% GPU)"
+                    if self.is_moonshine_ja_ready()
+                    else "Chưa tải (~99 MB)",
+                ),
+            )
+            moonshine_ko_state = self._states.get(
+                "moonshine-ko",
+                DownloadState(
+                    model_id="moonshine-ko",
+                    status="ready" if self.is_moonshine_ko_ready() else "missing",
+                    progress=100.0 if self.is_moonshine_ko_ready() else 0.0,
+                    total_mb=47.0,
+                    downloaded_mb=47.0 if self.is_moonshine_ko_ready() else 0.0,
+                    message="Sẵn sàng (Moonshine-v2 Tiếng Hàn • ~150ms Streaming • 0% GPU)"
+                    if self.is_moonshine_ko_ready()
+                    else "Chưa tải (~47 MB)",
+                ),
+            )
+            zf_multi_state = self._states.get(
+                "zipformer-multi",
+                DownloadState(
+                    model_id="zipformer-multi",
+                    status="ready" if self.is_zipformer_multi_ready() else "missing",
+                    progress=100.0 if self.is_zipformer_multi_ready() else 0.0,
+                    total_mb=247.0,
+                    downloaded_mb=247.0 if self.is_zipformer_multi_ready() else 0.0,
+                    message="Sẵn sàng (Thái/Trung/Indo Streaming ~15ms • 0% GPU)"
+                    if self.is_zipformer_multi_ready()
+                    else "Chưa tải (~247 MB)",
+                ),
+            )
             whisper_turbo_state = self._states.get(
                 "whisper-turbo",
                 DownloadState(
@@ -541,6 +774,9 @@ class ModelManager:
                 "asr_zipformer_streaming": asdict(zf_state),
                 "asr_zipformer_en_20m": asdict(zf_en_state),
                 "asr_moonshine_en": asdict(moonshine_en_state),
+                "asr_moonshine_ja": asdict(moonshine_ja_state),
+                "asr_moonshine_ko": asdict(moonshine_ko_state),
+                "asr_zipformer_multi": asdict(zf_multi_state),
                 "asr_whisper_turbo": asdict(whisper_turbo_state),
                 "asr_vietasr": {
                     "model_id": "viet-asr",
@@ -941,6 +1177,56 @@ class ModelManager:
             extra_files=[("silero_vad_v5.onnx", SILERO_VAD_URL, 2_313_101)],
         )
 
+    def ensure_moonshine_ja(self, on_progress: Optional[Callable[[dict], None]] = None) -> Path:
+        if self.is_moonshine_ja_ready():
+            self._update_state("moonshine-ja", on_progress, status="ready", progress=100.0)
+            return self.moonshine_ja_dir
+
+        return self._download_and_extract_tar_bz2(
+            model_id="moonshine-ja",
+            url=MOONSHINE_JA_URL,
+            dirname=MOONSHINE_JA_DIRNAME,
+            dest_dir=self.moonshine_ja_dir,
+            expected_mb=101.0,
+            start_msg="Đang tải Moonshine-v2 Base Tiếng Nhật + Silero VAD (~99 MB • ~120ms)...",
+            ready_msg="Sẵn sàng (Moonshine-v2 Tiếng Nhật • ~120ms Streaming • 0% GPU)",
+            on_progress=on_progress,
+            extra_files=[("silero_vad_v5.onnx", SILERO_VAD_URL, 2_313_101)],
+        )
+
+    def ensure_moonshine_ko(self, on_progress: Optional[Callable[[dict], None]] = None) -> Path:
+        if self.is_moonshine_ko_ready():
+            self._update_state("moonshine-ko", on_progress, status="ready", progress=100.0)
+            return self.moonshine_ko_dir
+
+        return self._download_and_extract_tar_bz2(
+            model_id="moonshine-ko",
+            url=MOONSHINE_KO_URL,
+            dirname=MOONSHINE_KO_DIRNAME,
+            dest_dir=self.moonshine_ko_dir,
+            expected_mb=49.0,
+            start_msg="Đang tải Moonshine-v2 Tiếng Hàn + Silero VAD (~47 MB • ~150ms)...",
+            ready_msg="Sẵn sàng (Moonshine-v2 Tiếng Hàn • ~150ms Streaming • 0% GPU)",
+            on_progress=on_progress,
+            extra_files=[("silero_vad_v5.onnx", SILERO_VAD_URL, 2_313_101)],
+        )
+
+    def ensure_zipformer_multi(self, on_progress: Optional[Callable[[dict], None]] = None) -> Path:
+        if self.is_zipformer_multi_ready():
+            self._update_state("zipformer-multi", on_progress, status="ready", progress=100.0)
+            return self.zipformer_multi_dir
+
+        return self._download_and_extract_tar_bz2(
+            model_id="zipformer-multi",
+            url=ZIPFORMER_MULTI_URL,
+            dirname=ZIPFORMER_MULTI_DIRNAME,
+            dest_dir=self.zipformer_multi_dir,
+            expected_mb=247.0,
+            start_msg="Đang tải Zipformer Streaming Đa ngôn ngữ (Thái, Trung, Indo • ~247 MB • ~15ms)...",
+            ready_msg="Sẵn sàng (Thái/Trung/Indo Streaming ~15ms • 0% GPU)",
+            on_progress=on_progress,
+        )
+
     def ensure_whisper_turbo(self, on_progress: Optional[Callable[[dict], None]] = None) -> Path:
         if self.is_whisper_turbo_ready():
             self._update_state("whisper-turbo", on_progress, status="ready", progress=100.0)
@@ -1246,6 +1532,9 @@ class ModelManager:
             "envit5": self.envit5_dir,
             "whisper-turbo": self.whisper_turbo_dir,
             "moonshine-en": self.moonshine_en_dir,
+            "moonshine-ja": self.moonshine_ja_dir,
+            "moonshine-ko": self.moonshine_ko_dir,
+            "zipformer-multi": self.zipformer_multi_dir,
             "zipformer-en-20m": self.zipformer_en_20m_dir,
             "zipformer-30m-streaming": self.zipformer_streaming_dir,
         }

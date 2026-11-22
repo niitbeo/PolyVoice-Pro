@@ -71,13 +71,26 @@ function renderLiveTarget(partial: PartialEvent) {
       </>
     );
   }
-  return <span className="overlay-translating-dots">Đang dịch...</span>;
+  return (
+    <span className="overlay-translating-dots" aria-label="Đang dịch trực tiếp">
+      <span className="live-dots" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </span>
+    </span>
+  );
 }
 
 export default function OverlayWindow() {
   const [status, setStatus] = useState<EngineStatus | null>(null);
   const [entries, setEntries] = useState<TranscriptEntry[]>([]);
   const [partial, setPartial] = useState<PartialEvent | null>(null);
+  const [inflightPartial, setInflightPartial] = useState<PartialEvent | null>(null);
+  // Adaptive minimum reading dwell hold for single/2-tier YouTube captions:
+  // prevents a freshly finalized sentence from being bumped away < 1.2s after completion.
+  const [ytDwellHoldUntil, setYtDwellHoldUntil] = useState(0);
+  const [, setYtDwellTick] = useState(0);
 
   const [layoutMode, setLayoutMode] = useState<OverlayLayoutMode>(() => getInitialOverlayLayout());
   const [stageMode, setStageMode] = useState(false);
@@ -94,6 +107,7 @@ export default function OverlayWindow() {
   const pinnedToBottomRef = useRef(true);
   const scrollAnimRef = useRef<number | null>(null);
   const hideBarTimerRef = useRef<number | null>(null);
+  const ytDwellTimerRef = useRef<number | null>(null);
 
   // Persist overlay layout preference
   useEffect(() => {
@@ -186,10 +200,19 @@ export default function OverlayWindow() {
           const msg = JSON.parse(ev.data);
           if (msg.type === "status") {
             setStatus(msg.data);
+            if (!msg.data?.listening) setInflightPartial(null);
           } else if (msg.type === "partial") {
             const d = msg.data;
             setPartial((prev) => {
               const same = Boolean(prev && prev.id === d.id && prev.target_lang === d.target_lang);
+              if (
+                !same &&
+                prev &&
+                prev.id !== d.id &&
+                (prev.translated_text || prev.stable_text || prev.unstable_text)
+              ) {
+                setInflightPartial(prev);
+              }
               return {
                 id: d.id,
                 speaker: d.speaker,
@@ -205,6 +228,7 @@ export default function OverlayWindow() {
             });
           } else if (msg.type === "partial_mt") {
             const d = msg.data;
+            setInflightPartial((cur) => (cur && cur.id !== d.id ? null : cur));
             setPartial((prev) =>
               prev && prev.id === d.id
                 ? {
@@ -220,13 +244,28 @@ export default function OverlayWindow() {
           } else if (msg.type === "final") {
             const entry: TranscriptEntry = msg.data;
             setPartial((prev) => (prev && prev.id === entry.id ? null : prev));
+            setInflightPartial((prev) => (prev && prev.id === entry.id ? null : prev));
             setEntries((prev) => {
               if (prev.some((x) => x.id === entry.id)) return prev;
               return [...prev, entry].slice(-200);
             });
+            // Hold newly finalized sentence calmly in primary slot for 1.2s–2.4s (scaled by length)
+            // before promoting it upward into the 2nd reading tier, so fast speech never feels rushed.
+            const wc = (entry.translated_text || entry.source_text || "").trim().split(/\s+/).filter(Boolean).length;
+            const holdMs = Math.min(2400, Math.max(1200, wc * 85));
+            const until = Date.now() + holdMs;
+            setYtDwellHoldUntil(until);
+            if (ytDwellTimerRef.current) window.clearTimeout(ytDwellTimerRef.current);
+            ytDwellTimerRef.current = window.setTimeout(() => {
+              ytDwellTimerRef.current = null;
+              setYtDwellTick((n) => n + 1);
+            }, holdMs + 30);
           } else if (msg.type === "history" && Array.isArray(msg.data)) {
             setEntries(msg.data.slice(-200));
-            if (msg.data.length === 0) setPartial(null);
+            if (msg.data.length === 0) {
+              setPartial(null);
+              setInflightPartial(null);
+            }
           }
         } catch {
           // ignore
@@ -244,6 +283,10 @@ export default function OverlayWindow() {
     return () => {
       closed = true;
       if (timer) clearTimeout(timer);
+      if (ytDwellTimerRef.current) {
+        window.clearTimeout(ytDwellTimerRef.current);
+        ytDwellTimerRef.current = null;
+      }
       wsRef.current?.close();
       document.body.classList.remove("overlay-body");
     };
@@ -655,34 +698,83 @@ export default function OverlayWindow() {
           ) : layoutMode === "youtube" ? (
             (() => {
               const latestFinal = entries[entries.length - 1] || null;
-              const activeHasMt = Boolean(partial && (partial.translated_text || partial.stable_text || partial.unstable_text));
-              // Atomic EN <-> VI swap: never show Sentence #2's English above Sentence #1's Vietnamese!
-              const holdPrevAtomic = Boolean(partial && !activeHasMt && latestFinal?.translated_text);
-              const ytSource = holdPrevAtomic
-                ? latestFinal?.source_text || ""
-                : partial?.source_text || latestFinal?.source_text || "";
-              const ytIsLive = Boolean(partial && activeHasMt);
+              const prevFinal = entries.length >= 2 ? entries[entries.length - 2] : null;
+              const rawActiveHasMt = Boolean(
+                partial && (partial.translated_text || partial.stable_text || partial.unstable_text)
+              );
+              const activePartial: PartialEvent | null = rawActiveHasMt
+                ? partial
+                : inflightPartial && (!latestFinal || inflightPartial.id !== latestFinal.id)
+                  ? inflightPartial
+                  : partial;
+              const activeHasMt = Boolean(
+                activePartial && (activePartial.translated_text || activePartial.stable_text || activePartial.unstable_text)
+              );
+              const partialWords = (activePartial?.translated_text || activePartial?.source_text || "")
+                .trim()
+                .split(/\s+/)
+                .filter(Boolean).length;
+              // Reading-comfort dwell hold: keep freshly finalized sentence bold in the primary slot
+              // for 1.2s–2.4s while the next sentence only has a few words (< 6), then promote it gently
+              // into the upper tier (`overlay-yt-prev`) so it stays readable for the ENTIRE next sentence!
+              const holdFreshFinal = Boolean(
+                latestFinal?.translated_text &&
+                  activePartial &&
+                  activePartial.id !== latestFinal.id &&
+                  Date.now() < ytDwellHoldUntil &&
+                  partialWords < 6
+              );
+              const showLivePrimary = Boolean(activeHasMt && activePartial && !holdFreshFinal);
+              const ytPrevEntry: TranscriptEntry | null = showLivePrimary ? latestFinal : prevFinal;
+              const ytSource = showLivePrimary
+                ? activePartial?.source_text || ""
+                : latestFinal?.source_text || activePartial?.source_text || "";
               return (
                 <div className="overlay-yt-stage">
-                  <div className={`overlay-yt-pill ${ytIsLive ? "live" : ""}`}>
-                    {ytSource && (
-                      <div className="overlay-yt-src" style={{ fontSize: Math.max(13, Math.round(fontSize * 0.56)) }}>
-                        {ytSource}
+                  <div className={`overlay-yt-pill ${showLivePrimary ? "live" : ""}`}>
+                    {ytPrevEntry && ytPrevEntry.translated_text && (
+                      <div
+                        className="overlay-yt-prev"
+                        key={`yt-prev-${ytPrevEntry.id}`}
+                        aria-label="Câu vừa hoàn tất"
+                      >
+                        <div
+                          className="overlay-yt-prev-tgt"
+                          style={{ fontSize: Math.max(14, Math.round(fontSize * 0.70)) }}
+                        >
+                          {ytPrevEntry.translated_text}
+                        </div>
                       </div>
                     )}
-                    <div className="overlay-yt-tgt" style={{ fontSize }}>
-                      {activeHasMt && partial ? (
-                        renderLiveTarget(partial)
-                      ) : latestFinal?.translated_text ? (
-                        <>
-                          {latestFinal.translated_text}
-                          {Boolean(partial) && <span className="live-caret" aria-hidden="true" />}
-                        </>
-                      ) : partial ? (
-                        <span className="overlay-translating-dots">...</span>
-                      ) : (
-                        "—"
+                    <div className="overlay-yt-curr">
+                      {ytSource && (
+                        <div
+                          className="overlay-yt-src"
+                          style={{ fontSize: Math.max(13, Math.round(fontSize * 0.56)) }}
+                        >
+                          {ytSource}
+                        </div>
                       )}
+                      <div className="overlay-yt-tgt" style={{ fontSize }}>
+                        {showLivePrimary && activePartial ? (
+                          renderLiveTarget(activePartial)
+                        ) : latestFinal?.translated_text ? (
+                          <>
+                            {latestFinal.translated_text}
+                            {Boolean(activePartial) && <span className="live-caret" aria-hidden="true" />}
+                          </>
+                        ) : activePartial ? (
+                          <span className="overlay-translating-dots">
+                            <span className="live-dots" aria-hidden="true">
+                              <span />
+                              <span />
+                              <span />
+                            </span>
+                          </span>
+                        ) : (
+                          "—"
+                        )}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -771,7 +863,9 @@ export default function OverlayWindow() {
                 );
               })}
 
-              {partial && (
+              {partial &&
+                (layoutMode !== "target-only" ||
+                  Boolean(partial.translated_text || partial.stable_text || partial.unstable_text)) && (
                 <div className={`overlay-stage-block live ${layoutMode}`}>
                   <div className="overlay-cell-meta live-tag">
                     <Radio size={12} /> {stageMode ? "LIVE" : "Đang nói & dịch trực tiếp..."}

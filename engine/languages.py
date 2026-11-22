@@ -259,6 +259,9 @@ SOURCE_LANGUAGES: list[SourceLanguageEntry] = [
     SourceLanguageEntry("ind_Latn", "id-ID", "Tiếng Indonesia", "Indonesian", "Bahasa Indonesia", True),
     SourceLanguageEntry("arb_Arab", "ar-SA", "Tiếng Ả Rập", "Arabic", "العربية", True),
     SourceLanguageEntry("hin_Deva", "hi-IN", "Tiếng Hindi", "Hindi", "हिन्दी", True),
+    SourceLanguageEntry("zsm_Latn", "ms-MY", "Tiếng Malaysia", "Malay", "Bahasa Melayu", True),
+    SourceLanguageEntry("tgl_Latn", "fil-PH", "Tiếng Philippines (Tagalog)", "Tagalog", "Tagalog", True),
+    SourceLanguageEntry("mya_Mymr", "my-MM", "Tiếng Myanmar", "Burmese", "မြန်မာဘာသာ", True),
     SourceLanguageEntry("nld_Latn", "nl-NL", "Tiếng Hà Lan", "Dutch", "Nederlands", True),
     SourceLanguageEntry("pol_Latn", "pl-PL", "Tiếng Ba Lan", "Polish", "Polski", True),
     SourceLanguageEntry("tur_Latn", "tr-TR", "Tiếng Thổ Nhĩ Kỳ", "Turkish", "Türkçe", True),
@@ -266,6 +269,50 @@ SOURCE_LANGUAGES: list[SourceLanguageEntry] = [
 ]
 
 SOURCE_LANGUAGE_MAP: dict[str, SourceLanguageEntry] = {s.code: s for s in SOURCE_LANGUAGES}
+
+
+@dataclass(frozen=True)
+class SourceAsrProfile:
+    preferred_model: str       # Fast-Lane model_id ("zipformer-30m-streaming", "moonshine-en", "moonshine-ja", "moonshine-ko", "zipformer-multi", or "whisper-turbo")
+    preferred_model_mb: int
+    fallback_model: str        # Universal safety-net model_id ("whisper-turbo")
+    recommended_pack: str      # "core" | "asia" | "global"
+    asr_tier: str              # "fast" | "universal" | "experimental"
+    asr_note: str = ""
+
+
+_DEFAULT_UNIVERSAL_PROFILE = SourceAsrProfile(
+    preferred_model="whisper-turbo",
+    preferred_model_mb=540,
+    fallback_model="whisper-turbo",
+    recommended_pack="global",
+    asr_tier="universal",
+)
+
+SOURCE_LANG_ASR_PROFILE: dict[str, SourceAsrProfile] = {
+    "vie_Latn": SourceAsrProfile("zipformer-30m-streaming", 49, "whisper-turbo", "core", "fast"),
+    "eng_Latn": SourceAsrProfile("moonshine-en", 106, "whisper-turbo", "core", "fast"),
+    "jpn_Jpan": SourceAsrProfile("moonshine-ja", 99, "whisper-turbo", "asia", "fast"),
+    "kor_Hang": SourceAsrProfile("moonshine-ko", 47, "whisper-turbo", "asia", "fast"),
+    "tha_Thai": SourceAsrProfile("zipformer-multi", 247, "whisper-turbo", "asia", "fast"),
+    "zho_Hans": SourceAsrProfile("zipformer-multi", 247, "whisper-turbo", "asia", "fast"),
+    "zho_Hant": SourceAsrProfile("zipformer-multi", 247, "whisper-turbo", "asia", "fast"),
+    "ind_Latn": SourceAsrProfile("zipformer-multi", 247, "whisper-turbo", "asia", "fast"),
+    "rus_Cyrl": SourceAsrProfile("zipformer-multi", 247, "whisper-turbo", "asia", "fast"),
+    "arb_Arab": SourceAsrProfile("zipformer-multi", 247, "whisper-turbo", "asia", "fast"),
+    "lao_Laoo": SourceAsrProfile(
+        "whisper-turbo",
+        540,
+        "whisper-turbo",
+        "global",
+        "experimental",
+        "Nghe trực tiếp giọng Lào Offline hiện độ chính xác còn hạn chế; chiều Việt → Lào hoạt động tốt 100% Offline.",
+    ),
+}
+
+
+def get_source_asr_profile(code: str) -> SourceAsrProfile:
+    return SOURCE_LANG_ASR_PROFILE.get(code, _DEFAULT_UNIVERSAL_PROFILE)
 
 # NLLB-200 code -> Whisper ISO-639-1 language code (99-language Whisper Large-v3-Turbo)
 NLLB_TO_WHISPER_LANG: dict[str, str] = {
@@ -334,7 +381,22 @@ def list_languages() -> list[dict]:
 
 
 def list_source_languages() -> list[dict]:
-    return [asdict(s) for s in SOURCE_LANGUAGES]
+    out: list[dict] = []
+    for s in SOURCE_LANGUAGES:
+        d = asdict(s)
+        prof = get_source_asr_profile(s.code)
+        d.update(
+            {
+                "preferred_model": prof.preferred_model,
+                "preferred_model_mb": prof.preferred_model_mb,
+                "fallback_model": prof.fallback_model,
+                "recommended_pack": prof.recommended_pack,
+                "asr_tier": prof.asr_tier,
+                "asr_note": prof.asr_note,
+            }
+        )
+        out.append(d)
+    return out
 
 
 # Official 38 languages/dialects supported by Tencent Hy-MT2-1.8B (Apache 2.0)

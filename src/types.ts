@@ -26,6 +26,26 @@ export interface SourceLanguageEntry {
   name_en: string;
   native: string;
   offline_onnx: boolean;
+  preferred_model?: string;
+  preferred_model_mb?: number;
+  fallback_model?: string;
+  recommended_pack?: "core" | "asia" | "global";
+  asr_tier?: "fast" | "universal" | "experimental";
+  asr_note?: string;
+}
+
+export interface SourceReadiness {
+  lang_code: string;
+  ready: boolean;
+  preferred_ready: boolean;
+  fallback_ready: boolean;
+  active_tier: "fast" | "universal" | "apple" | "experimental" | "missing";
+  preferred_model: string;
+  preferred_model_mb: number;
+  fallback_model: string;
+  recommended_pack: "core" | "asia" | "global";
+  asr_tier: "fast" | "universal" | "experimental";
+  note?: string;
 }
 
 export interface ModelState {
@@ -41,7 +61,10 @@ export interface ModelsStatus {
   models_dir: string;
   asr_zipformer_streaming: ModelState;
   asr_zipformer_en_20m: ModelState;
+  asr_zipformer_multi?: ModelState;
   asr_moonshine_en?: ModelState;
+  asr_moonshine_ja?: ModelState;
+  asr_moonshine_ko?: ModelState;
   asr_whisper_turbo?: ModelState;
   asr_vietasr: ModelState;
   mt_hymt2?: ModelState;
@@ -57,10 +80,13 @@ export type InputChannelId = "mix" | "left" | "right";
 export type AsrEngineId =
   | "auto"
   | "moonshine-en"
+  | "moonshine-ja"
+  | "moonshine-ko"
   | "apple-native"
   | "whisper-turbo"
   | "zipformer-30m-streaming"
   | "zipformer-en-20m"
+  | "zipformer-multi"
   | "viet-asr";
 export type MtModeId =
   | "auto-offline"
@@ -193,6 +219,11 @@ export interface FileTranslateResult {
   duration_s: number;
   elapsed_s: number;
   speed_x: number;
+  asr_used?: string;
+  vad_used?: boolean;
+  normalized?: boolean;
+  source_lang?: string;
+  target_lang?: string;
   segment_count: number;
   segments: Array<{
     index: number;
@@ -206,6 +237,8 @@ export interface FileTranslateResult {
   srt_file: string;
   txt_content: string;
   srt_content: string;
+  srt_target_content?: string;
+  srt_source_content?: string;
 }
 
 export interface EngineStatus {
@@ -217,7 +250,10 @@ export interface EngineStatus {
   hotwords_active?: number;
   zipformer_ready: boolean;
   zipformer_en_ready: boolean;
+  zipformer_multi_ready?: boolean;
   moonshine_en_ready?: boolean;
+  moonshine_ja_ready?: boolean;
+  moonshine_ko_ready?: boolean;
   whisper_turbo_ready?: boolean;
   hymt2_ready?: boolean;
   hymt2_loaded?: boolean;
@@ -238,6 +274,7 @@ export interface EngineStatus {
   };
   config: SessionConfig;
   source_lang_meta: SourceLanguageEntry | null;
+  active_source_readiness?: SourceReadiness;
   target_lang_meta: LanguageEntry | null;
   logs?: LogsStatus;
   audience?: { connected_count: number; active_languages: string[] };

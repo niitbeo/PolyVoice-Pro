@@ -156,11 +156,56 @@ def _run_cancellable_proc(
     return proc.returncode or 0, b"".join(chunks)
 
 
+def _dynamic_normalize_pcm16(
+    pcm: np.ndarray,
+    sample_rate: int = SAMPLE_RATE,
+    frame_ms: int = 150,
+    target_rms: float = 0.085,
+    max_gain: float = 12.0,
+    noise_floor: float = 0.0007,
+) -> np.ndarray:
+    """
+    Pure-NumPy windowed dynamic loudness normalizer (equivalent to ffmpeg `dynaudnorm`).
+    Lifts quiet speakers (e.g. far from mic, RMS ~0.0018) cleanly so VAD never drops them,
+    while keeping pure silence unamplified and clamping peaks softly below clipping.
+    """
+    if pcm is None or len(pcm) == 0:
+        return pcm
+    f32 = pcm.astype(np.float32) / 32768.0
+    win = max(160, int(sample_rate * frame_ms / 1000))
+    n = len(f32)
+    n_frames = (n + win - 1) // win
+    pad = n_frames * win - n
+    padded = np.pad(f32, (0, pad)) if pad > 0 else f32
+    frames = padded.reshape(n_frames, win)
+    rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+    peaks = np.max(np.abs(frames), axis=1) + 1e-12
+
+    gains = np.ones(n_frames, dtype=np.float32)
+    active = rms >= noise_floor
+    if np.any(active):
+        desired = np.minimum(target_rms / rms[active], 0.90 / peaks[active])
+        gains[active] = np.clip(desired, 0.5, max_gain)
+
+    # Smooth gain trajectory across neighboring frames (~0.75s window) to avoid pumping artifacts
+    k = min(5, n_frames)
+    if k >= 3:
+        kernel = np.ones(k, dtype=np.float32) / float(k)
+        gains = np.convolve(np.pad(gains, (k // 2, k // 2), mode="edge"), kernel, mode="valid")[:n_frames]
+
+    # Interpolate frame gains smoothly to per-sample envelope
+    centers = (np.arange(n_frames, dtype=np.float32) + 0.5) * win
+    sample_gains = np.interp(np.arange(n, dtype=np.float32), centers, gains).astype(np.float32)
+    out = np.tanh((f32 * sample_gains) * 1.05) / np.tanh(1.05)
+    return np.clip(out * 32767.0, -32768.0, 32767.0).astype(np.int16)
+
+
 def decode_media_to_pcm16(
     file_path: Path,
     cancel_event: threading.Event | None = None,
+    normalize_audio: bool = True,
 ) -> np.ndarray:
-    """Decode any audio/video file to 16 kHz mono int16 numpy array."""
+    """Decode any audio/video file to 16 kHz mono int16 numpy array (with optional dynamic normalization)."""
     if cancel_event is not None and cancel_event.is_set():
         raise FileTranslateCancelled("Đã hủy dịch file.")
 
@@ -169,34 +214,28 @@ def decode_media_to_pcm16(
     if p.suffix.lower() == ".wav":
         decoded = _decode_wav_numpy(p)
         if decoded is not None and len(decoded) > 0:
-            return decoded
+            return _dynamic_normalize_pcm16(decoded) if normalize_audio else decoded
 
     ffmpeg = _find_ffmpeg()
     if ffmpeg:
-        rc, stdout_bytes = _run_cancellable_proc(
-            [
-                ffmpeg,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(p),
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                str(SAMPLE_RATE),
-                "-f",
-                "s16le",
-                "pipe:1",
-            ],
-            capture_stdout=True,
-            timeout_s=300.0,
-            cancel_event=cancel_event,
-        )
-        if rc == 0 and stdout_bytes:
-            usable = (len(stdout_bytes) // 2) * 2
-            return np.frombuffer(stdout_bytes[:usable], dtype=np.int16).copy()
+        base_cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(p), "-vn"]
+        tail_cmd = ["-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "pipe:1"]
+        attempts: list[tuple[list[str], bool]] = []
+        if normalize_audio:
+            attempts.append((base_cmd + ["-af", "dynaudnorm=f=150:g=15:p=0.9:m=10"] + tail_cmd, False))
+        attempts.append((base_cmd + tail_cmd, normalize_audio))
+
+        for cmd, need_numpy_norm in attempts:
+            rc, stdout_bytes = _run_cancellable_proc(
+                cmd,
+                capture_stdout=True,
+                timeout_s=300.0,
+                cancel_event=cancel_event,
+            )
+            if rc == 0 and stdout_bytes:
+                usable = (len(stdout_bytes) // 2) * 2
+                arr = np.frombuffer(stdout_bytes[:usable], dtype=np.int16).copy()
+                return _dynamic_normalize_pcm16(arr) if need_numpy_norm else arr
 
     afconvert = shutil.which("afconvert")
     if afconvert:
@@ -212,13 +251,100 @@ def decode_media_to_pcm16(
             if rc == 0 and tmp_wav.exists():
                 decoded = _decode_wav_numpy(tmp_wav)
                 if decoded is not None and len(decoded) > 0:
-                    return decoded
+                    return _dynamic_normalize_pcm16(decoded) if normalize_audio else decoded
         finally:
             tmp_wav.unlink(missing_ok=True)
 
     raise RuntimeError(
         "Không thể giải mã định dạng file này. Hãy cài `ffmpeg` (hoặc tải lên file .WAV PCM)."
     )
+
+
+def segment_pcm_by_silero_vad(
+    pcm: np.ndarray,
+    vad_model_path: Path,
+    sample_rate: int = SAMPLE_RATE,
+    max_seg_s: float = 13.0,
+) -> list[tuple[float, float, np.ndarray]]:
+    """
+    Segment speech cleanly with Silero VAD v5 so SRT timestamps match real spoken turns
+    and silent/music sections are never sent to ASR (eliminates Whisper hallucinations).
+    """
+    if pcm is None or len(pcm) == 0 or not Path(vad_model_path).is_file():
+        return []
+    try:
+        import sherpa_onnx
+    except Exception:
+        return []
+
+    win = 512
+    silero = sherpa_onnx.SileroVadModelConfig(
+        model=str(vad_model_path),
+        threshold=0.40,
+        min_silence_duration=0.45,
+        min_speech_duration=0.22,
+        window_size=win,
+        max_speech_duration=max_seg_s,
+    )
+    cfg = sherpa_onnx.VadModelConfig(
+        silero_vad=silero,
+        sample_rate=sample_rate,
+        num_threads=1,
+        provider="cpu",
+        debug=False,
+    )
+    vad = sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=120.0)
+    f32 = pcm.astype(np.float32) / 32768.0
+    total_samples = len(f32)
+
+    raw_spans: list[tuple[int, int]] = []
+    pos = 0
+    while pos + win <= total_samples:
+        vad.accept_waveform(f32[pos : pos + win])
+        pos += win
+        while not vad.empty():
+            seg = vad.front
+            s_start = max(0, int(seg.start))
+            s_end = min(total_samples, s_start + len(seg.samples))
+            if s_end > s_start:
+                raw_spans.append((s_start, s_end))
+            vad.pop()
+
+    if pos < total_samples:
+        tail = np.zeros(win, dtype=np.float32)
+        tail[: total_samples - pos] = f32[pos:]
+        vad.accept_waveform(tail)
+    vad.flush()
+    while not vad.empty():
+        seg = vad.front
+        s_start = max(0, int(seg.start))
+        s_end = min(total_samples, s_start + len(seg.samples))
+        if s_end > s_start:
+            raw_spans.append((s_start, s_end))
+        vad.pop()
+
+    if not raw_spans:
+        return []
+
+    # Merge very short adjacent speech islands (gap <= 0.65s) up to max_seg_s for cleaner subtitles
+    merged: list[tuple[int, int]] = []
+    max_samples = int(max_seg_s * sample_rate)
+    max_gap = int(0.65 * sample_rate)
+    pad_samples = int(0.12 * sample_rate)
+    for s_start, s_end in raw_spans:
+        if merged and (s_start - merged[-1][1]) <= max_gap and (s_end - merged[-1][0]) <= max_samples:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], s_end))
+        else:
+            merged.append((s_start, s_end))
+
+    out: list[tuple[float, float, np.ndarray]] = []
+    for s_start, s_end in merged:
+        ps = max(0, s_start - pad_samples)
+        pe = min(total_samples, s_end + pad_samples)
+        chunk = pcm[ps:pe]
+        if len(chunk) >= int(0.22 * sample_rate):
+            out.append((s_start / sample_rate, s_end / sample_rate, chunk))
+    return out
 
 
 def segment_pcm_by_pauses(
@@ -230,16 +356,22 @@ def segment_pcm_by_pauses(
 ) -> list[tuple[float, float, np.ndarray]]:
     """
     Split long audio into natural speech chunks (3.5s–16s) at low-energy pauses so
-    ASR punctuation & SRT timestamps align cleanly with human phrasing.
+    ASR punctuation & SRT timestamps align cleanly with human phrasing, skipping dead silence.
     """
     total_samples = len(pcm)
     if total_samples == 0:
         return []
 
+    def _is_audible(seg: np.ndarray) -> bool:
+        if len(seg) == 0:
+            return False
+        s_f32 = seg.astype(np.float32) / 32768.0
+        return float(np.sqrt(np.mean(s_f32 * s_f32))) >= 0.0035
+
     win = int(sample_rate * 0.1)  # 100ms frames
     n_frames = total_samples // win
     if n_frames <= int(max_seg_s * 10):
-        return [(0.0, total_samples / sample_rate, pcm)]
+        return [(0.0, total_samples / sample_rate, pcm)] if _is_audible(pcm) else []
 
     f32 = pcm[: n_frames * win].reshape(n_frames, win).astype(np.float32) / 32768.0
     rms = np.sqrt(np.mean(f32 * f32, axis=1))
@@ -256,7 +388,9 @@ def segment_pcm_by_pauses(
         if rem <= max_f:
             s_idx = start_f * win
             e_idx = total_samples
-            segments.append((s_idx / sample_rate, e_idx / sample_rate, pcm[s_idx:e_idx]))
+            seg = pcm[s_idx:e_idx]
+            if _is_audible(seg):
+                segments.append((s_idx / sample_rate, e_idx / sample_rate, seg))
             break
 
         # Search for quiet pause between target_f and max_f (or earliest >= 300ms pause after min_f)
@@ -273,7 +407,9 @@ def segment_pcm_by_pauses(
 
         s_idx = start_f * win
         e_idx = split_f * win
-        segments.append((s_idx / sample_rate, e_idx / sample_rate, pcm[s_idx:e_idx]))
+        seg = pcm[s_idx:e_idx]
+        if _is_audible(seg):
+            segments.append((s_idx / sample_rate, e_idx / sample_rate, seg))
         start_f = split_f
 
     return segments
@@ -291,8 +427,10 @@ def translate_media_file(
     on_progress_event: Callable[[dict[str, Any]], None] | None = None,
     cancel_event: threading.Event | None = None,
     job_id: str = "",
+    asr_mode: str = "auto",
+    normalize_audio: bool = True,
 ) -> dict[str, Any]:
-    """Full offline/hybrid pipeline: Media -> PCM -> ASR -> Glossary -> MT -> .TXT & .SRT."""
+    """Full offline/hybrid pipeline: Media -> dynaudnorm PCM -> Silero VAD -> ASR -> Glossary -> MT -> .TXT & .SRT."""
     t0 = time.perf_counter()
 
     def _emit(
@@ -331,53 +469,80 @@ def translate_media_file(
                 }
             )
 
-    _emit("decoding", 3.0, "Đang giải mã âm thanh 16kHz...")
-    pcm = decode_media_to_pcm16(file_path, cancel_event=cancel_event)
+    _emit(
+        "decoding",
+        3.0,
+        "Đang giải mã & cân bằng âm lượng (dynaudnorm)..." if normalize_audio else "Đang giải mã âm thanh 16kHz...",
+    )
+    pcm = decode_media_to_pcm16(file_path, cancel_event=cancel_event, normalize_audio=normalize_audio)
     duration_s = round(len(pcm) / SAMPLE_RATE, 1)
     if duration_s < 0.3:
         raise RuntimeError("File âm thanh quá ngắn hoặc không có dữ liệu tiếng nói.")
     if cancel_event is not None and cancel_event.is_set():
         raise FileTranslateCancelled("Đã hủy dịch file.")
 
-    chunks = segment_pcm_by_pauses(pcm)
-    est_speed = 6.0 if mt_mode == "cloud-api" else 12.0
+    vad_used = False
+    chunks: list[tuple[float, float, np.ndarray]] = []
+    if runtime.model_manager.is_silero_vad_ready():
+        chunks = segment_pcm_by_silero_vad(pcm, runtime.model_manager.silero_vad_path)
+        if chunks:
+            vad_used = True
+    if not chunks:
+        chunks = segment_pcm_by_pauses(pcm)
+    if not chunks:
+        raise RuntimeError("Không phát hiện giọng nói rõ ràng trong file âm thanh.")
+
+    force_whisper = (asr_mode or "auto").strip().lower() == "whisper-turbo"
+    est_speed = 2.6 if force_whisper else (6.0 if mt_mode == "cloud-api" else 12.0)
     est_eta_s = max(1.0, round(duration_s / est_speed, 1))
+    seg_mode_label = "Silero VAD v5" if vad_used else "nhịp nghỉ"
     _emit(
         "loading_models",
         8.0,
-        f"Đã tách {len(chunks)} phân đoạn. Đang nạp mô hình AI...",
+        f"Đã tách {len(chunks)} câu nói ({seg_mode_label}). Đang nạp mô hình AI...",
         total_chunks=len(chunks),
         duration_s=duration_s,
         eta_s=est_eta_s,
         eta_estimated=True,
     )
 
-    use_vi_batch = source_lang == "vie_Latn"
+    use_vi_batch = (not force_whisper) and source_lang == "vie_Latn"
     refiner = runtime.ensure_pass2_refiner() if use_vi_batch else None
     zf_vi = (
         runtime.ensure_onnx_asr_loaded("zipformer-30m-streaming")
         if use_vi_batch and runtime.model_manager.is_zipformer_streaming_ready()
         else None
     )
-    en_moonshine = runtime.ensure_en_pass2_refiner() if source_lang == "eng_Latn" else None
+    en_moonshine = (
+        runtime.ensure_en_pass2_refiner()
+        if (not force_whisper) and source_lang == "eng_Latn"
+        else None
+    )
     zf_en = (
         runtime.ensure_onnx_asr_loaded("zipformer-en-20m")
-        if source_lang == "eng_Latn"
+        if (not force_whisper)
+        and source_lang == "eng_Latn"
         and en_moonshine is None
         and runtime.model_manager.is_zipformer_en_20m_ready()
         else None
     )
     whisper_asr = None
-    if not use_vi_batch and en_moonshine is None and zf_en is None:
+    if force_whisper or (not use_vi_batch and en_moonshine is None and zf_en is None):
         if runtime.model_manager.is_whisper_turbo_ready():
             whisper_asr = runtime.ensure_onnx_asr_loaded("whisper-turbo", lang_code=source_lang)
         else:
             raise RuntimeError(
-                "Để dịch file nói ngôn ngữ này offline (Thái, Lào, Nhật, Trung, Hàn...), "
-                "hãy mở 'Mô hình Offline' và tải 'Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)' (~540 MB)."
+                "Chưa tải 'Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)' (~540 MB). "
+                "Hãy mở mục 'Mô hình Offline' ở cột trái để tải 1 lần, hoặc chọn Engine 'Tự động'."
             )
     if cancel_event is not None and cancel_event.is_set():
         raise FileTranslateCancelled("Đã hủy dịch file.")
+
+    asr_used_label = (
+        "Whisper Large-v3-Turbo"
+        if whisper_asr is not None
+        else ("VietASR + Zipformer" if use_vi_batch else ("Moonshine-v2" if en_moonshine is not None else "Zipformer-EN"))
+    )
 
     protected_terms = runtime._get_glossary_hotwords()
     segments_out: list[dict[str, Any]] = []
@@ -388,7 +553,7 @@ def translate_media_file(
     _emit(
         "translating",
         12.0,
-        f"Đang nhận dạng & dịch đoạn 1/{len(chunks)}...",
+        f"Đang nhận dạng ({asr_used_label}) & dịch đoạn 1/{len(chunks)}...",
         current_chunk=0,
         total_chunks=len(chunks),
         processed_audio_s=0.0,
@@ -401,7 +566,9 @@ def translate_media_file(
         if cancel_event is not None and cancel_event.is_set():
             raise FileTranslateCancelled("Đã hủy dịch file.")
 
-        if use_vi_batch and refiner is not None:
+        if whisper_asr is not None:
+            text = whisper_asr.transcribe_pcm_isolated(seg_pcm, language=source_lang)
+        elif use_vi_batch and refiner is not None:
             p1_fallback = ""
             if zf_vi is not None and protected_terms:
                 p1_raw = zf_vi.transcribe_pcm_isolated(seg_pcm)
@@ -409,8 +576,6 @@ def translate_media_file(
             text, _ = refiner.refine(seg_pcm, p1_fallback, protected_terms=protected_terms)
         elif en_moonshine is not None:
             text, _ = en_moonshine.refine(seg_pcm, "")
-        elif whisper_asr is not None:
-            text = whisper_asr.transcribe_pcm_isolated(seg_pcm, language=source_lang)
         else:
             assert zf_en is not None
             text = zf_en.transcribe_pcm_isolated(seg_pcm)
@@ -464,7 +629,7 @@ def translate_media_file(
     _emit(
         "saving",
         98.5,
-        "Đang xuất file biên bản .TXT & .SRT song ngữ...",
+        "Đang xuất file biên bản .TXT & .SRT (song ngữ / đơn ngữ)...",
         current_chunk=len(chunks),
         total_chunks=len(chunks),
         processed_audio_s=duration_s,
@@ -473,14 +638,16 @@ def translate_media_file(
         speed_x=round(duration_s / max(time.perf_counter() - t_loop, 0.1), 1),
     )
 
-    # Build .TXT and .SRT
+    # Build .TXT and all 3 .SRT variants (bilingual, target-only, source-only)
     txt_lines = [
         f"=== PolyVoice Pro — Dịch File Offline: {orig_filename} ({duration_s}s) ===",
-        f"Hướng dịch: {source_lang} -> {target_lang} | Tổng: {len(segments_out)} đoạn",
+        f"Hướng dịch: {source_lang} -> {target_lang} | ASR: {asr_used_label} | Tổng: {len(segments_out)} đoạn",
         "=" * 64,
         "",
     ]
     srt_lines: list[str] = []
+    srt_target_lines: list[str] = []
+    srt_source_lines: list[str] = []
     for seg in segments_out:
         txt_lines.append(f"[{seg['start_srt']} --> {seg['end_srt']}]")
         txt_lines.append(f"Gốc : {seg['source_text']}")
@@ -491,9 +658,19 @@ def translate_media_file(
             f"{seg['index']}\n{seg['start_srt']} --> {seg['end_srt']}\n"
             f"{seg['translated_text']}\n{seg['source_text']}\n"
         )
+        srt_target_lines.append(
+            f"{seg['index']}\n{seg['start_srt']} --> {seg['end_srt']}\n"
+            f"{seg['translated_text']}\n"
+        )
+        srt_source_lines.append(
+            f"{seg['index']}\n{seg['start_srt']} --> {seg['end_srt']}\n"
+            f"{seg['source_text']}\n"
+        )
 
     txt_content = "\n".join(txt_lines)
     srt_content = "\n".join(srt_lines)
+    srt_target_content = "\n".join(srt_target_lines)
+    srt_source_content = "\n".join(srt_source_lines)
 
     # Auto-save to logs_dir
     safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(orig_filename).stem)[:48] or "audio"
@@ -525,10 +702,17 @@ def translate_media_file(
         "duration_s": duration_s,
         "elapsed_s": elapsed_s,
         "speed_x": speed_x,
+        "asr_used": asr_used_label,
+        "vad_used": vad_used,
+        "normalized": normalize_audio,
+        "source_lang": source_lang,
+        "target_lang": target_lang,
         "segment_count": len(segments_out),
         "segments": segments_out,
         "txt_file": str(txt_path),
         "srt_file": str(srt_path),
         "txt_content": txt_content,
         "srt_content": srt_content,
+        "srt_target_content": srt_target_content,
+        "srt_source_content": srt_source_content,
     }
