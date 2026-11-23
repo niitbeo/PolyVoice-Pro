@@ -76,6 +76,7 @@ export type AudioSourceId = "mic" | "system" | "dual" | "mix";
 export type InputChannelId = "mix" | "left" | "right";
 export type AsrEngineId =
   | "auto"
+  | "hybrid-en"
   | "moonshine-en"
   | "moonshine-ja"
   | "moonshine-ko"
@@ -432,7 +433,7 @@ const SHORT_LANG_LABELS: Record<string, string> = {
   lao_Laoo: "Lào",
   khm_Khmr: "Khmer",
   zho_Hans: "Trung",
-  zho_Hant: "Trung Phồn",
+  zho_Hant: "Đài Loan",
   jpn_Jpan: "Nhật",
   kor_Hang: "Hàn",
   fra_Latn: "Pháp",

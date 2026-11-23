@@ -581,7 +581,7 @@ def translate_media_file(
             text = parakeet_eu.transcribe_pcm_isolated(seg_pcm, language=source_lang)
         elif use_vi_batch and refiner is not None:
             p1_fallback = ""
-            if zf_vi is not None and protected_terms:
+            if zf_vi is not None:
                 p1_raw = zf_vi.transcribe_pcm_isolated(seg_pcm)
                 p1_fallback = runtime.glossary.apply_asr_fixes(p1_raw)
             text, _ = refiner.refine(seg_pcm, p1_fallback, protected_terms=protected_terms)

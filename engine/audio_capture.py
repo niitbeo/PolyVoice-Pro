@@ -951,9 +951,18 @@ class WindowsLoopbackStream:
                         # Default speaker disconnected / switched -> trigger reconnect
                         break
                     # WASAPI loopback emits zero callbacks when system audio is silent.
-                    # Feed silence chunks after 200ms idle so VAD/Zipformer endpoints finalize cleanly.
+                    # First flush any trailing <100ms speech samples trapped in `pcm_buf` (zero-padded),
+                    # then feed silence chunks after 200ms idle so VAD/Zipformer endpoints finalize cleanly.
                     if (time.monotonic() - state["last_pkt"]) >= 0.20:
-                        self._enqueue_pcm(silence_chunk)
+                        rem = state["pcm_buf"]
+                        if rem.size > 0:
+                            padded = np.zeros(BLOCK_SIZE, dtype=np.int16)
+                            n_copy = min(rem.size, BLOCK_SIZE)
+                            padded[:n_copy] = rem[:n_copy]
+                            self._enqueue_pcm(padded)
+                            state["pcm_buf"] = np.empty(0, dtype=np.int16)
+                        else:
+                            self._enqueue_pcm(silence_chunk)
                         self._emit_meter(0.0, False)
 
                 if self._stop_ev.is_set() or not self._running.is_set():

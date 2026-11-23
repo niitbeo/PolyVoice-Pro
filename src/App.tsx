@@ -182,10 +182,14 @@ const PINNED_CODES = [
   "eng_Latn",
   "tha_Thai",
   "lao_Laoo",
+  "khm_Khmr",
   "zho_Hans",
+  "zho_Hant",
   "jpn_Jpan",
   "kor_Hang",
-  "khm_Khmr",
+  "fra_Latn",
+  "deu_Latn",
+  "rus_Cyrl",
 ];
 
 export default function App() {
@@ -848,15 +852,49 @@ export default function App() {
     [hotUpdateConfig]
   );
 
+  const PARAKEET_EU_CODES = useMemo(
+    () =>
+      new Set([
+        "eng_Latn", "fra_Latn", "deu_Latn", "spa_Latn", "ita_Latn", "por_Latn",
+        "nld_Latn", "pol_Latn", "ukr_Cyrl", "ces_Latn", "swe_Latn", "fin_Latn",
+        "dan_Latn", "ell_Grek", "hun_Latn", "ron_Latn", "slk_Latn", "bul_Cyrl", "hrv_Latn",
+      ]),
+    []
+  );
+  const ZIPFORMER_MULTI_CODES = useMemo(
+    () =>
+      new Set([
+        "tha_Thai", "zho_Hans", "zho_Hant", "ind_Latn", "rus_Cyrl", "arb_Arab",
+        "vie_Latn", "eng_Latn", "jpn_Jpan",
+      ]),
+    []
+  );
+
+  const isAsrCompatibleWithLang = useCallback(
+    (engine: AsrEngineId, lang: string): boolean => {
+      if (engine === "auto" || engine === "whisper-turbo" || engine === "apple-native") return true;
+      if (engine === "zipformer-30m-streaming" || engine === "viet-asr") return lang === "vie_Latn";
+      if (engine === "hybrid-en" || engine === "moonshine-en") return lang === "eng_Latn";
+      if (engine === "moonshine-ja") return lang === "jpn_Jpan";
+      if (engine === "moonshine-ko") return lang === "kor_Hang";
+      if (engine === "zipformer-multi") return ZIPFORMER_MULTI_CODES.has(lang);
+      if (engine === "parakeet-eu") return PARAKEET_EU_CODES.has(lang);
+      return false;
+    },
+    [PARAKEET_EU_CODES, ZIPFORMER_MULTI_CODES]
+  );
+
   const handleSelectSourceLang = (code: string) => {
     setSourceLang(code);
+    const resetAsr = asrEngine !== "auto" && !isAsrCompatibleWithLang(asrEngine, code);
+    if (resetAsr) setAsrEngine("auto");
     // Auto-flip target to Vietnamese if user switches source away from Vietnamese and target was identical
     if (code === targetLang) {
       const nextTgt = code === "vie_Latn" ? "eng_Latn" : "vie_Latn";
       setTargetLang(nextTgt);
-      hotUpdateConfig({ source_lang: code, target_lang: nextTgt });
+      hotUpdateConfig({ source_lang: code, target_lang: nextTgt, ...(resetAsr ? { asr_engine: "auto" } : {}) });
     } else {
-      hotUpdateConfig({ source_lang: code });
+      hotUpdateConfig({ source_lang: code, ...(resetAsr ? { asr_engine: "auto" } : {}) });
     }
   };
 
@@ -864,9 +902,11 @@ export default function App() {
     if (code === sourceLang) {
       const canSwap = sourceLanguages.some((s) => s.code === targetLang && s.code !== code);
       const nextSrc = canSwap ? targetLang : code === "vie_Latn" ? "eng_Latn" : "vie_Latn";
+      const resetAsr = asrEngine !== "auto" && !isAsrCompatibleWithLang(asrEngine, nextSrc);
+      if (resetAsr) setAsrEngine("auto");
       setSourceLang(nextSrc);
       setTargetLang(code);
-      hotUpdateConfig({ source_lang: nextSrc, target_lang: code });
+      hotUpdateConfig({ source_lang: nextSrc, target_lang: code, ...(resetAsr ? { asr_engine: "auto" } : {}) });
       return;
     }
     setTargetLang(code);
@@ -881,9 +921,11 @@ export default function App() {
     }
     const nextSrc = targetLang;
     const nextTgt = sourceLang;
+    const resetAsr = asrEngine !== "auto" && !isAsrCompatibleWithLang(asrEngine, nextSrc);
+    if (resetAsr) setAsrEngine("auto");
     setSourceLang(nextSrc);
     setTargetLang(nextTgt);
-    hotUpdateConfig({ source_lang: nextSrc, target_lang: nextTgt });
+    hotUpdateConfig({ source_lang: nextSrc, target_lang: nextTgt, ...(resetAsr ? { asr_engine: "auto" } : {}) });
   };
 
   const handleAudioSourceChange = (src: AudioSourceId) => {
@@ -2053,17 +2095,36 @@ export default function App() {
         )
         .join("\n");
     } else {
-      // .SRT keeps crisp YouTube-style sentence-by-sentence cues
+      // .SRT uses real elapsed timestamps from `h.timestamp` (HH:MM:SS) relative to first cue
+      const parseHms = (ts: string | undefined): number | null => {
+        if (!ts) return null;
+        const m = ts.trim().match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
+        if (!m) return null;
+        return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+      };
+      const firstAbs = parseHms(chronological[0]?.timestamp);
+      const relStarts: number[] = [];
+      let prevStart = -1;
+      for (let i = 0; i < chronological.length; i++) {
+        const curAbs = parseHms(chronological[i]?.timestamp);
+        let rel = firstAbs !== null && curAbs !== null ? curAbs - firstAbs : i * 4;
+        if (rel < 0) rel += 86400; // midnight rollover
+        if (prevStart >= 0 && rel <= prevStart) rel = prevStart + 2;
+        relStarts.push(rel);
+        prevStart = rel;
+      }
+      const fmt = (s: number) => {
+        const clamped = Math.max(0, Math.floor(s));
+        const hh = String(Math.floor(clamped / 3600)).padStart(2, "0");
+        const mm = String(Math.floor((clamped % 3600) / 60)).padStart(2, "0");
+        const ss = String(clamped % 60).padStart(2, "0");
+        return `${hh}:${mm}:${ss},000`;
+      };
       content = chronological
         .map((h, idx) => {
-          const startSec = idx * 4;
-          const endSec = startSec + 3;
-          const fmt = (s: number) => {
-            const hh = String(Math.floor(s / 3600)).padStart(2, "0");
-            const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
-            const ss = String(s % 60).padStart(2, "0");
-            return `${hh}:${mm}:${ss},000`;
-          };
+          const startSec = relStarts[idx];
+          const nextSec = idx + 1 < relStarts.length ? relStarts[idx + 1] : startSec + 4;
+          const endSec = Math.max(startSec + 1, Math.min(startSec + 6, nextSec));
           return `${idx + 1}\n${fmt(startSec)} --> ${fmt(endSec)}\n${h.translated_text}\n${h.source_text}\n`;
         })
         .join("\n");
@@ -2372,11 +2433,17 @@ export default function App() {
             className={`btn ${glossaryOpen ? "active" : ""}`}
             onClick={handleOpenGlossary}
             disabled={!connected}
-            title="Khóa tên riêng, thuật ngữ chuyên ngành và tự đồng bộ Hotwords vào ASR"
+            title={
+              status?.glossary_enabled === false
+                ? "Từ điển đang TẮT — bấm để mở và bật khóa thuật ngữ / tên riêng"
+                : "Khóa tên riêng, thuật ngữ chuyên ngành và tự đồng bộ Hotwords vào ASR"
+            }
           >
             <BookOpen size={13.5} /> Từ điển
             {typeof status?.glossary_count === "number" && (
-              <span className="btn-badge">{status.glossary_count}</span>
+              <span className={`btn-badge ${status?.glossary_enabled === false ? "muted" : ""}`}>
+                {status?.glossary_enabled === false ? "Tắt" : status.glossary_count}
+              </span>
             )}
           </button>
 
@@ -3136,33 +3203,61 @@ export default function App() {
                 }}
               >
                 <option value="auto">Tự động tối ưu theo ngôn ngữ (Khuyên dùng)</option>
-                <option value="moonshine-en" disabled={!status?.moonshine_en_ready}>
-                  Moonshine-v2 Tiếng Anh (Streaming dấu câu chuẩn YouTube)
-                </option>
-                <option value="moonshine-ja" disabled={!status?.moonshine_ja_ready}>
-                  Moonshine-v2 Tiếng Nhật (Streaming siêu mượt ~120ms • 0% GPU)
-                </option>
-                <option value="moonshine-ko" disabled={!status?.moonshine_ko_ready}>
-                  Moonshine-v2 Tiếng Hàn (Streaming siêu mượt ~150ms • 0% GPU)
-                </option>
-                <option value="zipformer-multi" disabled={!status?.zipformer_multi_ready}>
-                  Zipformer Đa ngôn ngữ (Thái, Trung, Indo • ~15ms • 0% GPU)
-                </option>
-                <option value="parakeet-eu" disabled={!status?.parakeet_eu_ready}>
-                  Parakeet-Ultra 25 NN Châu Âu (Pháp, Đức, TBN, Ý... • ~0.3s • 0% GPU)
-                </option>
-                <option value="whisper-turbo" disabled={!status?.whisper_turbo_ready}>
-                  Whisper-Turbo 99 NN (Thái, Nhật, Trung, Hàn, Pháp, Đức • Offline)
-                </option>
-                {status?.mac_helper_ready && (
-                  <option value="apple-native">
-                    Apple Neural Engine (macOS Native • ~1% CPU • 60 NN)
+                {sourceLang === "vie_Latn" && (
+                  <>
+                    <option value="zipformer-30m-streaming" disabled={!status?.zipformer_ready}>
+                      Zipformer-30M Tiếng Việt (49MB • ~30ms)
+                    </option>
+                    <option value="viet-asr">VietASR Tiếng Việt (78MB • Dấu câu/ITN)</option>
+                  </>
+                )}
+                {sourceLang === "eng_Latn" && (
+                  <>
+                    <option value="hybrid-en" disabled={!status?.moonshine_en_ready}>
+                      Hybrid-EN (Moonshine-v2 + Silero VAD • Siêu nhẹ 1.8% WER)
+                    </option>
+                    <option value="moonshine-en" disabled={!status?.moonshine_en_ready}>
+                      Moonshine-v2 Tiếng Anh (Cửa sổ trượt liên tục)
+                    </option>
+                  </>
+                )}
+                {sourceLang === "jpn_Jpan" && (
+                  <option value="moonshine-ja" disabled={!status?.moonshine_ja_ready}>
+                    Moonshine-v2 Tiếng Nhật (Streaming siêu mượt ~120ms • 0% GPU)
                   </option>
                 )}
-                <option value="zipformer-30m-streaming" disabled={!status?.zipformer_ready}>
-                  Zipformer-30M Tiếng Việt (49MB • ~30ms)
+                {sourceLang === "kor_Hang" && (
+                  <option value="moonshine-ko" disabled={!status?.moonshine_ko_ready}>
+                    Moonshine-v2 Tiếng Hàn (Streaming siêu mượt ~150ms • 0% GPU)
+                  </option>
+                )}
+                {ZIPFORMER_MULTI_CODES.has(sourceLang) && (
+                  <option value="zipformer-multi" disabled={!status?.zipformer_multi_ready}>
+                    Zipformer Đa ngôn ngữ (Thái, Trung, Indo, Nga, Ả Rập • ~15ms • 0% GPU)
+                  </option>
+                )}
+                {PARAKEET_EU_CODES.has(sourceLang) && (
+                  <option value="parakeet-eu" disabled={!status?.parakeet_eu_ready}>
+                    Parakeet-Ultra 25 NN Châu Âu (Pháp, Đức, TBN, Ý... • ~0.3s • 0% GPU)
+                  </option>
+                )}
+                <option value="whisper-turbo" disabled={!status?.whisper_turbo_ready}>
+                  Whisper-Turbo 99 NN (Mở rộng đa ngôn ngữ • Offline)
                 </option>
-                <option value="viet-asr">VietASR Tiếng Việt (78MB • Dấu câu/ITN)</option>
+                {status?.mac_helper_ready &&
+                  (() => {
+                    const loc = (currentSrcObj?.locale || "").toLowerCase().replace("_", "-");
+                    const pref = loc.split("-")[0] + "-";
+                    const onDev = (status?.apple_caps?.on_device_locales || []).map((x) =>
+                      x.toLowerCase().replace("_", "-")
+                    );
+                    const hasOnDev = Boolean(loc) && onDev.some((x) => x === loc || x.startsWith(pref));
+                    return hasOnDev ? (
+                      <option value="apple-native">
+                        Apple Neural Engine (macOS On-Device • ~1% CPU • 100% Offline)
+                      </option>
+                    ) : null;
+                  })()}
               </select>
             </label>
 

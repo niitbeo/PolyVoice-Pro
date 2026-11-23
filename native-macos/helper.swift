@@ -201,6 +201,12 @@ final class AppleSpeechRunner {
     }
 
     func run() async {
+        // Strict 100% Offline guarantee: check on-device support BEFORE touching TCC or network!
+        guard recognizer.supportsOnDeviceRecognition else {
+            emitError("Ngôn ngữ \(localeId) chưa tải gói nhận dạng Offline (On-Device) trên macOS — từ chối gửi âm thanh lên máy chủ Apple để bảo đảm 100% Offline.")
+            exit(1)
+        }
+
         let auth = await requestAuth()
         guard auth == .authorized else {
             emitError("Chưa có quyền Nhận dạng giọng nói macOS (Cài đặt → Quyền riêng tư & Bảo mật → Nhận dạng giọng nói). Status=\(auth.rawValue)")
@@ -284,9 +290,7 @@ final class AppleSpeechRunner {
         if #available(macOS 13.0, *) {
             req.addsPunctuation = true
         }
-        if recognizer.supportsOnDeviceRecognition {
-            req.requiresOnDeviceRecognition = true
-        }
+        req.requiresOnDeviceRecognition = true
         currentRequest = req
         taskStartTime = Date()
         lastText = ""

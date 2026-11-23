@@ -529,8 +529,27 @@ _VI_PROPER_PHRASES: list[tuple[str, str]] = [
     ("google", "Google"),
     ("microsoft", "Microsoft"),
     ("amazon", "Amazon"),
+    ("apple", "Apple"),
+    ("nvidia", "NVIDIA"),
+    ("intel", "Intel"),
+    ("tsmc", "TSMC"),
+    ("samsung", "Samsung"),
+    ("hyundai", "Hyundai"),
+    ("toshiba", "Toshiba"),
+    ("hitachi", "Hitachi"),
+    ("fujitsu", "Fujitsu"),
+    ("sony", "Sony"),
+    ("panasonic", "Panasonic"),
+    ("toyota", "Toyota"),
+    ("honda", "Honda"),
+    ("canon", "Canon"),
+    ("mitsubishi", "Mitsubishi"),
+    ("dram", "DRAM"),
     ("openai", "OpenAI"),
+    ("open ai", "OpenAI"),
     ("chatgpt", "ChatGPT"),
+    ("chat gpt", "ChatGPT"),
+    ("gpt", "GPT"),
     ("youtube", "YouTube"),
     ("facebook", "Facebook"),
     ("tiktok", "TikTok"),
@@ -604,6 +623,82 @@ _RE_VI_GIO_TAY = re.compile(
     re.IGNORECASE | re.UNICODE,
 )
 
+# Contextual Vietnamese "ai" -> "AI" (Artificial Intelligence) casing rules.
+# Preserves interrogative/pronoun "ai" ("who" in "ai là", "có ai không", "của ai", "ai đó", "ai cũng").
+_RE_VI_AI_PHRASES = re.compile(
+    r"(?<!\w)("
+    r"(?:công nghệ|ứng dụng|mô hình|công cụ|hệ thống|nền tảng|dữ liệu|trợ lý|tác tử|giải pháp|"
+    r"kỷ nguyên|thời đại|làn sóng|xu hướng|chuyển đổi|tích hợp|phát triển|đào tạo|"
+    r"dùng|sử dụng|chạy|học về|học|làm về|làm chủ|phụ thuộc vào|thay thế bởi)\s+ai"
+    r"|ai\s+(?:tạo sinh|agent|agents|assistant|model|models|tool|tools|coding|native|"
+    r"nó|thay thế|tự động|phân tích|xử lý|trở nên phổ biến|phát triển|hỗ trợ|viết code|lập trình|sinh ảnh|tạo ảnh|tạo video|đang bùng nổ)"
+    r"|(?:chat với|hỏi|nhờ|cho)\s+con\s+ai"
+    r")(?!\w)",
+    re.IGNORECASE | re.UNICODE,
+)
+_RE_VI_AI_TECH_SENT_HINT = re.compile(
+    r"(?<!\w)(?:chatgpt|openai|claude|gemini|llm|mcp|api|cli|token|prompt|gpu|"
+    r"machine learning|trí tuệ nhân tạo|tự động hóa|dữ liệu lớn|big data|"
+    r"phần mềm|lập trình|công nghệ|thuật toán|chip|bán dẫn|cloud|startup)(?!\w)",
+    re.IGNORECASE | re.UNICODE,
+)
+_VI_AI_HUMAN_PREV = frozenset({
+    "có", "không", "chẳng", "chưa", "bất", "kỳ", "cứ", "người", "của", "cho", "với",
+    "gặp", "hỏi", "biết", "thấy", "nhờ", "bảo", "nhìn", "tìm", "là", "được", "bị", "về",
+    "mời", "gọi", "chọn", "còn", "từng", "mỗi", "hơn", "bằng", "như", "từ", "đến",
+})
+_VI_AI_HUMAN_NEXT = frozenset({
+    "đó", "đấy", "vậy", "thế", "nhỉ", "cũng", "mà", "nào", "hết", "cả", "ơi", "nói",
+    "biết", "hỏi", "muốn", "thích", "hiểu", "nghĩ", "nhớ", "tin", "cần", "đi", "đến",
+    "về", "ở", "ngồi", "đứng", "là", "có", "không", "đã", "sẽ", "đang", "còn", "lại",
+})
+_RE_VI_AI_WORD = re.compile(r"(?<!\w)ai(?!\w)", re.IGNORECASE | re.UNICODE)
+
+
+_VI_SINGLE_DIGIT_MAP: dict[str, str] = {
+    "không": "0", "một": "1", "hai": "2", "ba": "3", "bốn": "4",
+    "tư": "4", "năm": "5", "sáu": "6", "bảy": "7", "bẩy": "7", "tám": "8", "chín": "9",
+}
+_RE_VI_SPOKEN_VERSION = re.compile(
+    r"(?<!\w)(ChatGPT|GPT|Gemini|Claude|Qwen|Llama|Windows|iOS|macOS|Android|Python|phiên bản|bản)\s+"
+    r"(không|một|hai|ba|bốn|tư|năm|sáu|bảy|bẩy|tám|chín)\s+chấm\s+"
+    r"(không|một|hai|ba|bốn|tư|năm|sáu|bảy|bẩy|tám|chín)(?!\w)",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _restore_vi_ai_acronym(text: str) -> str:
+    """Capitalize Vietnamese tech 'ai' -> 'AI' only in unambiguous AI contexts (zero false positives on 'who')."""
+    s = _RE_VI_SPOKEN_VERSION.sub(
+        lambda m: f"{m.group(1)} {_VI_SINGLE_DIGIT_MAP[m.group(2).lower()]}.{_VI_SINGLE_DIGIT_MAP[m.group(3).lower()]}",
+        text,
+    )
+    if "ai" not in s.lower():
+        return s
+
+    def _upper_ai_in_match(m: re.Match[str]) -> str:
+        return _RE_VI_AI_WORD.sub("AI", m.group(0))
+
+    s = _RE_VI_AI_PHRASES.sub(_upper_ai_in_match, s)
+
+    # Secondary pass: if the utterance already contains explicit AI/tech terminology,
+    # promote remaining standalone "ai" tokens that are NOT framed as human interrogatives ("who").
+    if _RE_VI_AI_TECH_SENT_HINT.search(s):
+        toks = s.split()
+        for idx, tok in enumerate(toks):
+            l, core, r = _strip_edge_punct(tok)
+            if core.lower() != "ai" or core == "AI":
+                continue
+            prev_core = _strip_edge_punct(toks[idx - 1])[1].lower() if idx > 0 else ""
+            next_core = _strip_edge_punct(toks[idx + 1])[1].lower() if idx + 1 < len(toks) else ""
+            if prev_core in _VI_AI_HUMAN_PREV or next_core in _VI_AI_HUMAN_NEXT:
+                continue
+            if idx == 0 and next_core in ("là", "đã", "sẽ", "có", "biết", "muốn"):
+                continue
+            toks[idx] = f"{l}AI{r}"
+        s = " ".join(toks)
+    return s
+
 _VI_NUM_WORDS = frozenset({
     "không", "một", "mốt", "hai", "ba", "bốn", "tư", "năm", "lăm", "nhăm",
     "sáu", "bảy", "bẩy", "tám", "chín", "mười", "mươi", "trăm", "nghìn", "ngàn",
@@ -621,6 +716,7 @@ def restore_vietnamese_casing(text: str) -> str:
     for pat, repl in _VI_PROPER_PATTERNS:
         s = pat.sub(repl, s)
     s = _RE_VI_BUDDHA_WORD.sub("Phật", s)
+    s = _restore_vi_ai_acronym(s)
     if s and s[0].islower():
         s = s[0].upper() + s[1:]
     return s
@@ -784,9 +880,10 @@ def _transfer_punct_and_caps(pass1_text: str, pass2_text: str) -> str:
                 if len(c1) >= 2 and c1.isupper() and c1.isascii():
                     core = c1
                 elif not after_sentence_end and c2 and c2[0].isupper() and c1 and c1[0].islower() and (
-                    p2_had_sent_end or c2.lower() in _VI_MID_NO_CAP
+                    p2_had_sent_end or (j1 + k) == 0 or c2.lower() in _VI_MID_NO_CAP
                 ):
                     # Do not leak spurious mid-clause capitalization when Pass-2 inserted a period we stripped,
+                    # when Pass-2 dropped leading words so j=0 was sentence-initial only in Pass-2,
                     # or onto common function/pronoun words (still preserves real proper nouns like Việt Nam, Tiến!)
                     core = c1
                 else:
@@ -851,7 +948,9 @@ def _transfer_punct_and_caps(pass1_text: str, pass2_text: str) -> str:
                     after_sentence_end = any(ch in ".?!" for ch in right_p)
                     p2_had_sent_end = any(ch in ".?!" for ch in p2_end_p) if idx_s == len(eff_span) - 1 else False
         elif tag == "delete":
-            # Pass-2 dropped words that Pass-1 heard -> keep Pass-1 words cleanly
+            # Pass-2 dropped words that Pass-1 heard -> keep Pass-1 words cleanly.
+            # Preserve `p2_had_sent_end` (Pass-2 did NOT advance) so a sentence-initial capital
+            # on Pass-2's next token (`j1 == 0` or right after a Pass-2 period) won't leak mid-sentence!
             for idx_d, t1 in enumerate(p1_toks[i1:i2]):
                 l1, c1, r1 = _strip_edge_punct(t1)
                 is_last = (i1 + idx_d) == len(p1_toks) - 1
@@ -860,7 +959,6 @@ def _transfer_punct_and_caps(pass1_text: str, pass2_text: str) -> str:
                 right_p = _safe_right_punct(c1, r1, is_last)
                 out.append(f"{l1}{c1}{right_p}")
                 after_sentence_end = any(ch in ".?!" for ch in right_p)
-                p2_had_sent_end = False
         elif tag == "insert":
             # Restore a single missing 2nd syllable of a Vietnamese 2-word discourse connector
             # (e.g. Pass-1 "Thành" + Pass-2 "Thành ra," -> prevents EnViT5 hallucinating "DRAGON,"!).
@@ -935,7 +1033,7 @@ class VietASRBatchRefiner:
         protected_terms: list[str] | None = None,
     ) -> tuple[str, float]:
         base_formatted = restore_vietnamese_casing(fallback_text)
-        if pcm_s16 is None or len(pcm_s16) < int(self.sample_rate * 0.4):
+        if pcm_s16 is None or len(pcm_s16) < int(self.sample_rate * 0.4) or len(base_formatted.split()) <= 2:
             return base_formatted, 0.0
         t0 = time.perf_counter()
         try:
@@ -977,15 +1075,16 @@ class MoonshineV2EnRefiner:
     - Built-in punctuation, capitalization, and proper handling of AI/tech terms (AI, AGI, Sora, MCP).
     """
 
-    def __init__(self, model_dir: Path, sample_rate: int = 16000, num_threads: int = 4) -> None:
+    def __init__(self, model_dir: Path, sample_rate: int = 16000, num_threads: int = 0) -> None:
         d = Path(model_dir)
         self.sample_rate = sample_rate
         self._lock = threading.Lock()
+        eff_threads = num_threads if num_threads > 0 else max(2, min(4, (os.cpu_count() or 4) // 2))
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_moonshine_v2(
             encoder=str(d / "encoder_model.ort"),
             decoder=str(d / "decoder_model_merged.ort"),
             tokens=str(d / "tokens.txt"),
-            num_threads=num_threads,
+            num_threads=eff_threads,
             provider="cpu",
         )
 
@@ -994,12 +1093,14 @@ class MoonshineV2EnRefiner:
             return fallback_text, 0.0
         t0 = time.perf_counter()
         try:
+            dur_s = len(pcm_s16) / float(self.sample_rate)
             audio_f32 = pcm_s16.astype(np.float32) / 32768.0
             with self._lock:
                 stream = self._recognizer.create_stream()
                 stream.accept_waveform(self.sample_rate, audio_f32)
                 self._recognizer.decode_stream(stream)
                 refined = (stream.result.text or "").strip()
+            refined = _clean_moonshine_loops(refined, dur_s=dur_s)
             ms = round((time.perf_counter() - t0) * 1000.0, 1)
             fb_words = len(fallback_text.split())
             rf_words = len(refined.split())
@@ -1156,11 +1257,17 @@ _MOONSHINE_NOISE_HALLUCINATIONS = (
 )
 
 
+_RE_MOONSHINE_HYPHEN_LOOP = re.compile(
+    r"([A-Za-zÀ-ỹ]{2,})(?:-\1){2,}",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
 def _clean_moonshine_loops(text: str, dur_s: float = 10.0) -> str:
     """
-    Strip Transformer greedy-decoder phrase/sentence repetition loops and music/noise
+    Strip Transformer greedy-decoder phrase/sentence/hyphenated repetition loops and music/noise
     boilerplate hallucinations that Moonshine-v2 can emit on silence, background music,
-    or very short (<1.8s) audio prefixes.
+    or very short (<1.8s) audio prefixes — while preserving valid leading sentence prefixes.
     """
     raw = " ".join((text or "").strip().split())
     if not raw:
@@ -1169,27 +1276,65 @@ def _clean_moonshine_loops(text: str, dur_s: float = 10.0) -> str:
     if any(pat in low_full for pat in _MOONSHINE_NOISE_HALLUCINATIONS):
         return ""
 
+    # 1) Strip single-token hyphenated decoder loops (e.g. "Trans-Sifthian-Sifthian-Sifthian...")
+    raw = _RE_MOONSHINE_HYPHEN_LOOP.sub(r"\1", raw)
+
     toks = raw.split()
-    if len(toks) < 4:
+    if len(toks) < 3:
         return raw
+
+    # 2) Collapse >=3 consecutive identical single tokens ("the the the the" -> keep prefix before loop)
+    i_tok = 0
+    while i_tok + 2 < len(toks):
+        w0 = _en_norm_word(toks[i_tok])
+        if w0 and w0 == _en_norm_word(toks[i_tok + 1]) == _en_norm_word(toks[i_tok + 2]):
+            if i_tok == 0:
+                return ""
+            toks = toks[: i_tok + 1]
+            break
+        i_tok += 1
+
+    # 3) Iteratively detect ANY 2..(N/2)-word phrase repeated back-to-back (longest span first so
+    #    longer phrase loops are cleaned cleanly before shorter tail echoes).
+    #    - 3x+ loop starting at i==0: pure noise/music loop -> return "".
+    #    - 3x+ loop starting at i>0: preserve the valid leading prefix toks[:i] instead of wiping everything!
+    #    - 2x loop: keep first copy and drop the duplicate copy cleanly.
+    for _ in range(4):
+        if len(toks) < 4:
+            break
+        norms = [_en_norm_word(t) for t in toks]
+        max_span = len(toks) // 2
+        found = False
+        for span in range(max_span, 1, -1):
+            for i in range(0, len(toks) - 2 * span + 1):
+                a = norms[i : i + span]
+                if not any(a):
+                    continue
+                b = norms[i + span : i + 2 * span]
+                if a == b:
+                    if i + 3 * span <= len(toks) and norms[i + 2 * span : i + 3 * span] == a:
+                        if i == 0:
+                            return ""
+                        # Valid sentence prefix exists before the 3x tail loop -> preserve prefix!
+                        toks = toks[:i]
+                        if toks:
+                            toks[-1] = toks[-1].rstrip(",;:")
+                        found = True
+                        break
+                    # 2x back-to-back repeat -> drop the repeated copy (and if trailing echo at end, trim cleanly)
+                    toks = toks[: i + span] + toks[i + 2 * span :]
+                    found = True
+                    break
+            if found:
+                break
+        if not found:
+            break
+
+    if not toks:
+        return ""
     norms = [_en_norm_word(t) for t in toks]
 
-    # Detect ANY 2..(N/2)-word phrase or full sentence repeated immediately back-to-back!
-    # If repeated >= 3x consecutively (classic noise/music decoder loop), discard completely.
-    max_span = len(toks) // 2
-    for span in range(2, max_span + 1):
-        for i in range(0, len(toks) - 2 * span + 1):
-            a = norms[i : i + span]
-            if not any(a):
-                continue
-            b = norms[i + span : i + 2 * span]
-            if a == b:
-                # Check if it repeats a 3rd time consecutively -> pure noise loop hallucination
-                if i + 3 * span <= len(toks) and norms[i + 2 * span : i + 3 * span] == a:
-                    return ""
-                return " ".join(toks[: i + span]).strip()
-
-    # Also catch 2-word alternating echoes on short clips (e.g. "Welcome you welcome me welcome you")
+    # 4) Catch 2-word alternating echoes on short clips (e.g. "Welcome you welcome me welcome you")
     if dur_s < 2.2 and len(toks) >= 5 and norms[0] and norms[0] == norms[2] and norms[0] == norms[4]:
         return " ".join(toks[:2]).strip()
     # Physical speaking-rate guard on very short clips (<2.0s): >5.5 words/sec is a decoder loop
@@ -1197,7 +1342,7 @@ def _clean_moonshine_loops(text: str, dur_s: float = 10.0) -> str:
         max_w = max(5, int(dur_s * 5.5) + 2)
         if len(toks) > max_w:
             return " ".join(toks[:max_w]).strip()
-    return raw
+    return " ".join(toks).strip()
 
 
 class MoonshineEnStreamingEngine:
@@ -1489,7 +1634,7 @@ class HybridEnStreamingEngine:
             min_silence_duration=0.40,
             min_speech_duration=0.35,
             window_size=self._vad_window,
-            max_speech_duration=6.5,
+            max_speech_duration=8.5,
         )
         cfg = sherpa_onnx.VadModelConfig(
             silero_vad=silero,
@@ -1895,10 +2040,12 @@ class WhisperTurboStreamingEngine:
         if rms < 0.006:
             return ""
         stream = self._recognizer.create_stream()
-        # Non-Latin scripts (Japanese, Chinese, Thai, Khmer, Hindi, Arabic) expand to 2-3 BPE byte
-        # tokens per char; raise sherpa-onnx's default 6 tokens/sec limit so fast speech is never truncated!
+        # Non-Latin scripts (Japanese, Chinese, Thai, Hindi, Arabic) expand to 2-3 BPE byte tokens
+        # per char; keep 30 tok/s for high-accuracy scripts, but cap low-resource scripts (lo/km/my)
+        # at 18 tok/s so greedy repetition loops never burn 10-20s on CPU.
         if hasattr(stream, "set_option"):
-            stream.set_option("max_tokens_per_second", "36")
+            tps = "18" if self._language in ("lo", "km", "my") else "30"
+            stream.set_option("max_tokens_per_second", tps)
         stream.accept_waveform(self.sample_rate, samples_f32)
         self._recognizer.decode_stream(stream)
         return _clean_whisper_text(stream.result.text or "", rms=rms)
@@ -1936,6 +2083,12 @@ class WhisperTurboStreamingEngine:
                 txt = self._decode_f32_locked(seg_samples)
                 if txt:
                     finals.append(txt)
+                # Guard against CPU backlog hangs on slow/low-resource decodes: if one segment already
+                # took >=2.5s, drain stale queued VAD segments instead of freezing stop/switch for 20s!
+                if (time.perf_counter() - t0) >= 2.5:
+                    while not self._vad.empty():
+                        self._vad.pop()
+                    break
 
             if finals:
                 self._active_chunks.clear()
@@ -1957,15 +2110,20 @@ class WhisperTurboStreamingEngine:
         with self._lock:
             self._vad.flush()
             finals: list[str] = []
-            while not self._vad.empty():
-                seg = self._vad.front
-                seg_samples = np.array(seg.samples, dtype=np.float32, copy=True)
-                self._vad.pop()
-                txt = self._decode_f32_locked(seg_samples)
-                if txt:
-                    finals.append(txt)
-            if not finals and self._active_chunks:
-                txt = self._decode_f32_locked(np.concatenate(self._active_chunks))
+            if not self._vad.empty():
+                # Decode at most the latest buffered VAD segment on stop/switch so teardown stays snappy
+                seg_samples = None
+                while not self._vad.empty():
+                    seg = self._vad.front
+                    seg_samples = np.array(seg.samples, dtype=np.float32, copy=True)
+                    self._vad.pop()
+                if seg_samples is not None and self._language not in ("lo", "km", "my"):
+                    txt = self._decode_f32_locked(seg_samples)
+                    if txt:
+                        finals.append(txt)
+            elif self._active_chunks and self._language not in ("lo", "km", "my"):
+                tail_pcm = np.concatenate(self._active_chunks)[-(self.sample_rate * 4) :]
+                txt = self._decode_f32_locked(tail_pcm)
                 if txt:
                     finals.append(txt)
             self._vad.reset()

@@ -84,6 +84,23 @@ _ABBREV_SET = {
 }
 
 
+def _windows_short_path_file(path: Path) -> str:
+    """Return Windows 8.3 ASCII short path for an existing file (prevents C++ argv/fopen failures on Vietnamese usernames)."""
+    raw = str(path)
+    if os.name != "nt":
+        return raw
+    try:
+        import ctypes
+
+        buf = ctypes.create_unicode_buffer(1024)
+        n = ctypes.windll.kernel32.GetShortPathNameW(raw, buf, len(buf))  # type: ignore[attr-defined]
+        if 0 < n < len(buf) and buf.value.isascii():
+            return buf.value
+    except Exception:
+        pass
+    return raw
+
+
 def _adaptive_mt_threads(requested: int = 0) -> int:
     """Choose optimal CTranslate2/llama CPU thread budget without oversubscribing low-core CPUs."""
     cpu_count = os.cpu_count() or 4
@@ -874,15 +891,17 @@ class HyMT2Translator:
             attempts.append(("cpu", ["-ngl", "0"]))
 
             last_err = ""
+            gguf_arg = _windows_short_path_file(self.gguf_path)
             for backend_label, extra_flags in attempts:
                 cmd = [
                     str(llama_bin),
-                    "-m", str(self.gguf_path),
+                    "-m", gguf_arg,
                     "--host", "127.0.0.1",
                     "--port", str(self.port),
                     "--jinja",
                     "--reasoning", "off",
-                    "-c", "2048",
+                    "--no-warmup",
+                    "-c", "1024",
                     "-np", "1",
                     "--log-disable",
                     "-t", str(self.threads),
@@ -900,7 +919,8 @@ class HyMT2Translator:
                 self._proc = proc
                 self._start_stderr_drainer(proc)
 
-                deadline = time.monotonic() + (20.0 if len(attempts) > 1 and backend_label != "cpu" else 45.0)
+                gpu_timeout = 30.0 if backend_label == "vulkan" else 20.0
+                deadline = time.monotonic() + (gpu_timeout if len(attempts) > 1 and backend_label != "cpu" else 45.0)
                 started = False
                 while time.monotonic() < deadline:
                     if proc.poll() is not None:
@@ -965,7 +985,7 @@ class HyMT2Translator:
     def _content_words(s: str) -> set[str]:
         """
         Script-aware content-unit extractor for context-leak detection across ALL 38 Hy-MT2 languages:
-        - Spaced scripts (Latin/Vietnamese/Cyrillic/Arabic/digits): >=3-char word tokens.
+        - Spaced scripts (Latin/Vietnamese/Cyrillic/Arabic): >=3-char word tokens + >=2-digit numbers.
         - Hangul / CJK / Kana / Thai / Lao / Khmer: overlapping 2-char morpheme bigrams
           (immune to attached Korean/Japanese particles and unspaced Thai/Chinese runs).
         """
@@ -973,6 +993,8 @@ class HyMT2Translator:
         units: set[str] = set(
             re.findall(r"[a-z\u00c0-\u024f\u1e00-\u1eff\u0400-\u04ff\u0600-\u06ff0-9]{3,}", low)
         )
+        # Preserve 2-digit numbers (e.g. "31", "16", "80") so numeric context leaks never slip past {3,}
+        units.update(re.findall(r"(?<!\d)\d{2}(?!\d)", low))
         for run in re.findall(r"[\uac00-\ud7a3\u3040-\u30ff\u4e00-\u9fff\u0e00-\u0eff\u1780-\u17ff]+", low):
             if len(run) == 2:
                 units.add(run)
@@ -983,22 +1005,28 @@ class HyMT2Translator:
 
     @classmethod
     def _looks_like_context_leak(cls, clean_src: str, translated: str, ctx_pairs: list[tuple[str, str]]) -> bool:
-        """Detect when a 1.8B LLM accidentally re-translates the background context instead of the target segment."""
+        """Detect when a 1.8B LLM accidentally re-translates or paraphrases the background context instead of the target segment."""
         if not ctx_pairs or not translated:
-            return False
-        out_words = cls._content_words(translated)
-        if len(out_words) < 3:
             return False
         prev_src = " ".join(s for s, _ in ctx_pairs if s)
         prev_tgt = " ".join(t for _, t in ctx_pairs if t)
+
+        # 1) High-precision numeric leak check: if output invents a multi-digit number that exists in
+        #    prior context (`prev_src`/`prev_tgt`, e.g. "31") but does NOT exist in `clean_src`, it is
+        #    unmistakably a context leak even when surrounding words were paraphrased ("girl" -> "woman")!
+        src_nums = set(re.findall(r"\d+(?:[.,]\d+)?", clean_src))
+        out_nums = set(re.findall(r"\d+(?:[.,]\d+)?", translated))
+        prev_nums = set(re.findall(r"\d+(?:[.,]\d+)?", prev_src)) | set(re.findall(r"\d+(?:[.,]\d+)?", prev_tgt))
+        if (out_nums & prev_nums) - src_nums:
+            return True
+
+        out_words = cls._content_words(translated)
+        if len(out_words) < 3:
+            return False
         prev_tgt_words = cls._content_words(prev_tgt)
         if len(prev_tgt_words) < 3:
             return False
         shared = len(out_words & prev_tgt_words)
-        if shared < 3:
-            return False
-        overlap_out_self = shared / max(len(out_words), 1)
-        overlap_out_min = shared / max(min(len(out_words), len(prev_tgt_words)), 1)
         src_words = cls._content_words(clean_src)
         prev_src_words = cls._content_words(prev_src)
         overlap_src = (
@@ -1006,12 +1034,24 @@ class HyMT2Translator:
             if src_words and prev_src_words
             else 0.0
         )
-        # Catch both distinct-sentence leaks (48%+ of output OR 60%+ of min when prev_tgt >= 5 units)
-        # and same-topic near-verbatim copies (68%+), while avoiding false triggers on 2 shared common words
+
+        # 2) Output-bloat clause-bleed check: when a short target receives a much longer translation
+        #    borrowing extra clauses from `prev_tgt` (distinct topic with >=2 shared, or same topic with >=3 shared)
+        if (
+            len(out_words) >= max(len(src_words) + 5, int(len(src_words) * 1.65))
+            and ((shared >= 2 and overlap_src <= 0.30) or (shared >= 3 and overlap_src < 0.65))
+        ):
+            return True
+
+        if shared < 3:
+            return False
+        overlap_out_self = shared / max(len(out_words), 1)
+        overlap_out_min = shared / max(min(len(out_words), len(prev_tgt_words)), 1)
+        # 3) Standard lexical overlap checks (distinct-sentence leak or near-verbatim copy)
         distinct_leak = overlap_src <= 0.35 and (
-            overlap_out_self >= 0.48 or (len(prev_tgt_words) >= 5 and overlap_out_min >= 0.60)
+            overlap_out_self >= 0.44 or (len(prev_tgt_words) >= 5 and overlap_out_min >= 0.58)
         )
-        verbatim_leak = overlap_out_min >= 0.68 and overlap_out_self >= 0.48 and overlap_src < 0.65
+        verbatim_leak = overlap_out_min >= 0.68 and overlap_out_self >= 0.44 and overlap_src < 0.65
         return distinct_leak or verbatim_leak
 
     def _build_prompt(
@@ -1028,11 +1068,14 @@ class HyMT2Translator:
                 lines.append(f"{s} translates to {t}")
             blocks.append("\n".join(lines))
 
-        tgt_spec = (
-            "polite formal Korean (consistent 합니다/해요 style)"
-            if tgt_name == "Korean"
-            else tgt_name
-        )
+        if tgt_name == "Korean":
+            tgt_spec = "polite formal Korean (consistent 합니다/해요 style)"
+        elif tgt_name == "Japanese":
+            tgt_spec = "polite formal Japanese (consistent です/ます style)"
+        elif tgt_name == "Traditional Chinese":
+            tgt_spec = "Traditional Chinese (Taiwan standard 繁體中文)"
+        else:
+            tgt_spec = tgt_name
         bg = " ".join(s for s, _ in ctx_pairs if s).strip() if ctx_pairs else ""
         if bg:
             blocks.append(bg)
@@ -1090,10 +1133,13 @@ class HyMT2Translator:
                 matched_terms.append((s, t))
 
         # Keep single most recent turn for pronoun/topic continuity on medium segments;
-        # skip prior-turn context on very short (<=5 words) or long self-contained paragraphs (>=38 words)
-        # to prevent 1.8B context-overwriting and keep latency crisp.
+        # skip prior-turn context on short clauses (<=10 words), long self-contained paragraphs (>=38 words),
+        # or when prior context is >2.2x longer than the target (prevents 1.8B attention swamping / meaning inversion!).
         src_wc = len(clean.split())
-        ctx_pairs = [] if (src_wc <= 5 or src_wc >= 38) else (context or [])[-1:]
+        cand_ctx = [] if (src_wc <= 10 or src_wc >= 38) else (context or [])[-1:]
+        if cand_ctx and len(cand_ctx[0][0]) > max(120, int(len(clean) * 2.2)):
+            cand_ctx = []
+        ctx_pairs = cand_ctx
         norm_clean = _normalize_vi_large_units_for_cjk(clean, src_lang, tgt_lang)
         term_sig = "|".join(f"{s}->{t}" for s, t in matched_terms)
         ctx_sig = "|".join(s for s, _ in ctx_pairs)

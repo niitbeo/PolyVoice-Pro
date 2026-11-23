@@ -32,7 +32,7 @@ LANGUAGES: list[LanguageEntry] = [
     LanguageEntry("deu_Latn", "Tiếng Đức", "German", "Deutsch", "de-DE-KatjaNeural", True),
     LanguageEntry("spa_Latn", "Tiếng Tây Ban Nha", "Spanish", "Español", "es-ES-ElviraNeural", True),
     LanguageEntry("rus_Cyrl", "Tiếng Nga", "Russian", "Русский", "ru-RU-SvetlanaNeural", True),
-    LanguageEntry("zho_Hant", "Tiếng Trung (Phồn thể)", "Chinese (Traditional)", "繁體中文", "zh-TW-HsiaoChenNeural", True),
+    LanguageEntry("zho_Hant", "Tiếng Trung Phồn thể (Đài Loan)", "Chinese (Traditional, Taiwan)", "繁體中文", "zh-TW-HsiaoChenNeural", True),
     LanguageEntry("ita_Latn", "Tiếng Ý", "Italian", "Italiano", "it-IT-ElsaNeural", True),
     LanguageEntry("por_Latn", "Tiếng Bồ Đào Nha", "Portuguese", "Português", "pt-BR-FranciscaNeural", True),
     LanguageEntry("ind_Latn", "Tiếng Indonesia", "Indonesian", "Bahasa Indonesia", "id-ID-GadisNeural", True),
@@ -247,7 +247,7 @@ SOURCE_LANGUAGES: list[SourceLanguageEntry] = [
     SourceLanguageEntry("lao_Laoo", "lo-LA", "Tiếng Lào", "Lao", "ລາວ", True),
     SourceLanguageEntry("jpn_Jpan", "ja-JP", "Tiếng Nhật", "Japanese", "日本語", True),
     SourceLanguageEntry("zho_Hans", "zh-CN", "Tiếng Trung (Giản thể)", "Chinese (Simplified)", "简体中文", True),
-    SourceLanguageEntry("zho_Hant", "zh-TW", "Tiếng Trung (Phồn thể)", "Chinese (Traditional)", "繁體中文", True),
+    SourceLanguageEntry("zho_Hant", "zh-TW", "Tiếng Trung Phồn thể (Đài Loan)", "Chinese (Traditional, Taiwan)", "繁體中文", True),
     SourceLanguageEntry("kor_Hang", "ko-KR", "Tiếng Hàn", "Korean", "한국어", True),
     SourceLanguageEntry("khm_Khmr", "km-KH", "Tiếng Khmer (Campuchia)", "Khmer", "ភាសាខ្មែរ", True),
     SourceLanguageEntry("fra_Latn", "fr-FR", "Tiếng Pháp", "French", "Français", True),
@@ -339,6 +339,14 @@ SOURCE_LANG_ASR_PROFILE: dict[str, SourceAsrProfile] = {
         "global",
         "experimental",
         "Nghe trực tiếp giọng Lào Offline hiện độ chính xác còn hạn chế; chiều Việt → Lào hoạt động tốt 100% Offline.",
+    ),
+    "khm_Khmr": SourceAsrProfile(
+        "whisper-turbo",
+        540,
+        "whisper-turbo",
+        "global",
+        "experimental",
+        "Nghe trực tiếp giọng Khmer (Campuchia) Offline hiện độ chính xác còn hạn chế; chiều Việt → Khmer hoạt động tốt 100% Offline.",
     ),
 }
 

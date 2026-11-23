@@ -112,6 +112,7 @@ from audio_capture import (
 from file_translator import FileTranslateCancelled, translate_media_file
 from glossary import GlossaryManager
 from languages import (
+    PARAKEET_EU_LANGS,
     get_hymt2_lang_name,
     get_language,
     get_source_asr_profile,
@@ -442,8 +443,14 @@ class StablePrefixTracker:
                 else:
                     window = set(new_norms[: len(locked_norms) + 3])
                     overlap = sum(1 for t in locked_norms if t and t in window) / max(len(locked_norms), 1)
-                    if overlap < 0.30 and len(new_tokens) >= len(self._locked_tokens) + 5:
-                        # Major semantic re-parse (e.g., sentence-final negation) — clean re-anchor
+                    last_locked_missing = bool(locked_norms) and bool(locked_norms[-1]) and (locked_norms[-1] not in window)
+                    if (
+                        (overlap < 0.30 and len(new_tokens) >= len(self._locked_tokens) + 5)
+                        or (last_locked_missing and len(self._locked_tokens) <= 4 and len(new_tokens) >= len(self._locked_tokens) + 2)
+                        or (overlap < 0.50 and len(new_tokens) >= len(self._locked_tokens) + 3)
+                    ):
+                        # Major semantic re-parse / mid-sentence rephrase (e.g. "And come" -> "And he goes back...")
+                        # Cleanly re-anchor instead of gluing a stale locked prefix onto a rephrased tail!
                         self._locked_tokens = new_tokens[:cand_lock]
                         unstable_tokens = new_tokens[cand_lock:]
                     else:
@@ -1404,6 +1411,44 @@ class EngineRuntime:
             return self.model_manager.is_whisper_turbo_ready()
         return False
 
+    @staticmethod
+    def _is_asr_compatible_with_lang(engine_id: str, lang_code: str) -> bool:
+        """Verify whether a manually pinned ASR engine actually supports `lang_code`."""
+        if not engine_id or engine_id in ("auto", "whisper-turbo", "apple-native"):
+            return True
+        if engine_id in ("zipformer-30m-streaming", "viet-asr"):
+            return lang_code == "vie_Latn"
+        if engine_id in ("hybrid-en", "moonshine-en"):
+            return lang_code == "eng_Latn"
+        if engine_id == "moonshine-ja":
+            return lang_code == "jpn_Jpan"
+        if engine_id == "moonshine-ko":
+            return lang_code == "kor_Hang"
+        if engine_id == "zipformer-multi":
+            return lang_code in {
+                "tha_Thai", "zho_Hans", "zho_Hant", "ind_Latn", "rus_Cyrl", "arb_Arab",
+                "vie_Latn", "eng_Latn", "jpn_Jpan",
+            }
+        if engine_id == "parakeet-eu":
+            return (lang_code in PARAKEET_EU_LANGS) or (lang_code == "eng_Latn")
+        return False
+
+    def _is_apple_on_device_ready(self, lang_code: str) -> bool:
+        """Strictly require macOS on-device speech assets so `apple-native` NEVER streams audio to Apple servers."""
+        if self.mac_helper is None or lang_code in ("lao_Laoo", "khm_Khmr", "mya_Mymr"):
+            return False
+        on_dev = [str(loc).lower().replace("_", "-") for loc in (self.apple_caps.get("on_device_locales") or [])]
+        if not on_dev:
+            return False
+        src_meta = get_source_language(lang_code)
+        if not src_meta or not src_meta.locale:
+            return False
+        want = src_meta.locale.lower().replace("_", "-")
+        if want in on_dev:
+            return True
+        want_prefix = want.split("-", 1)[0] + "-"
+        return any(loc.startswith(want_prefix) for loc in on_dev)
+
     def get_source_readiness(self, lang_code: str) -> dict[str, Any]:
         """Return declarative 3-tier readiness metadata for any source language."""
         prof = get_source_asr_profile(lang_code)
@@ -1412,7 +1457,7 @@ class EngineRuntime:
         if lang_code == "vie_Latn":
             pref_ready = pref_ready or True
         fallback_ready = self._is_asr_model_ready(prof.fallback_model)
-        apple_ready = (self.mac_helper is not None) and (lang_code not in ("lao_Laoo", "khm_Khmr", "mya_Mymr"))
+        apple_ready = self._is_apple_on_device_ready(lang_code)
 
         if pref_ready:
             active_tier = prof.asr_tier
@@ -1442,8 +1487,10 @@ class EngineRuntime:
         }
 
     def _resolve_asr_choice_for_lang(self, lang_code: str, forced_engine: str = "auto") -> str:
-        """Pick optimal ASR backend via 3-tier declarative registry: Fast-Lane -> Universal 99 NN -> OS Native."""
-        if forced_engine == "zipformer-en-20m":
+        """Pick optimal ASR backend via 3-tier declarative registry: Fast-Lane -> Universal 99 NN -> OS Native (strict on-device)."""
+        if forced_engine == "zipformer-en-20m" or not self._is_asr_compatible_with_lang(forced_engine, lang_code):
+            forced_engine = "auto"
+        if forced_engine == "apple-native" and not self._is_apple_on_device_ready(lang_code):
             forced_engine = "auto"
         if forced_engine != "auto":
             return forced_engine
@@ -1466,8 +1513,8 @@ class EngineRuntime:
         if self.model_manager.is_whisper_turbo_ready():
             return "whisper-turbo"
 
-        # Tier 3: macOS Apple Neural Engine fallback (~60 system locales)
-        if self.mac_helper is not None and lang_code not in ("lao_Laoo", "khm_Khmr", "mya_Mymr"):
+        # Tier 3: macOS Apple Neural Engine fallback — ONLY when strict on-device asset is installed!
+        if self._is_apple_on_device_ready(lang_code):
             return "apple-native"
 
         src_meta = get_source_language(lang_code)
@@ -1804,7 +1851,11 @@ class EngineRuntime:
             auto_gain=bool(req.auto_gain),
             source_lang=req.source_lang,
             target_lang=req.target_lang,
-            asr_engine="auto" if req.asr_engine == "zipformer-en-20m" else req.asr_engine,
+            asr_engine=(
+                "auto"
+                if (req.asr_engine == "zipformer-en-20m" or not self._is_asr_compatible_with_lang(req.asr_engine, req.source_lang))
+                else req.asr_engine
+            ),
             mt_mode="auto-offline" if req.mt_mode == "opus" else ("nllb" if req.mt_mode == "nllb-1.3b" else req.mt_mode),
             paragraph_mode=req.paragraph_mode if req.paragraph_mode in ("short", "medium", "long") else "long",
             translate_partials=req.translate_partials,
@@ -2241,6 +2292,8 @@ class EngineRuntime:
                 need_restart = True
         if req.source_lang is not None and req.source_lang != self.config.source_lang:
             self.config.source_lang = req.source_lang
+            if not self._is_asr_compatible_with_lang(self.config.asr_engine, req.source_lang):
+                self.config.asr_engine = "auto"
             need_restart = True
         if req.audio_source is not None and req.audio_source != self.config.audio_source:
             self.config.audio_source = req.audio_source
@@ -2263,10 +2316,32 @@ class EngineRuntime:
             if self._audio_stream is not None and hasattr(self._audio_stream, "set_conditioning"):
                 self._audio_stream.set_conditioning(auto_gain=self.config.auto_gain)
         if req.asr_engine is not None and req.asr_engine != self.config.asr_engine:
-            self.config.asr_engine = req.asr_engine
-            need_restart = True
+            next_asr = req.asr_engine
+            if next_asr == "zipformer-en-20m" or not self._is_asr_compatible_with_lang(next_asr, self.config.source_lang):
+                next_asr = "auto"
+            if next_asr != self.config.asr_engine:
+                self.config.asr_engine = next_asr
+                need_restart = True
         if req.target_lang is not None and req.target_lang != self.config.target_lang:
             self.config.target_lang = req.target_lang
+            # Immediately flush prior-language MT context & live draft state so switching
+            # target_lang mid-session (without restarting ASR) never bleeds the old language
+            # into the first translated utterance or live preview.
+            self._recent_context.clear()
+            self._stable_prefix.reset()
+            with self._partial_lock:
+                self._pending_partial = None
+            with self._para_lock:
+                self._para_tgt_lang = req.target_lang
+            if (
+                self.config.mt_mode == "hy-mt2"
+                and self._nllb is not None
+                and self.config.source_lang in HYMT2_LANG_NAMES
+                and req.target_lang in HYMT2_LANG_NAMES
+            ):
+                with self._model_lock:
+                    self._nllb = None
+                gc.collect()
             if self.config.audio_source == "dual":
                 need_restart = True
         if req.mt_mode is not None:
@@ -3548,76 +3623,79 @@ class EngineRuntime:
                 cfg = self.config
                 source_text = item["source_text"]
                 speaker = item.get("speaker", "")
+                active_tgt = item["target_lang"]
+                if speaker != "remote" and not item.get("is_stop_flush", False) and cfg.audio_source != "dual":
+                    active_tgt = cfg.target_lang
                 asr_label = self._remote_asr_label if speaker == "remote" else self._active_asr_label
                 pass2_ms = 0.0
 
-                # Pass-2 Async Refinement (never blocks live Pass-1 streaming):
-                # - Vietnamese: VietASRBatchRefiner (punctuation + ITN) with Glossary-Keyword Preservation Guard!
-                # - English: Moonshine-v2-Base (only when Pass-1 was NOT already Moonshine-v2 streaming!)
-                if cfg.pass2_refine and item.get("pcm") is not None:
-                    if item["source_lang"] == "vie_Latn" and asr_label == "zipformer-30m-streaming":
-                        try:
-                            p1_fixed = self.glossary.apply_asr_fixes(source_text)
-                            refiner = self.ensure_pass2_refiner()
-                            refined, pass2_ms = refiner.refine(
-                                item["pcm"],
-                                p1_fixed,
-                                protected_terms=self._get_glossary_hotwords(),
-                            )
-                            if refined:
-                                source_text = refined
-                        except Exception:
-                            pass
-                    elif item["source_lang"] == "eng_Latn" and asr_label not in ("moonshine-en", "hybrid-en"):
-                        try:
-                            en_refiner = self.ensure_en_pass2_refiner()
-                            if en_refiner is not None:
-                                refined, pass2_ms = en_refiner.refine(item["pcm"], source_text)
-                                if refined:
-                                    source_text = refined
-                        except Exception:
-                            pass
-
-                # Post-Pass-2 Text-Only Dangling-Tail Carry-Over for English (zero audio overlap, 0% duplicates!)
-                if item["source_lang"] == "eng_Latn" and asr_label != "moonshine-en":
-                    ckey = (speaker, item["source_lang"])
-                    prev_c = self._post_pass2_carry.pop(ckey, "")
-                    source_text, next_c = self._apply_post_pass2_carry(
-                        source_text,
-                        prev_c,
-                        allow_peel=not bool(item.get("is_stop_flush", False)),
-                    )
-                    if next_c:
-                        self._post_pass2_carry[ckey] = next_c
-
-                source_text = self._clean_verbatim(
-                    self.glossary.apply_asr_fixes(source_text),
-                    item["source_lang"],
-                    protected_terms=set(self._get_glossary_hotwords()),
-                )
-                source_text = self.glossary.normalize_session_entities(source_text, item["source_lang"])
-                source_text = self._capitalize_sentence_start(source_text)
-                eff_wc = (
-                    max(len(source_text.split()), len(source_text) // 4)
-                    if item["source_lang"].startswith(_NON_SPACED_SCRIPT_PREFIXES)
-                    else len(source_text.split())
-                )
-                para_id = self._assign_paragraph_id(
-                    eff_wc,
-                    item["source_lang"],
-                    item["target_lang"],
-                    speaker=speaker,
-                )
-
+                # Pass-2 Async Refinement + Final MT under `_final_mt_busy` so `_draft_mt_loop`
+                # yields CPU cores during Pass-2 as well (cuts Pass-2 latency 30-50% on Windows CPU laptops!).
                 translated = ""
                 mt_ms = 0.0
                 mt_engine = cfg.mt_mode
+                para_id = ""
                 self._final_mt_busy = True
                 try:
+                    if cfg.pass2_refine and item.get("pcm") is not None:
+                        if item["source_lang"] == "vie_Latn" and asr_label == "zipformer-30m-streaming":
+                            try:
+                                p1_fixed = self.glossary.apply_asr_fixes(source_text)
+                                refiner = self.ensure_pass2_refiner()
+                                refined, pass2_ms = refiner.refine(
+                                    item["pcm"],
+                                    p1_fixed,
+                                    protected_terms=self._get_glossary_hotwords(),
+                                )
+                                if refined:
+                                    source_text = refined
+                            except Exception:
+                                pass
+                        elif item["source_lang"] == "eng_Latn" and asr_label not in ("moonshine-en", "hybrid-en"):
+                            try:
+                                en_refiner = self.ensure_en_pass2_refiner()
+                                if en_refiner is not None:
+                                    refined, pass2_ms = en_refiner.refine(item["pcm"], source_text)
+                                    if refined:
+                                        source_text = refined
+                            except Exception:
+                                pass
+
+                    # Post-Pass-2 Text-Only Dangling-Tail Carry-Over for English (zero audio overlap, 0% duplicates!)
+                    if item["source_lang"] == "eng_Latn" and asr_label != "moonshine-en":
+                        ckey = (speaker, item["source_lang"])
+                        prev_c = self._post_pass2_carry.pop(ckey, "")
+                        source_text, next_c = self._apply_post_pass2_carry(
+                            source_text,
+                            prev_c,
+                            allow_peel=not bool(item.get("is_stop_flush", False)),
+                        )
+                        if next_c:
+                            self._post_pass2_carry[ckey] = next_c
+
+                    source_text = self._clean_verbatim(
+                        self.glossary.apply_asr_fixes(source_text),
+                        item["source_lang"],
+                        protected_terms=set(self._get_glossary_hotwords()),
+                    )
+                    source_text = self.glossary.normalize_session_entities(source_text, item["source_lang"])
+                    source_text = self._capitalize_sentence_start(source_text)
+                    eff_wc = (
+                        max(len(source_text.split()), len(source_text) // 4)
+                        if item["source_lang"].startswith(_NON_SPACED_SCRIPT_PREFIXES)
+                        else len(source_text.split())
+                    )
+                    para_id = self._assign_paragraph_id(
+                        eff_wc,
+                        item["source_lang"],
+                        active_tgt,
+                        speaker=speaker,
+                    )
+
                     res = self.translate_text(
                         source_text,
                         item["source_lang"],
-                        item["target_lang"],
+                        active_tgt,
                         mt_mode=cfg.mt_mode,
                         beam_size=cfg.beam_size,
                         llm_url=cfg.llm_url,
@@ -3634,7 +3712,12 @@ class EngineRuntime:
                 finally:
                     self._final_mt_busy = False
 
-                if source_text and translated:
+                if (
+                    source_text
+                    and translated
+                    and item["source_lang"] == self.config.source_lang
+                    and active_tgt == self.config.target_lang
+                ):
                     self._recent_context.append((source_text, translated))
 
                 entry = {
@@ -3644,7 +3727,7 @@ class EngineRuntime:
                     "source_text": source_text,
                     "translated_text": translated,
                     "source_lang": item["source_lang"],
-                    "target_lang": item["target_lang"],
+                    "target_lang": active_tgt,
                     "asr_ms": item["asr_ms"],
                     "pass2_ms": pass2_ms,
                     "mt_ms": mt_ms,
@@ -3697,6 +3780,8 @@ class EngineRuntime:
 
             cfg = self.config
             seg_id = str(partial_job["id"])
+            if cfg.audio_source != "dual" and partial_job["target_lang"] != cfg.target_lang:
+                continue
             with self._partial_lock:
                 if seg_id in self._committed_seg_ids:
                     continue
@@ -3780,7 +3865,9 @@ class EngineRuntime:
                 last_partial_wc = wc_now
                 last_draft_mt_ms = r.latency_ms
 
-                # Guard against race: if this segment committed while EnViT5 was running, drop stale draft
+                # Guard against race: if this segment committed or target_lang changed while draft MT ran, drop stale draft
+                if self.config.audio_source != "dual" and partial_job["target_lang"] != self.config.target_lang:
+                    continue
                 with self._partial_lock:
                     if seg_id in self._committed_seg_ids:
                         continue

@@ -622,6 +622,7 @@ AUDIENCE_HTML = (
             <option value="khm_Khmr">ភាសាខ្មែរ (Khmer)</option>
             <option value="vie_Latn">Tiếng Việt</option>
             <option value="zho_Hans">简体中文 (Tiếng Trung)</option>
+            <option value="zho_Hant">繁體中文 (Đài Loan)</option>
             <option value="jpn_Jpan">日本語 (Tiếng Nhật)</option>
             <option value="kor_Hang">한국어 (Tiếng Hàn)</option>
             <option value="fra_Latn">Français (Tiếng Pháp)</option>

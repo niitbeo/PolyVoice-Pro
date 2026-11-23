@@ -153,7 +153,7 @@ _VI_2WORD_NON_PERSON_PHRASES = frozenset({
     "đồng tháp", "đồng nai", "đồng bằng", "đồng ý", "đồng hành", "đồng bộ", "đồng chí",
     "hồ gươm", "hồ tây", "hồ hoàn", "hồ sơ", "ninh bình", "ninh thuận",
     "lý tưởng", "lý thuyết", "lý lịch", "lý do", "lý tính", "lý luận",
-    "tôn giáo", "tôn vinh", "tôn chỉ", "hoàng gia", "hoàng hôn", "hoàng hậu", "hoàng cung",
+    "tôn giáo", "tôn vinh", "tôn chỉ", "hoàng gia", "hoàng hôn", "hoàng hậu", "hoàng cung", "hoàng kim", "hoàng đế", "hoàng tử",
     "đào tạo", "lưu trữ", "lưu ý", "lưu hành", "lưu lượng", "tăng trưởng", "tăng cường",
     "phạm vi", "bùi ngùi", "trần gian", "trần trụi", "mai sau", "mai mối",
     "đoàn kết", "đoàn thể", "kiều bào", "kiều hối", "bạch cầu", "bạch kim", "bạch tuyết",
