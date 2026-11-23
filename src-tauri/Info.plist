@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
     <key>NSMicrophoneUsageDescription</key>
-    <string>PolyVoice Pro cần quyền Micro để nhận dạng giọng nói và phiên dịch theo thời gian thực.</string>
+    <string>DAU Voice Pro cần quyền Micro để nhận dạng giọng nói và phiên dịch theo thời gian thực.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
-    <string>PolyVoice Pro sử dụng nhận dạng giọng nói offline của macOS trên Apple Neural Engine để đạt tốc độ cao và tiết kiệm CPU.</string>
+    <string>DAU Voice Pro sử dụng nhận dạng giọng nói offline của macOS trên Apple Neural Engine để đạt tốc độ cao và tiết kiệm CPU.</string>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>PolyVoice Pro cần quyền ghi âm thanh hệ thống (ScreenCaptureKit) để thu trực tiếp tiếng YouTube, Zoom, Google Meet.</string>
+    <string>DAU Voice Pro cần quyền ghi âm thanh hệ thống (ScreenCaptureKit) để thu trực tiếp tiếng YouTube, Zoom, Google Meet.</string>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>PolyVoice Pro sử dụng mạng nội bộ (Wi-Fi / LAN) để phát phụ đề đa ngôn ngữ qua mã QR cho điện thoại khán giả trong hội trường.</string>
+    <string>DAU Voice Pro sử dụng mạng nội bộ (Wi-Fi / LAN) để phát phụ đề đa ngôn ngữ qua mã QR cho điện thoại khán giả trong hội trường.</string>
 </dict>
 </plist>

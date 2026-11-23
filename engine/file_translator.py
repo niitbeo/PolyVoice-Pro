@@ -650,7 +650,7 @@ def translate_media_file(
 
     # Build .TXT and all 3 .SRT variants (bilingual, target-only, source-only)
     txt_lines = [
-        f"=== PolyVoice Pro — Dịch File Offline: {orig_filename} ({duration_s}s) ===",
+        f"=== DAU Voice Pro — Dịch File Offline: {orig_filename} ({duration_s}s) ===",
         f"Hướng dịch: {source_lang} -> {target_lang} | ASR: {asr_used_label} | Tổng: {len(segments_out)} đoạn",
         "=" * 64,
         "",

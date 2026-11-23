@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# 1-Command Release Script for PolyVoice Pro
-# Usage: bash scripts/release.sh 0.8.1 "Mô tả tính năng mới"
+# 1-Command Release Script for DAU Voice Pro
+# Usage: bash scripts/release.sh 1.0.0 "Mô tả tính năng mới"
 set -euo pipefail
 
 NEW_VER="${1:-}"
-NOTES="${2:-Cập nhật PolyVoice Pro v${NEW_VER}}"
+NOTES="${2:-Cập nhật DAU Voice Pro v${NEW_VER}}"
 
 if [[ -z "$NEW_VER" ]]; then
   echo "Cách dùng: bash scripts/release.sh <version> [ghi chú]"
@@ -56,7 +56,7 @@ if git diff --name-only -- src-tauri/Cargo.lock | grep -q "Cargo.lock"; then
 fi
 
 git commit -m "release: v${NEW_VER} — ${NOTES}"
-git tag -a "v${NEW_VER}" -m "PolyVoice Pro v${NEW_VER}: ${NOTES}"
+git tag -a "v${NEW_VER}" -m "DAU Voice Pro v${NEW_VER}: ${NOTES}"
 git push origin main --follow-tags
 
 echo ""

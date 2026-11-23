@@ -1,4 +1,4 @@
-name: Release PolyVoice Pro (Windows & macOS + Auto-Update)
+name: Release DAU Voice Pro (Windows & macOS + Auto-Update)
 
 on:
   push:
@@ -23,9 +23,9 @@ jobs:
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --draft \
-              --title "PolyVoice Pro v${VERSION}" \
+              --title "DAU Voice Pro v${VERSION}" \
               --notes "$(cat <<EOF
-          ## PolyVoice Pro v${VERSION}
+          ## DAU Voice Pro v${VERSION}
 
           Bản phát hành chính thức cho **Windows (\`.exe\`/\`.msi\`)** và **macOS (\`.dmg\`)** tích hợp sẵn AI Engine (không cần cài Python).
           Người dùng đang cài đặt bản cũ chỉ cần mở app lên để **tự động cập nhật 1 chạm** (giữ nguyên toàn bộ model offline, từ điển và API Key).
@@ -249,9 +249,9 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: v__VERSION__
-          releaseName: "PolyVoice Pro v__VERSION__"
+          releaseName: "DAU Voice Pro v__VERSION__"
           releaseBody: |
-            ## PolyVoice Pro v__VERSION__
+            ## DAU Voice Pro v__VERSION__
 
             Bản phát hành chính thức cho **Windows (`.exe`/`.msi`)** và **macOS (`.dmg`)** tích hợp sẵn AI Engine (không cần cài Python).
             Người dùng đang cài đặt bản cũ chỉ cần mở app lên để **tự động cập nhật 1 chạm** (giữ nguyên toàn bộ model offline, từ điển và API Key).
@@ -330,7 +330,7 @@ jobs:
 
               manifest = {
                   "version": version,
-                  "notes": rel.get("body") or f"PolyVoice Pro v{version}",
+                  "notes": rel.get("body") or f"DAU Voice Pro v{version}",
                   "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                   "platforms": {
                       "darwin-aarch64": {"signature": mac_sig, "url": canonical_url(mac_tar)},

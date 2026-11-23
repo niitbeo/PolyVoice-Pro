@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="src-tauri/icons/128x128@2x.png" alt="PolyVoice Pro Logo" width="88" />
+<img src="src-tauri/icons/128x128@2x.png" alt="DAU Voice Pro Logo" width="88" />
 
-# PolyVoice Pro
+# DAU Voice Pro
 
 **Hệ thống Phiên dịch Hội nghị Song ngữ Thời gian thực — 20 Ngôn ngữ Nói ⇄ 202 Ngôn ngữ Dịch**
 <br />
@@ -24,7 +24,7 @@
 
 <br />
 
-<img src="docs/images/hero-main-app.png" alt="PolyVoice Pro — Giao diện chính với Dòng chảy 2 tầng & Kiểm định Google AI" width="100%" />
+<img src="docs/images/hero-main-app.png" alt="DAU Voice Pro — Giao diện chính với Dòng chảy 2 tầng & Kiểm định Google AI" width="100%" />
 
 </div>
 
@@ -32,9 +32,9 @@
 
 ## 🎯 Tổng quan
 
-**PolyVoice Pro** là ứng dụng desktop đa nền tảng (**macOS Apple Silicon** & **Windows x64**) chuyên dụng cho **hội nghị quốc tế, họp trực tuyến Zoom/Teams/Meet, giảng dạy song ngữ và livestream sự kiện**.
+**DAU Voice Pro** là ứng dụng desktop đa nền tảng (**macOS Apple Silicon** & **Windows x64**) chuyên dụng cho **hội nghị quốc tế, họp trực tuyến Zoom/Teams/Meet, giảng dạy song ngữ và livestream sự kiện**.
 
-Thay vì phụ thuộc vào các thư viện AI nặng nề (như PyTorch hàng GB hay yêu cầu card đồ họa rời), PolyVoice Pro sử dụng **nhân suy luận C++/ONNX/CTranslate2 INT8** đóng gói thành sidecar độc lập ngay trong file cài đặt — đạt độ trễ dịch nháp **`~68–161 ms`** và chốt câu **`~134–212 ms`** ngay trên CPU laptop phổ thông (**0% GPU**), đồng thời giữ nguyên 100% quyền riêng tư âm thanh nội bộ.
+Thay vì phụ thuộc vào các thư viện AI nặng nề (như PyTorch hàng GB hay yêu cầu card đồ họa rời), DAU Voice Pro sử dụng **nhân suy luận C++/ONNX/CTranslate2 INT8** đóng gói thành sidecar độc lập ngay trong file cài đặt — đạt độ trễ dịch nháp **`~68–161 ms`** và chốt câu **`~134–212 ms`** ngay trên CPU laptop phổ thông (**0% GPU**), đồng thời giữ nguyên 100% quyền riêng tư âm thanh nội bộ.
 
 ---
 
@@ -142,7 +142,7 @@ flowchart TB
 
 ### 1. Stack Ứng dụng Desktop, Hệ thống Native & Backend
 
-| Lớp hệ thống | Công nghệ & Thư viện | Vai trò trong PolyVoice Pro |
+| Lớp hệ thống | Công nghệ & Thư viện | Vai trò trong DAU Voice Pro |
 | :--- | :--- | :--- |
 | **Desktop Shell** | **Tauri 2** (Rust) + `tauri-plugin-updater` + `tauri-plugin-global-shortcut` | Khung ứng dụng native siêu nhẹ (RAM thấp hơn Electron nhiều lần), cửa sổ Phụ đề Nổi trong suốt xuyên chuột, phím tắt toàn cục và cập nhật tự động ký số **Ed25519**. |
 | **Frontend UI** | **React 19** + **TypeScript 5.8** + **Vite 6** + **Lucide Icons** | Giao diện **Crimson Academic Pro** (Sáng & Tối), dòng chảy phụ đề 2 tầng mượt không giật DOM, quản lý Lịch sử, Từ điển và Báo cáo Kiểm định Google AI. |
@@ -194,14 +194,14 @@ flowchart TB
 
 1. Truy cập trang **[GitHub Releases mới nhất](https://github.com/niitbeo/PolyVoice-Pro/releases/latest)**.
 2. Tải đúng bộ cài cho máy của bạn:
-   - **Windows 10/11 (64-bit):** `PolyVoice Pro_x.x.x_x64-setup.exe` hoặc `.msi`
-   - **macOS Apple Silicon (M1 / M2 / M3 / M4):** `PolyVoice Pro_x.x.x_aarch64.dmg`
+   - **Windows 10/11 (64-bit):** `DAU.Voice.Pro_x.x.x_x64-setup.exe` hoặc `.msi`
+   - **macOS Apple Silicon (M1 / M2 / M3 / M4):** `DAU.Voice.Pro_x.x.x_aarch64.dmg`
 3. Mở ứng dụng lần đầu để app tự tải **gói mô hình AI cốt lõi (~1.18 GB)** từ Hugging Face (chỉ tải 1 lần duy nhất, sau đó dùng 100% không cần mạng).
 4. **Cập nhật tự động 1 chạm:** Khi có phiên bản mới trên GitHub Releases, ứng dụng sẽ tự thông báo và cập nhật tại chỗ (giữ nguyên toàn bộ model offline, Từ điển và API Key đã lưu).
 
 > **Lưu ý cho macOS (bản ký ad-hoc):** Nếu macOS Gatekeeper báo *"cannot be opened because the developer cannot be verified"*, chạy 1 lệnh sau trong Terminal rồi mở lại app:
 > ```bash
-> xattr -cr "/Applications/PolyVoice Pro.app"
+> xattr -cr "/Applications/DAU Voice Pro.app"
 > ```
 
 ---
@@ -267,5 +267,5 @@ Script tự động đồng bộ phiên bản (`package.json`, `tauri.conf.json`
 ---
 
 <div align="center">
-<sub>Được xây dựng với ❤️ cho các hội nghị, lớp học và sự kiện đa ngôn ngữ — <b>PolyVoice Pro</b></sub>
+<sub>Được xây dựng với ❤️ cho các hội nghị, lớp học và sự kiện đa ngôn ngữ — <b>DAU Voice Pro</b></sub>
 </div>

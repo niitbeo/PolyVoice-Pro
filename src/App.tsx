@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  AlignJustify,
   ArrowLeftRight,
+  ArrowRight,
   ArrowUpCircle,
+  AudioLines,
   BookOpen,
   Check,
   CheckCircle2,
@@ -16,8 +19,10 @@ import {
   FileAudio,
   FileText,
   FolderOpen,
+  Gauge,
   Globe,
   Headphones,
+  Languages,
   Layers,
   Loader2,
   LogOut,
@@ -32,6 +37,7 @@ import {
   RefreshCw,
   Search,
   Send,
+  Server,
   Settings,
   Settings2,
   ShieldCheck,
@@ -48,6 +54,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
+import { StudioSelect, StudioSelectOption } from "./StudioSelect";
 import {
   AsrEngineId,
   AudienceInfo,
@@ -1390,7 +1397,7 @@ export default function App() {
           .map((s) => `${s.index}\n${s.start_srt} --> ${s.end_srt}\n${s.source_text}\n`)
           .join("\n");
         const txtBody = [
-          `=== PolyVoice Pro — Dịch File Offline: ${prev.filename} (${prev.duration_s}s) ===`,
+          `=== DAU Voice Pro — Dịch File Offline: ${prev.filename} (${prev.duration_s}s) ===`,
           `Tổng: ${nextSegs.length} đoạn (đã cập nhật theo kiểm định Google AI)`,
           "=".repeat(64),
           "",
@@ -2133,7 +2140,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `polyvoice-pro-${sourceLang}-to-${targetLang}.${format}`;
+    a.download = `dau-voice-pro-${sourceLang}-to-${targetLang}.${format}`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -2336,6 +2343,258 @@ export default function App() {
     showPartialAsActive && activePartial ? activePartial.mt_ms : latestItem?.mt_ms ?? activePartial?.mt_ms ?? 0;
   const litBars = Math.round(level * VU_BARS);
 
+  const isViEnPair =
+    (sourceLang === "vie_Latn" && targetLang === "eng_Latn") ||
+    (sourceLang === "eng_Latn" && targetLang === "vie_Latn");
+
+  const resolvedAutoAsrBadge = (() => {
+    if (sourceLang === "vie_Latn") return status?.zipformer_ready ? "Zipformer-30M" : "VietASR";
+    if (sourceLang === "eng_Latn") return status?.moonshine_en_ready ? "Hybrid-EN" : "Whisper-Turbo";
+    if (sourceLang === "jpn_Jpan") return status?.moonshine_ja_ready ? "Moonshine-JA" : "Whisper-Turbo";
+    if (sourceLang === "kor_Hang") return status?.moonshine_ko_ready ? "Moonshine-KO" : "Whisper-Turbo";
+    if (ZIPFORMER_MULTI_CODES.has(sourceLang)) return status?.zipformer_multi_ready ? "Zipformer-Multi" : "Whisper-Turbo";
+    if (PARAKEET_EU_CODES.has(sourceLang)) return status?.parakeet_eu_ready ? "Parakeet-EU" : "Whisper-Turbo";
+    return "Whisper-Turbo";
+  })();
+
+  const micDeviceOptions: StudioSelectOption[] =
+    devices.length === 0
+      ? [{ value: "", label: "Micro mặc định hệ thống", badge: "Mặc định", icon: <Mic size={13} /> }]
+      : devices.map((d) => ({
+          value: String(d.id),
+          label: d.name,
+          badge: d.is_default ? "Mặc định" : undefined,
+          icon: <Mic size={13} />,
+        }));
+
+  const loopbackDeviceOptions: StudioSelectOption[] = loopbackDevices.map((d) => ({
+    value: String(d.id),
+    label: d.name,
+    badge: d.is_default ? "Mặc định" : undefined,
+    icon: <MonitorSpeaker size={13} />,
+  }));
+
+  const sourceLangOptions: StudioSelectOption[] = sourceLanguages.map((sl) => ({
+    value: sl.code,
+    label: sl.name_vi,
+    description: sl.native && sl.native !== sl.name_vi ? sl.native : sl.name_en,
+    badge: sl.asr_tier === "experimental" ? "Thử nghiệm" : sl.asr_tier === "universal" ? "99 NN" : undefined,
+    icon: <Languages size={13} />,
+  }));
+
+  const mtOfflineOptions: StudioSelectOption[] = [
+    {
+      value: "auto-offline",
+      label: "Siêu nhẹ (0% GPU)",
+      badge: isViEnPair ? "EnViT5" : "NLLB-200",
+      description: "Việt-Anh (EnViT5) + 202 ngôn ngữ (NLLB-600M) • Không cần GPU",
+      icon: <Cpu size={13} />,
+    },
+    {
+      value: "hy-mt2",
+      label: "Chuyên sâu 38 NN",
+      badge: status?.hymt2_ready ? "Hy-MT2" : "Chưa tải",
+      description: status?.hymt2_ready
+        ? "Tencent Hy-MT2 1.8B • Tăng tốc GPU/RAM, văn phong hội nghị tự nhiên"
+        : "Cần tải model Hy-MT2 1.8B trong mục Mô hình Offline",
+      icon: <Sparkles size={13} />,
+      disabled: !status?.hymt2_ready,
+    },
+    {
+      value: "local-llm",
+      label: "Local LLM",
+      badge: "Ollama",
+      description: "Kết nối Ollama / llama.cpp OpenAI-compatible cục bộ",
+      icon: <Server size={13} />,
+    },
+  ];
+
+  const hasAppleOnDevice = (() => {
+    if (!status?.mac_helper_ready) return false;
+    const loc = (currentSrcObj?.locale || "").toLowerCase().replace("_", "-");
+    const pref = loc.split("-")[0] + "-";
+    const onDev = (status?.apple_caps?.on_device_locales || []).map((x) =>
+      x.toLowerCase().replace("_", "-")
+    );
+    return Boolean(loc) && onDev.some((x) => x === loc || x.startsWith(pref));
+  })();
+
+  const asrEngineOptions: StudioSelectOption[] = [
+    {
+      value: "auto",
+      label: "Tự động tối ưu",
+      badge: resolvedAutoAsrBadge,
+      description: `Khuyên dùng • Đang áp dụng chuẩn ${resolvedAutoAsrBadge}`,
+      icon: <AudioLines size={13} />,
+    },
+    ...(sourceLang === "vie_Latn"
+      ? [
+          {
+            value: "zipformer-30m-streaming",
+            label: "Zipformer-30M Việt",
+            badge: "49 MB • ~30ms",
+            description: "Streaming siêu tốc 6.000 giờ tiếng Việt + BPE Hotwords",
+            icon: <AudioLines size={13} />,
+            disabled: !status?.zipformer_ready,
+          },
+          {
+            value: "viet-asr",
+            label: "VietASR Tiếng Việt",
+            badge: "78 MB • ITN",
+            description: "Tích hợp sẵn dấu câu và chuẩn hóa số liệu",
+            icon: <AudioLines size={13} />,
+          },
+        ]
+      : []),
+    ...(sourceLang === "eng_Latn"
+      ? [
+          {
+            value: "hybrid-en",
+            label: "Hybrid-EN",
+            badge: "1.8% WER",
+            description: "Moonshine-v2 + Silero VAD Zero-Overlap • Chống lặp chữ 0%",
+            icon: <AudioLines size={13} />,
+            disabled: !status?.moonshine_en_ready,
+          },
+          {
+            value: "moonshine-en",
+            label: "Moonshine-v2 Anh",
+            badge: "Streaming",
+            description: "Cửa sổ trượt liên tục thời gian thực",
+            icon: <AudioLines size={13} />,
+            disabled: !status?.moonshine_en_ready,
+          },
+        ]
+      : []),
+    ...(sourceLang === "jpn_Jpan"
+      ? [
+          {
+            value: "moonshine-ja",
+            label: "Moonshine-v2 Nhật",
+            badge: "~120ms • 0% GPU",
+            description: "Nhận dạng tiếng Nhật độ trễ thấp + Silero VAD",
+            icon: <AudioLines size={13} />,
+            disabled: !status?.moonshine_ja_ready,
+          },
+        ]
+      : []),
+    ...(sourceLang === "kor_Hang"
+      ? [
+          {
+            value: "moonshine-ko",
+            label: "Moonshine-v2 Hàn",
+            badge: "~150ms • 0% GPU",
+            description: "Nhận dạng tiếng Hàn + chuẩn hóa số/đơn vị ITN",
+            icon: <AudioLines size={13} />,
+            disabled: !status?.moonshine_ko_ready,
+          },
+        ]
+      : []),
+    ...(ZIPFORMER_MULTI_CODES.has(sourceLang)
+      ? [
+          {
+            value: "zipformer-multi",
+            label: "Zipformer Đa ngôn ngữ",
+            badge: "~15ms • 0% GPU",
+            description: "Thái, Trung (Giản/Phồn), Indo, Nga, Ả Rập",
+            icon: <AudioLines size={13} />,
+            disabled: !status?.zipformer_multi_ready,
+          },
+        ]
+      : []),
+    ...(PARAKEET_EU_CODES.has(sourceLang)
+      ? [
+          {
+            value: "parakeet-eu",
+            label: "Parakeet-Ultra 25 NN",
+            badge: "~0.3s • 0% GPU",
+            description: "Pháp, Đức, TBN, Ý, Bồ Đào Nha, Hà Lan, Ba Lan, Ukraina...",
+            icon: <AudioLines size={13} />,
+            disabled: !status?.parakeet_eu_ready,
+          },
+        ]
+      : []),
+    {
+      value: "whisper-turbo",
+      label: "Whisper-Turbo 99 NN",
+      badge: "99 NN",
+      description: "Mở rộng đa ngôn ngữ toàn cầu • 100% Offline",
+      icon: <AudioLines size={13} />,
+      disabled: !status?.whisper_turbo_ready,
+    },
+    ...(hasAppleOnDevice
+      ? [
+          {
+            value: "apple-native",
+            label: "Apple Neural Engine",
+            badge: "macOS ANE",
+            description: "On-Device 100% Offline • ~1% CPU",
+            icon: <Cpu size={13} />,
+          },
+        ]
+      : []),
+  ];
+
+  const paragraphOptions: StudioSelectOption[] = [
+    {
+      value: "long",
+      label: "Đoạn dài YouTube",
+      badge: "3–4 câu",
+      description: "Gom liền mạch thành đoạn hội nghị dễ đọc",
+      icon: <AlignJustify size={13} />,
+    },
+    {
+      value: "medium",
+      label: "Đoạn trung bình",
+      badge: "~2 câu",
+      description: "Cân bằng độ trễ hiển thị và độ trọn ý",
+      icon: <AlignJustify size={13} />,
+    },
+    {
+      value: "short",
+      label: "Từng câu ngắn",
+      badge: "1 câu",
+      description: "Phụ đề rời từng câu phát ra nhanh nhất",
+      icon: <AlignJustify size={13} />,
+    },
+  ];
+
+  const beamOptions: StudioSelectOption[] = [
+    { value: "1", label: "Beam = 1", badge: "Nhanh nhất", description: "Độ trễ thấp nhất cho dịch trực tiếp", icon: <Gauge size={13} /> },
+    { value: "2", label: "Beam = 2", badge: "Cân bằng", description: "Câu văn mượt hơn, vẫn nhẹ CPU", icon: <Gauge size={13} /> },
+    { value: "3", label: "Beam = 3", badge: "Chính xác cao", description: "Ưu tiên chất lượng cao nhất", icon: <Gauge size={13} /> },
+  ];
+
+  const fileAsrOptions: StudioSelectOption[] = [
+    {
+      value: "auto",
+      label: "Tự động tối ưu",
+      badge: "Siêu tốc",
+      description: "VietASR / Moonshine / Parakeet theo ngôn ngữ (~4× RT)",
+      icon: <AudioLines size={13} />,
+    },
+    {
+      value: "whisper-turbo",
+      label: "Whisper Large-v3-Turbo",
+      badge: models?.asr_whisper_turbo?.status === "ready" ? "Sẵn sàng" : "540 MB",
+      description: "Chuyên xử lý file nhiều tạp âm hoặc nói chen",
+      icon: <AudioLines size={13} />,
+    },
+  ];
+
+  const fileSrtOptions: StudioSelectOption[] = [
+    { value: "bilingual", label: ".SRT Song ngữ", badge: "2 dòng", description: "Hiển thị cả câu gốc và bản dịch", icon: <FileText size={13} /> },
+    { value: "target", label: ".SRT Chỉ bản dịch", badge: "Đích", description: "Phù hợp ghép phụ đề video 1 ngôn ngữ", icon: <FileText size={13} /> },
+    { value: "source", label: ".SRT Chỉ văn bản gốc", badge: "Gốc", description: "Xuất phụ đề nguyên văn diễn giả", icon: <FileText size={13} /> },
+  ];
+
+  const geminiModelOptions: StudioSelectOption[] = [
+    { value: "gemini-2.5-flash", label: "gemini-2.5-flash", badge: "Khuyên dùng", description: "Nhanh ~0.9s, ổn định nhất", icon: <Sparkles size={13} /> },
+    { value: "gemini-3.1-flash-lite", label: "gemini-3.1-flash-lite", badge: "Tiết kiệm", description: "Flash Lite chi phí tối ưu nhất", icon: <Sparkles size={13} /> },
+    { value: "gemini-3.5-flash-lite", label: "gemini-3.5-flash-lite", badge: "3.5 Lite", description: "Flash Lite thế hệ 3.5", icon: <Sparkles size={13} /> },
+    { value: "gemini-3.8-flash", label: "gemini-3.8-flash", badge: "Mới nhất", description: "Flash thế hệ 3.8 mới nhất", icon: <Sparkles size={13} /> },
+  ];
+
   return (
     <div className="app-shell">
       {/* Single-Row Studio Top Bar */}
@@ -2347,9 +2606,25 @@ export default function App() {
             </div>
             <div className="brand-meta">
               <div className="brand-title">
-                PolyVoice <span className="brand-pro-tag">PRO</span>
+                DAU Voice <span className="brand-pro-tag">PRO</span>
               </div>
-              <div className="brand-sub">Phiên dịch Hội nghị • {languages.length || 202} Ngôn ngữ</div>
+              <div
+                className="brand-sub"
+                title={
+                  !connected
+                    ? "Đang kết nối AI Engine..."
+                    : status?.listening
+                    ? `Đang dịch trực tiếp (${status?.active_asr_label || "auto"})`
+                    : `Sẵn sàng trên ${status?.platform?.os || ""} ${status?.platform?.arch || ""}`.trim()
+                }
+              >
+                <span
+                  className={`status-beacon ${
+                    !connected ? "warn pulse" : status?.listening ? "live pulse" : "ok"
+                  }`}
+                />
+                <span>Phiên dịch Hội nghị</span>
+              </div>
             </div>
           </div>
 
@@ -2371,20 +2646,13 @@ export default function App() {
                 ? "Âm thanh máy"
                 : "Đang lắng nghe"}
             </span>
-          ) : (
-            <span
-              className="pill ok"
-              title={`Sẵn sàng trên ${status?.platform?.os || ""} ${status?.platform?.arch || ""}`}
-            >
-              <span className="dot" /> Sẵn sàng
-            </span>
-          )}
+          ) : null}
 
           {updateInfo && (
             <button
               className="btn primary sm"
               onClick={() => setUpdateModalOpen(true)}
-              title={`Có phiên bản mới PolyVoice Pro v${updateInfo.version} — bấm để cập nhật tự động`}
+              title={`Có phiên bản mới DAU Voice Pro v${updateInfo.version} — bấm để cập nhật tự động`}
             >
               <ArrowUpCircle size={13} /> Cập nhật v{updateInfo.version}
             </button>
@@ -2488,12 +2756,18 @@ export default function App() {
               disabled={!connected}
             >
               {status?.listening ? <MicOff size={17} /> : <Mic size={17} />}
-              {status?.listening
-                ? "Dừng dịch giọng nói"
-                : `Bắt đầu dịch (${shortLangName(sourceLang, currentSrcObj?.name_vi)} → ${shortLangName(
-                    targetLang,
-                    currentTgtObj?.name_vi
-                  )})`}
+              {status?.listening ? (
+                "Dừng dịch giọng nói"
+              ) : (
+                <>
+                  <span>Bắt đầu dịch</span>
+                  <span className="cta-lang-pair">
+                    ({shortLangName(sourceLang, currentSrcObj?.name_vi)}
+                    <ArrowRight size={13} />
+                    {shortLangName(targetLang, currentTgtObj?.name_vi)})
+                  </span>
+                </>
+              )}
             </button>
 
             {/* Sleek Segmented Audio Source Switcher */}
@@ -2536,16 +2810,18 @@ export default function App() {
                 <button
                   className={`sub-seg-btn ${audioSource === "dual" ? "active" : ""}`}
                   onClick={() => handleAudioSourceChange("dual")}
-                  title="Micro dịch xuôi (A→B), Loa Zoom/Meet dịch ngược (B→A)"
+                  title="Micro dịch xuôi (A sang B), Loa Zoom/Meet dịch ngược (B sang A)"
                 >
-                  Đàm thoại 2 chiều (A⇄B)
+                  <span>Đàm thoại 2 chiều</span>
+                  <ArrowLeftRight size={11} />
                 </button>
                 <button
                   className={`sub-seg-btn ${audioSource === "mix" ? "active" : ""}`}
                   onClick={() => handleAudioSourceChange("mix")}
-                  title="Gộp tiếng Micro/Mixer + Video/Zoom trên máy vào chung 1 luồng dịch xuôi (A→B)"
+                  title="Gộp tiếng Micro/Mixer + Video/Zoom trên máy vào chung 1 luồng dịch xuôi"
                 >
-                  Gộp hội trường (A→B)
+                  <span>Gộp hội trường</span>
+                  <ArrowRight size={11} />
                 </button>
               </div>
             )}
@@ -2572,26 +2848,20 @@ export default function App() {
 
             {audioSource !== "system" ? (
               <div className="row">
-                <select
-                  className="select"
-                  value={selectedDevice ?? ""}
-                  onChange={(e) => {
-                    const id = e.target.value ? Number(e.target.value) : null;
+                <StudioSelect
+                  value={selectedDevice !== null ? String(selectedDevice) : ""}
+                  options={micDeviceOptions}
+                  leadingIcon={<Mic size={13} />}
+                  showTriggerBadge={false}
+                  onChange={(val) => {
+                    const id = val ? Number(val) : null;
                     setSelectedDevice(id);
                     if (status?.listening && id !== null) {
                       hotUpdateConfig({ device_id: id });
                     }
                   }}
                   title="Chọn Micro, Line-In, USB Soundcard hoặc Bàn Mixer"
-                >
-                  {devices.length === 0 && <option value="">Micro mặc định hệ thống</option>}
-                  {devices.map((d) => (
-                    <option key={d.id} value={d.id}>
-                      {d.is_default ? "★ " : ""}
-                      {d.name}
-                    </option>
-                  ))}
-                </select>
+                />
                 <button
                   className="btn sm icon-only"
                   onClick={handleRefreshDevices}
@@ -2614,25 +2884,20 @@ export default function App() {
             ) : (
               <div className="row">
                 {!isMacOs && loopbackDevices.length > 0 ? (
-                  <select
-                    className="select"
-                    value={selectedLoopback ?? ""}
-                    onChange={(e) => {
-                      const id = e.target.value ? Number(e.target.value) : null;
+                  <StudioSelect
+                    value={selectedLoopback !== null ? String(selectedLoopback) : ""}
+                    options={loopbackDeviceOptions}
+                    leadingIcon={<MonitorSpeaker size={13} />}
+                    showTriggerBadge={false}
+                    onChange={(val) => {
+                      const id = val ? Number(val) : null;
                       setSelectedLoopback(id);
                       if (status?.listening && id !== null) {
                         hotUpdateConfig({ loopback_device_id: id });
                       }
                     }}
                     title="Chọn thiết bị Loa / Cổng âm thanh Windows cần bắt tiếng (WASAPI Loopback)"
-                  >
-                    {loopbackDevices.map((d) => (
-                      <option key={d.id} value={d.id}>
-                        {d.is_default ? "★ " : ""}
-                        {d.name}
-                      </option>
-                    ))}
-                  </select>
+                  />
                 ) : (
                   <div className="sys-audio-chip">
                     <MonitorSpeaker size={12} />
@@ -2660,25 +2925,20 @@ export default function App() {
 
             {!isMacOs && (audioSource === "dual" || audioSource === "mix") && loopbackDevices.length > 0 && (
               <div className="row">
-                <select
-                  className="select"
-                  value={selectedLoopback ?? ""}
-                  onChange={(e) => {
-                    const id = e.target.value ? Number(e.target.value) : null;
+                <StudioSelect
+                  value={selectedLoopback !== null ? String(selectedLoopback) : ""}
+                  options={loopbackDeviceOptions}
+                  prefix="Loa:"
+                  leadingIcon={<MonitorSpeaker size={13} />}
+                  onChange={(val) => {
+                    const id = val ? Number(val) : null;
                     setSelectedLoopback(id);
                     if (status?.listening && id !== null) {
                       hotUpdateConfig({ loopback_device_id: id });
                     }
                   }}
                   title="Chọn loa Windows để bắt âm thanh hệ thống (WASAPI Loopback)"
-                >
-                  {loopbackDevices.map((d) => (
-                    <option key={d.id} value={d.id}>
-                      Loa: {d.is_default ? "★ " : ""}
-                      {d.name}
-                    </option>
-                  ))}
-                </select>
+                />
               </div>
             )}
 
@@ -2762,33 +3022,33 @@ export default function App() {
           {/* Bidirectional Source <-> Target Language Card */}
           <div className="card">
             <div className="card-title">
-              <span className="row">
-                <Globe size={12.5} /> Ngôn ngữ Nói ⇄ Dịch
+              <span className="row" style={{ gap: 5 }}>
+                <Globe size={12.5} />
+                <span>Ngôn ngữ Nói</span>
+                <ArrowLeftRight size={11} />
+                <span>Dịch</span>
               </span>
-              <span style={{ color: "var(--accent-text)", fontWeight: 700, textTransform: "none", letterSpacing: 0 }}>
-                → {currentTgtObj?.name_vi || targetLang}
+              <span className="card-target-tag">
+                <ArrowRight size={11.5} />
+                <span>{currentTgtObj?.name_vi || targetLang}</span>
               </span>
             </div>
 
             <div className="row">
-              <select
-                className="select"
-                style={{ flex: 1 }}
+              <StudioSelect
                 value={sourceLang}
-                onChange={(e) => handleSelectSourceLang(e.target.value)}
+                options={sourceLangOptions}
+                prefix="Nói:"
+                leadingIcon={<Languages size={13} />}
+                showTriggerBadge={false}
+                onChange={(val) => handleSelectSourceLang(val)}
                 title="Ngôn ngữ người nói / video YouTube"
-              >
-                {sourceLanguages.map((sl) => (
-                  <option key={sl.code} value={sl.code}>
-                    Nói: {sl.name_vi}
-                  </option>
-                ))}
-              </select>
+              />
 
               <button
                 className="btn sm active icon-only"
                 onClick={handleSwapLanguages}
-                title="Đảo chiều ngôn ngữ (ví dụ: Việt ⇄ Anh)"
+                title="Đảo chiều ngôn ngữ"
               >
                 <ArrowLeftRight size={13} />
               </button>
@@ -3012,19 +3272,19 @@ export default function App() {
                 <Zap size={12.5} /> Engine &amp; Tối ưu Họp
               </span>
               <span
+                className="engine-mode-tag"
                 style={{
-                  fontSize: 10.5,
-                  fontWeight: 700,
-                  textTransform: "none",
-                  letterSpacing: 0,
                   color: mtMode === "cloud-api" ? "var(--green-text)" : "var(--accent-text)",
                 }}
               >
-                {mtMode === "cloud-api"
-                  ? "● Đang dùng Cloud"
-                  : status?.hymt2_loaded && status?.hymt2_backend
-                  ? `● Offline • ${status.hymt2_backend.toUpperCase()}`
-                  : "● 100% Offline"}
+                <span className={`status-beacon ${mtMode === "cloud-api" ? "ok" : "live"}`} />
+                <span>
+                  {mtMode === "cloud-api"
+                    ? "Đang dùng Cloud"
+                    : status?.hymt2_loaded && status?.hymt2_backend
+                    ? `Offline • ${status.hymt2_backend.toUpperCase()}`
+                    : "100% Offline"}
+                </span>
               </span>
             </div>
 
@@ -3074,7 +3334,9 @@ export default function App() {
                 <div className="cloud-inline-strip" style={{ flexDirection: "column", alignItems: "stretch", gap: 4 }}>
                   <div className="row" style={{ justifyContent: "space-between" }}>
                     <span
+                      className="row"
                       style={{
+                        gap: 5,
                         color: activeP?.has_key && !activeP.cap_reached ? "var(--green-text)" : "var(--amber)",
                         fontWeight: 700,
                         overflow: "hidden",
@@ -3082,11 +3344,21 @@ export default function App() {
                         whiteSpace: "nowrap",
                       }}
                     >
-                      {activeP?.has_key
-                        ? activeP.cap_reached
-                          ? `⚠ Chạm hạn mức ${providerLabel}`
-                          : `● ${providerLabel}`
-                        : "⚠ Chưa nhập API Key"}
+                      {activeP?.has_key ? (
+                        activeP.cap_reached ? (
+                          <>
+                            <AlertTriangle size={12} /> Chạm hạn mức {providerLabel}
+                          </>
+                        ) : (
+                          <>
+                            <span className="status-beacon ok" /> {providerLabel}
+                          </>
+                        )
+                      ) : (
+                        <>
+                          <AlertTriangle size={12} /> Chưa nhập API Key
+                        </>
+                      )}
                     </span>
                     {activeP?.has_key && (
                       <span style={{ color: "var(--text-2)", fontFamily: "ui-monospace, monospace", fontSize: 10.5 }}>
@@ -3097,33 +3369,24 @@ export default function App() {
                   <div style={{ fontSize: 10.5, color: "var(--text-2)" }}>
                     {activeP?.has_key
                       ? "Nháp chạy Offline (0 tốn quota) • Hết hạn mức tự về Offline"
-                      : "Bấm biểu tượng bánh răng ⚙ bên trên để dán API Key"}
+                      : "Bấm nút Cài đặt bên trên để dán API Key"}
                   </div>
                 </div>
               );
             })() : (
-              <label className="field-label">
+              <div className="field-label">
                 <span>Engine Dịch Offline (MT)</span>
-                <select
-                  className="select"
+                <StudioSelect
                   value={mtMode === "auto-offline" || mtMode === "hy-mt2" || mtMode === "local-llm" ? mtMode : "auto-offline"}
-                  onChange={(e) => {
-                    const mode = e.target.value as MtModeId;
+                  options={mtOfflineOptions}
+                  onChange={(val) => {
+                    const mode = val as MtModeId;
                     setMtMode(mode);
                     if (mode !== "cloud-api") setLastOfflineMtMode(mode);
                     hotUpdateConfig({ mt_mode: mode });
                   }}
-                >
-                  <option value="auto-offline">
-                    Siêu nhẹ &amp; Sát nghĩa (EnViT5 + NLLB 202 NN • 0% GPU)
-                  </option>
-                  <option value="hy-mt2" disabled={!status?.hymt2_ready}>
-                    {status?.hymt2_ready
-                      ? "Chuyên sâu 38 NN (Hy-MT2 1.8B • Dùng GPU/RAM)"
-                      : "Chuyên sâu 38 NN (Hy-MT2 — chưa tải)"}
-                  </option>
-                  <option value="local-llm">Local LLM nâng cao (Ollama / llama.cpp)</option>
-                </select>
+                  title="Chọn chuẩn dịch máy Offline"
+                />
                 {mtMode === "auto-offline" &&
                   sourceLang !== "lao_Laoo" &&
                   targetLang !== "lao_Laoo" &&
@@ -3188,95 +3451,36 @@ export default function App() {
                       )}
                     </div>
                   )}
-              </label>
+              </div>
             )}
 
-            <label className="field-label">
+            <div className="field-label">
               <span>Nhận dạng Giọng nói (ASR)</span>
-              <select
-                className="select"
+              <StudioSelect
                 value={asrEngine}
-                onChange={(e) => {
-                  const val = e.target.value as AsrEngineId;
-                  setAsrEngine(val);
-                  hotUpdateConfig({ asr_engine: val });
+                options={asrEngineOptions}
+                onChange={(val) => {
+                  const next = val as AsrEngineId;
+                  setAsrEngine(next);
+                  hotUpdateConfig({ asr_engine: next });
                 }}
-              >
-                <option value="auto">Tự động tối ưu theo ngôn ngữ (Khuyên dùng)</option>
-                {sourceLang === "vie_Latn" && (
-                  <>
-                    <option value="zipformer-30m-streaming" disabled={!status?.zipformer_ready}>
-                      Zipformer-30M Tiếng Việt (49MB • ~30ms)
-                    </option>
-                    <option value="viet-asr">VietASR Tiếng Việt (78MB • Dấu câu/ITN)</option>
-                  </>
-                )}
-                {sourceLang === "eng_Latn" && (
-                  <>
-                    <option value="hybrid-en" disabled={!status?.moonshine_en_ready}>
-                      Hybrid-EN (Moonshine-v2 + Silero VAD • Siêu nhẹ 1.8% WER)
-                    </option>
-                    <option value="moonshine-en" disabled={!status?.moonshine_en_ready}>
-                      Moonshine-v2 Tiếng Anh (Cửa sổ trượt liên tục)
-                    </option>
-                  </>
-                )}
-                {sourceLang === "jpn_Jpan" && (
-                  <option value="moonshine-ja" disabled={!status?.moonshine_ja_ready}>
-                    Moonshine-v2 Tiếng Nhật (Streaming siêu mượt ~120ms • 0% GPU)
-                  </option>
-                )}
-                {sourceLang === "kor_Hang" && (
-                  <option value="moonshine-ko" disabled={!status?.moonshine_ko_ready}>
-                    Moonshine-v2 Tiếng Hàn (Streaming siêu mượt ~150ms • 0% GPU)
-                  </option>
-                )}
-                {ZIPFORMER_MULTI_CODES.has(sourceLang) && (
-                  <option value="zipformer-multi" disabled={!status?.zipformer_multi_ready}>
-                    Zipformer Đa ngôn ngữ (Thái, Trung, Indo, Nga, Ả Rập • ~15ms • 0% GPU)
-                  </option>
-                )}
-                {PARAKEET_EU_CODES.has(sourceLang) && (
-                  <option value="parakeet-eu" disabled={!status?.parakeet_eu_ready}>
-                    Parakeet-Ultra 25 NN Châu Âu (Pháp, Đức, TBN, Ý... • ~0.3s • 0% GPU)
-                  </option>
-                )}
-                <option value="whisper-turbo" disabled={!status?.whisper_turbo_ready}>
-                  Whisper-Turbo 99 NN (Mở rộng đa ngôn ngữ • Offline)
-                </option>
-                {status?.mac_helper_ready &&
-                  (() => {
-                    const loc = (currentSrcObj?.locale || "").toLowerCase().replace("_", "-");
-                    const pref = loc.split("-")[0] + "-";
-                    const onDev = (status?.apple_caps?.on_device_locales || []).map((x) =>
-                      x.toLowerCase().replace("_", "-")
-                    );
-                    const hasOnDev = Boolean(loc) && onDev.some((x) => x === loc || x.startsWith(pref));
-                    return hasOnDev ? (
-                      <option value="apple-native">
-                        Apple Neural Engine (macOS On-Device • ~1% CPU • 100% Offline)
-                      </option>
-                    ) : null;
-                  })()}
-              </select>
-            </label>
+                title="Chọn chuẩn nhận dạng giọng nói Offline"
+              />
+            </div>
 
-            <label className="field-label">
+            <div className="field-label">
               <span>Gom đoạn hiển thị</span>
-              <select
-                className="select"
+              <StudioSelect
                 value={paragraphMode}
-                onChange={(e) => {
-                  const val = e.target.value as ParagraphModeId;
-                  setParagraphMode(val);
-                  hotUpdateConfig({ paragraph_mode: val });
+                options={paragraphOptions}
+                onChange={(val) => {
+                  const next = val as ParagraphModeId;
+                  setParagraphMode(next);
+                  hotUpdateConfig({ paragraph_mode: next });
                 }}
-              >
-                <option value="long">Đoạn dài kiểu YouTube (3–4 câu/đoạn)</option>
-                <option value="medium">Trung bình (~2 câu/đoạn)</option>
-                <option value="short">Từng câu riêng lẻ (Phụ đề ngắn)</option>
-              </select>
-            </label>
+                title="Chọn chuẩn gom câu phụ đề"
+              />
+            </div>
 
             <label
               className="toggle-row"
@@ -3561,22 +3765,19 @@ export default function App() {
                   </span>
                 </label>
 
-                <label className="field-label">
+                <div className="field-label">
                   <span>Beam giải mã Offline</span>
-                  <select
-                    className="select"
-                    value={beamSize}
-                    onChange={(e) => {
-                      const val = Number(e.target.value);
-                      setBeamSize(val);
-                      hotUpdateConfig({ beam_size: val });
+                  <StudioSelect
+                    value={String(beamSize)}
+                    options={beamOptions}
+                    onChange={(val) => {
+                      const next = Number(val);
+                      setBeamSize(next);
+                      hotUpdateConfig({ beam_size: next });
                     }}
-                  >
-                    <option value={1}>Beam = 1 (Nhanh nhất — Real-time)</option>
-                    <option value={2}>Beam = 2 (Cân bằng)</option>
-                    <option value={3}>Beam = 3 (Chính xác cao hơn)</option>
-                  </select>
-                </label>
+                    title="Chọn kích thước Beam giải mã Offline"
+                  />
+                </div>
 
                 {mtMode === "local-llm" && (
                   <>
@@ -3607,7 +3808,7 @@ export default function App() {
                 <div className="update-footer-row">
                   <div className="row" style={{ justifyContent: "space-between", width: "100%" }}>
                     <span style={{ fontSize: 11, color: "var(--text-2)", fontWeight: 600 }}>
-                      PolyVoice Pro v{APP_VERSION}
+                      DAU Voice Pro v{APP_VERSION}
                     </span>
                     <button
                       className="btn sm"
@@ -4275,7 +4476,7 @@ export default function App() {
             <div className="modal-head qr-modal-head">
               <div className="row" style={{ gap: 12, minWidth: 0 }}>
                 <div className="brand-crest qr-crest">
-                  <img src="/school-logo.png" alt="PolyVoice Pro" />
+                  <img src="/school-logo.png" alt="DAU Voice Pro" />
                 </div>
                 <div style={{ minWidth: 0 }}>
                   <div className="modal-title qr-modal-title">
@@ -4532,20 +4733,17 @@ export default function App() {
               ) : (
                 <>
                   <div className="file-options-bar">
-                    <label className="file-opt-group">
+                    <div className="file-opt-group">
                       <span className="file-opt-label">Engine nhận dạng (ASR)</span>
-                      <select
-                        className="select file-opt-select"
+                      <StudioSelect
+                        className="file-opt-select"
+                        compact
                         value={fileAsrMode}
-                        onChange={(e) => setFileAsrMode(e.target.value as "auto" | "whisper-turbo")}
-                      >
-                        <option value="auto">Tự động tối ưu (Nhanh • VietASR / Moonshine)</option>
-                        <option value="whisper-turbo">
-                          Whisper Large-v3-Turbo (Chuẩn tạp âm / nói chen
-                          {models?.asr_whisper_turbo?.status === "ready" ? " • Sẵn sàng" : " • Cần tải 540 MB"})
-                        </option>
-                      </select>
-                    </label>
+                        options={fileAsrOptions}
+                        onChange={(val) => setFileAsrMode(val as "auto" | "whisper-turbo")}
+                        title="Chọn Engine nhận dạng cho file ghi âm"
+                      />
+                    </div>
                     <label
                       className="toggle-row file-opt-toggle"
                       title="Áp dụng bộ lọc dynaudnorm để nâng giọng nói xa micro trước khi tách VAD — tránh bỏ sót câu nhỏ"
@@ -4611,18 +4809,17 @@ export default function App() {
                       )}
                     </div>
                     <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
-                      <select
-                        className="select file-srt-select"
+                      <StudioSelect
+                        className="file-srt-select"
+                        compact
+                        showTriggerBadge={false}
                         value={fileSrtFormat}
-                        onChange={(e) =>
-                          setFileSrtFormat(e.target.value as "bilingual" | "target" | "source")
+                        options={fileSrtOptions}
+                        onChange={(val) =>
+                          setFileSrtFormat(val as "bilingual" | "target" | "source")
                         }
                         title="Chọn định dạng phụ đề .SRT"
-                      >
-                        <option value="bilingual">.SRT Song ngữ</option>
-                        <option value="target">.SRT Chỉ bản dịch</option>
-                        <option value="source">.SRT Chỉ văn bản gốc</option>
-                      </select>
+                      />
                       <button
                         className="btn primary sm"
                         onClick={() => {
@@ -5164,19 +5361,15 @@ export default function App() {
                       )}
 
                       {cloudTab === "gemini" && (
-                        <label className="field-label">
+                        <div className="field-label">
                           <span>Model Gemini</span>
-                          <select
-                            className="select"
+                          <StudioSelect
                             value={cloudModel}
-                            onChange={(e) => setCloudModel(e.target.value)}
-                          >
-                            <option value="gemini-2.5-flash">gemini-2.5-flash (Khuyên dùng • Nhanh ~0.9s, ổn định nhất)</option>
-                            <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (Flash Lite tiết kiệm nhất)</option>
-                            <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (Flash Lite thế hệ 3.5)</option>
-                            <option value="gemini-3.8-flash">gemini-3.8-flash (Flash thế hệ 3.8 mới nhất)</option>
-                          </select>
-                        </label>
+                            options={geminiModelOptions}
+                            onChange={(val) => setCloudModel(val)}
+                            title="Chọn model Google Gemini"
+                          />
+                        </div>
                       )}
 
                       <label className="field-label">
@@ -5279,7 +5472,7 @@ export default function App() {
                   <img src="/school-logo.png" alt="Logo" />
                 </div>
                 <div>
-                  <div className="modal-title">Có phiên bản mới — PolyVoice Pro v{updateInfo.version}</div>
+                  <div className="modal-title">Có phiên bản mới — DAU Voice Pro v{updateInfo.version}</div>
                   <div className="modal-sub">
                     Phiên bản hiện tại: v{APP_VERSION} • Tự động nâng cấp giữ nguyên model offline &amp; từ điển
                   </div>
@@ -5385,7 +5578,7 @@ export default function App() {
                     <div id="exit-confirm-title" className="modal-title">
                       Bạn có chắc muốn thoát chương trình?
                     </div>
-                    <div className="modal-sub">PolyVoice Pro v{APP_VERSION}</div>
+                    <div className="modal-sub">DAU Voice Pro v{APP_VERSION}</div>
                   </div>
                 </div>
                 <button

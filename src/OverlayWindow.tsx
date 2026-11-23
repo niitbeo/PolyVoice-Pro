@@ -470,10 +470,10 @@ export default function OverlayWindow() {
           >
             <div className="overlay-titlebar-left" data-tauri-drag-region>
               <div className="brand-crest sm" data-tauri-drag-region>
-                <img src="/school-logo.png" alt="PolyVoice Pro" />
+                <img src="/school-logo.png" alt="DAU Voice Pro" />
               </div>
               <span className="overlay-brand" data-tauri-drag-region>
-                <span>PolyVoice</span>
+                <span>DAU Voice</span>
                 <span className="brand-pro-tag">PRO</span>
               </span>
               <span className="overlay-modal-sub" data-tauri-drag-region>

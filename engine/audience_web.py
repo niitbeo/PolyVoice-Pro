@@ -1,5 +1,5 @@
 """
-Self-contained Offline Web Views served directly by PolyVoice Pro Local Engine (v0.8):
+Self-contained Offline Web Views served directly by DAU Voice Pro Local Engine:
 1. `/audience` — Mobile-first LAN Audience View (Wordly / Google Live Translate style).
    Attendees scan the QR code over local Wi-Fi (ZERO Internet required!) and watch
    live subtitles on their own phones, even choosing their own preferred target language!
@@ -33,7 +33,7 @@ def _load_school_logo_data_uri() -> str:
 
 _LOGO_DATA_URI = _load_school_logo_data_uri()
 _LOGO_IMG_TAG = (
-    f'<span class="crest"><img src="{_LOGO_DATA_URI}" alt="PolyVoice Pro" /></span>'
+    f'<span class="crest"><img src="{_LOGO_DATA_URI}" alt="DAU Voice Pro" /></span>'
     if _LOGO_DATA_URI
     else ""
 )
@@ -69,7 +69,7 @@ AUDIENCE_HTML = (
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
-  <title>PolyVoice Pro — Phụ Đề Hội Nghị Trực Tiếp</title>
+  <title>DAU Voice Pro — Phụ Đề Hội Nghị Trực Tiếp</title>
   __FAVICON__
   <style>
     :root, [data-theme="dark"] {
@@ -188,21 +188,20 @@ AUDIENCE_HTML = (
     .crest {
       width: 36px;
       height: 36px;
-      border-radius: 10px;
-      background: #ffffff;
-      border: 1px solid rgba(196, 0, 15, 0.28);
-      padding: 3.5px;
+      background: transparent;
+      border: none;
+      padding: 0;
       display: inline-flex;
       align-items: center;
       justify-content: center;
       flex-shrink: 0;
-      box-shadow: 0 2px 10px rgba(196, 0, 15, 0.16);
     }
     .crest img {
       width: 100%;
       height: 100%;
       object-fit: contain;
       display: block;
+      filter: drop-shadow(0 1px 4px rgba(196, 0, 15, 0.28));
     }
     .brand-meta {
       display: flex;
@@ -584,7 +583,7 @@ AUDIENCE_HTML = (
           __LOGO_IMG__
           <div class="brand-meta">
             <div class="brand-row">
-              <span>PolyVoice</span>
+              <span>DAU Voice</span>
               <span class="pro">PRO</span>
             </div>
             <div class="brand-sub">Phụ đề Hội nghị Trực tiếp</div>
@@ -910,7 +909,7 @@ OBS_HTML = (
 <html lang="vi">
 <head>
   <meta charset="utf-8" />
-  <title>PolyVoice Pro — OBS Transparent Subtitles</title>
+  <title>DAU Voice Pro — OBS Transparent Subtitles</title>
   __FAVICON__
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }

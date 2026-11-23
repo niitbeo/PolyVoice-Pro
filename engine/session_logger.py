@@ -126,7 +126,7 @@ class SessionLogger:
             self._cur_para_offset = 0
 
             header = (
-                f"=== PolyVoice Pro — Biên Bản Dịch Song Ngữ ({stamp}) ===\n"
+                f"=== DAU Voice Pro — Biên Bản Dịch Song Ngữ ({stamp}) ===\n"
                 f"Hướng dịch: {source_lang} -> {target_lang}\n"
                 f"{'=' * 64}\n\n"
             )
