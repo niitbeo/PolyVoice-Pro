@@ -59,8 +59,8 @@ PRESETS: dict[str, dict[str, list[dict[str, str]]]] = {
             {"wrong": "o k r", "correct": "OKR"},
         ],
         "term_locks": [
-            {"source": "Giám đốc điều hành", "target": "CEO"},
-            {"source": "Hiệu trưởng", "target": "Principal"},
+            {"source": "Giám đốc điều hành", "target": "CEO", "target_lang": "eng_Latn"},
+            {"source": "Hiệu trưởng", "target": "Principal", "target_lang": "eng_Latn"},
             {"source": "KPI", "target": "KPI"},
             {"source": "OKR", "target": "OKR"},
         ],
@@ -70,8 +70,8 @@ PRESETS: dict[str, dict[str, list[dict[str, str]]]] = {
             {"wrong": "bệnh viện nhà nước", "correct": "bệnh viện công lập"},
         ],
         "term_locks": [
-            {"source": "Giám đốc chuyên môn", "target": "Chief Medical Officer"},
-            {"source": "Giám đốc bệnh viện", "target": "Hospital Director"},
+            {"source": "Giám đốc chuyên môn", "target": "Chief Medical Officer", "target_lang": "eng_Latn"},
+            {"source": "Giám đốc bệnh viện", "target": "Hospital Director", "target_lang": "eng_Latn"},
         ],
     },
 }
@@ -395,7 +395,17 @@ class GlossaryManager:
                             if str(x.get("wrong", "")).strip() and str(x.get("correct", "")).strip()
                         ],
                         "term_locks": [
-                            {"source": str(x.get("source", "")).strip(), "target": str(x.get("target", "")).strip()}
+                            (
+                                {
+                                    "source": str(x.get("source", "")).strip(),
+                                    "target": str(x.get("target", "")).strip(),
+                                    **(
+                                        {"target_lang": str(x.get("target_lang", "")).strip()}
+                                        if str(x.get("target_lang", "")).strip()
+                                        else {}
+                                    ),
+                                }
+                            )
                             for x in raw.get("term_locks", [])
                             if str(x.get("source", "")).strip() and str(x.get("target", "")).strip()
                         ],
@@ -459,11 +469,17 @@ class GlossaryManager:
                     if str(x.get("wrong", "")).strip() and str(x.get("correct", "")).strip()
                 ]
             if term_locks is not None:
-                self._data["term_locks"] = [
-                    {"source": str(x.get("source", "")).strip(), "target": str(x.get("target", "")).strip()}
-                    for x in term_locks
-                    if str(x.get("source", "")).strip() and str(x.get("target", "")).strip()
-                ]
+                cleaned_locks: list[dict[str, str]] = []
+                for x in term_locks:
+                    src_s = str(x.get("source", "")).strip()
+                    tgt_s = str(x.get("target", "")).strip()
+                    if src_s and tgt_s:
+                        entry = {"source": src_s, "target": tgt_s}
+                        tl = str(x.get("target_lang", "")).strip()
+                        if tl:
+                            entry["target_lang"] = tl
+                        cleaned_locks.append(entry)
+                self._data["term_locks"] = cleaned_locks
             self._save_unlocked(self._data)
         return self.get()
 
@@ -513,8 +529,12 @@ class GlossaryManager:
         and landmarks for native LLM terminology intervention (Hy-MT2 / Gemini).
         """
         with self._lock:
-            base = list(self._data["term_locks"]) if self._data.get("enabled", True) else []
+            raw_base = list(self._data["term_locks"]) if self._data.get("enabled", True) else []
             session_snap = dict(self._session_persons)
+        base = [
+            r for r in raw_base
+            if not r.get("target_lang") or r.get("target_lang") == target_lang
+        ]
         if source_lang != "vie_Latn" or target_lang == "vie_Latn" or not text:
             return base
         persons, places = extract_vietnamese_proper_entities(text, session_persons=session_snap)
@@ -563,6 +583,9 @@ class GlossaryManager:
 
         # 1) User-configured Glossary term locks first (highest precedence)
         for rule in rules:
+            rule_tgt = rule.get("target_lang")
+            if rule_tgt and rule_tgt != target_lang:
+                continue
             pat = _word_boundary_pattern(rule["source"])
             if pat.search(masked):
                 token = f"XTerm{chr(65 + (idx % 26))}{idx}X"
@@ -612,6 +635,12 @@ class GlossaryManager:
             return translated
         out = translated
         for token, target in sorted(restore_pairs, key=lambda p: len(p[0]), reverse=True):
-            # Word-boundary case-insensitive replacement prevents accidental substring collisions
-            out = re.sub(rf"(?<!\w){re.escape(token)}(?!\w)", lambda _m, t=target: t, out, flags=re.IGNORECASE)
+            # Opaque ASCII sentinels (`XTermA0X`) often attach directly to Hangul/CJK particles
+            # (`XTermA0X는`, `XTermA0Xは`, `对于XTermC2X`) where Unicode `\w` matches non-ASCII scripts.
+            # Use ASCII-only boundaries for `XTerm...X` so restoration succeeds 100% across all scripts!
+            if token.startswith("XTerm") and token.endswith("X"):
+                pat = rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])"
+            else:
+                pat = rf"(?<!\w){re.escape(token)}(?!\w)"
+            out = re.sub(pat, lambda _m, t=target: t, out, flags=re.IGNORECASE)
         return out

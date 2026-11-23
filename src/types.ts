@@ -60,7 +60,6 @@ export interface ModelState {
 export interface ModelsStatus {
   models_dir: string;
   asr_zipformer_streaming: ModelState;
-  asr_zipformer_en_20m: ModelState;
   asr_zipformer_multi?: ModelState;
   asr_moonshine_en?: ModelState;
   asr_moonshine_ja?: ModelState;
@@ -70,9 +69,6 @@ export interface ModelsStatus {
   asr_vietasr: ModelState;
   mt_hymt2?: ModelState;
   mt_envit5: ModelState;
-  mt_nllb_13b?: ModelState;
-  mt_opus_vi_en: ModelState;
-  mt_opus_en_vi: ModelState;
   mt_nllb_600m: ModelState;
 }
 
@@ -87,7 +83,6 @@ export type AsrEngineId =
   | "apple-native"
   | "whisper-turbo"
   | "zipformer-30m-streaming"
-  | "zipformer-en-20m"
   | "zipformer-multi"
   | "viet-asr";
 export type MtModeId =
@@ -95,9 +90,7 @@ export type MtModeId =
   | "light-offline"
   | "cloud-api"
   | "hy-mt2"
-  | "opus"
   | "nllb"
-  | "nllb-1.3b"
   | "fast-online"
   | "local-llm";
 
@@ -251,7 +244,6 @@ export interface EngineStatus {
   pass2_loaded?: boolean;
   hotwords_active?: number;
   zipformer_ready: boolean;
-  zipformer_en_ready: boolean;
   zipformer_multi_ready?: boolean;
   moonshine_en_ready?: boolean;
   moonshine_ja_ready?: boolean;
@@ -263,9 +255,6 @@ export interface EngineStatus {
   hymt2_backend?: string;
   llama_server_ready?: boolean;
   envit5_ready: boolean;
-  opus_en_ready: boolean;
-  opus_en_vi_ready: boolean;
-  nllb_13b_ready?: boolean;
   nllb_loaded: boolean;
   nllb_ready: boolean;
   mac_helper_ready: boolean;

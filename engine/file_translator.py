@@ -519,14 +519,6 @@ def translate_media_file(
         if (not force_whisper) and source_lang == "eng_Latn"
         else None
     )
-    zf_en = (
-        runtime.ensure_onnx_asr_loaded("zipformer-en-20m")
-        if (not force_whisper)
-        and source_lang == "eng_Latn"
-        and en_moonshine is None
-        and runtime.model_manager.is_zipformer_en_20m_ready()
-        else None
-    )
     parakeet_eu = (
         runtime.ensure_onnx_asr_loaded("parakeet-eu", lang_code=source_lang)
         if (not force_whisper)
@@ -535,13 +527,18 @@ def translate_media_file(
         else None
     )
     whisper_asr = None
-    if force_whisper or (not use_vi_batch and en_moonshine is None and zf_en is None and parakeet_eu is None):
+    if force_whisper or (not use_vi_batch and en_moonshine is None and parakeet_eu is None):
         if runtime.model_manager.is_whisper_turbo_ready():
             whisper_asr = runtime.ensure_onnx_asr_loaded("whisper-turbo", lang_code=source_lang)
         else:
+            if source_lang in PARAKEET_EU_LANGS:
+                raise RuntimeError(
+                    "Chưa tải 'Parakeet-Ultra 25 NN Châu Âu' (~465 MB). "
+                    "Hãy mở mục 'Mô hình Offline' ở cột trái để tải Gói 3 (Châu Âu siêu tốc)."
+                )
             raise RuntimeError(
-                "Chưa tải 'Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)' (~540 MB) hoặc 'Parakeet-Ultra 25 NN Châu Âu' (~465 MB). "
-                "Hãy mở mục 'Mô hình Offline' ở cột trái để tải Gói 3."
+                "Chưa tải 'Nghe Mở rộng 99 NN (Whisper-Turbo)' (~540 MB). "
+                "Hãy mở mục 'Mô hình Offline → Chi tiết từng model' ở cột trái để tải thêm."
             )
     if cancel_event is not None and cancel_event.is_set():
         raise FileTranslateCancelled("Đã hủy dịch file.")
@@ -552,7 +549,7 @@ def translate_media_file(
         else (
             "Parakeet-Ultra 25 NN Châu Âu"
             if parakeet_eu is not None
-            else ("VietASR + Zipformer" if use_vi_batch else ("Moonshine-v2" if en_moonshine is not None else "Zipformer-EN"))
+            else ("VietASR + Zipformer" if use_vi_batch else "Moonshine-v2")
         )
     )
 
@@ -591,8 +588,7 @@ def translate_media_file(
         elif en_moonshine is not None:
             text, _ = en_moonshine.refine(seg_pcm, "")
         else:
-            assert zf_en is not None
-            text = zf_en.transcribe_pcm_isolated(seg_pcm)
+            text = ""
 
         text = runtime.glossary.apply_asr_fixes(text.strip())
         if text:

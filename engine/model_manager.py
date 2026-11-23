@@ -1,19 +1,19 @@
 """
 Model Manager — handles downloading, caching, and status reporting for local models.
 
-Models managed:
+Models managed (10 streamlined offline models, 0% PyTorch):
 1. ASR:
-   - `zipformer-30m-streaming`: hynt/Zipformer-30M-RNNT-Streaming-6000h (~51MB, Vietnamese O(1) streaming)
-   - `zipformer-en-20m`: sherpa-onnx-streaming-zipformer-en-20M-2023-02-17 (~128MB archive, English O(1) streaming)
-   - `moonshine-en`: sherpa-onnx-moonshine-base-en-quantized-2026-02-27 (~106MB, English Pass-2 refiner)
-   - `whisper-turbo`: sherpa-onnx-whisper-turbo (~538MB INT8) + Silero VAD v5 (~2.2MB) — 99-language offline ASR (TH/LO/JA/ZH/KO/KM/FR/DE...)
+   - `zipformer-30m-streaming`: hynt/Zipformer-30M-RNNT-Streaming-6000h (~49MB, Vietnamese O(1) streaming)
    - `viet-asr`: embedded 78MB INT8 Zipformer2 + Silero VAD + Punctuation/ITN (zero download)
+   - `moonshine-en`: sherpa-onnx-moonshine-base-en-quantized-2026-02-27 (~106MB, English main + Pass-2)
+   - `moonshine-ja`: sherpa-onnx-moonshine-base-ja-quantized-2026-02-27 (~99MB, Japanese Fast-Lane)
+   - `moonshine-ko`: sherpa-onnx-moonshine-tiny-ko-quantized-2026-02-27 (~47MB, Korean Fast-Lane)
+   - `zipformer-multi`: sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh (~247MB, Asian 8-lang Fast-Lane)
+   - `parakeet-eu`: sherpa-onnx-nemo-parakeet-tdt-0.6b-ultra-int8 (~465MB, 25-lang European Fast-Lane)
+   - `whisper-turbo`: sherpa-onnx-whisper-turbo (~538MB INT8) + Silero VAD v5 (~2.2MB) — optional 99-language extension
 2. MT (Translation):
    - `envit5`: luigi000/envit5-translation-ct2-int8 (~266MB, VietAI EnViT5 VI <-> EN)
-   - `opus-vi-en`: dekthedev/opus-mt-vi-en-ct2-int8 (~77MB, ultra-fast VI -> EN)
-   - `opus-en-vi`: dekthedev/opus-mt-en-vi-ct2-int8 (~77MB, ultra-fast EN -> VI)
    - `nllb-600m`: mijuanlo/nllb-200-distilled-600M-ct2-int8 (~615MB INT8, 202 x 202 languages offline)
-   - `nllb-1.3b`: JustFrederik/nllb-200-distilled-1.3B-ct2-int8 (~1.34GB INT8, 202 languages)
    - `hy-mt2`: tencent/Hy-MT2-1.8B-GGUF (~1.05GB Q4_K_M, 38 languages)
 """
 
@@ -137,12 +137,6 @@ ZIPFORMER_STREAMING_FILES = [
     "bpe.model",
 ]
 
-ZIPFORMER_EN_20M_URL = (
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
-    "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17.tar.bz2"
-)
-ZIPFORMER_EN_20M_DIRNAME = "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17"
-
 MOONSHINE_EN_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
     "sherpa-onnx-moonshine-base-en-quantized-2026-02-27.tar.bz2"
@@ -183,19 +177,15 @@ SILERO_VAD_URL = (
     "silero_vad_v5.onnx"
 )
 
-OPUS_VI_EN_REPO = "dekthedev/opus-mt-vi-en-ct2-int8"
-OPUS_EN_VI_REPO = "dekthedev/opus-mt-en-vi-ct2-int8"
 ENVIT5_REPO = "luigi000/envit5-translation-ct2-int8"
 HYMT2_REPO = "tencent/Hy-MT2-1.8B-GGUF"
 HYMT2_FILENAME = "Hy-MT2-1.8B-Q4_K_M.gguf"
-NLLB_13B_REPO = "JustFrederik/nllb-200-distilled-1.3B-ct2-int8"
 
 _DOWNLOADING_MARKER = ".downloading"
 _READY_SENTINEL = ".ready"
 
 _KNOWN_MODEL_SUBDIRS = (
     "zipformer-30m-streaming-vi",
-    ZIPFORMER_EN_20M_DIRNAME,
     MOONSHINE_EN_DIRNAME,
     MOONSHINE_JA_DIRNAME,
     MOONSHINE_KO_DIRNAME,
@@ -204,10 +194,7 @@ _KNOWN_MODEL_SUBDIRS = (
     WHISPER_TURBO_DIRNAME,
     "envit5-translation-ct2-int8",
     "nllb-200-distilled-600M-ct2-int8",
-    "nllb-200-distilled-1.3B-ct2-int8",
     "hy-mt2-1.8b-gguf",
-    "opus-mt-vi-en-ct2-int8",
-    "opus-mt-en-vi-ct2-int8",
 )
 
 
@@ -400,10 +387,6 @@ class ModelManager:
         return self.models_dir / "zipformer-30m-streaming-vi"
 
     @property
-    def zipformer_en_20m_dir(self) -> Path:
-        return self.models_dir / ZIPFORMER_EN_20M_DIRNAME
-
-    @property
     def moonshine_en_dir(self) -> Path:
         return self.models_dir / MOONSHINE_EN_DIRNAME
 
@@ -445,14 +428,6 @@ class ModelManager:
         return _file_ok(self.silero_vad_path, 500_000)
 
     @property
-    def opus_vi_en_dir(self) -> Path:
-        return self.models_dir / "opus-mt-vi-en-ct2-int8"
-
-    @property
-    def opus_en_vi_dir(self) -> Path:
-        return self.models_dir / "opus-mt-en-vi-ct2-int8"
-
-    @property
     def envit5_dir(self) -> Path:
         return self.models_dir / "envit5-translation-ct2-int8"
 
@@ -464,24 +439,8 @@ class ModelManager:
     def hy_mt2_gguf_path(self) -> Path:
         return self.hy_mt2_dir / HYMT2_FILENAME
 
-    @property
-    def nllb_13b_dir(self) -> Path:
-        return self.models_dir / "nllb-200-distilled-1.3B-ct2-int8"
-
     def is_hymt2_ready(self) -> bool:
         return _dir_not_downloading(self.hy_mt2_dir) and _file_ok(self.hy_mt2_gguf_path, 100_000_000)
-
-    def is_nllb_13b_ready(self) -> bool:
-        d = self.nllb_13b_dir
-        if not _dir_not_downloading(d):
-            return False
-        has_core = (
-            _file_ok(d / "model.bin", 100_000_000)
-            and _file_ok(d / "config.json", 20)
-            and _file_ok(d / "sentencepiece.bpe.model", 100_000)
-        )
-        has_vocab = any(_file_ok(d / f, 1000) for f in NLLB_OPTIONAL_VOCAB_FILES)
-        return has_core and has_vocab
 
     def is_nllb_ready(self) -> bool:
         d = self.nllb_600m_dir
@@ -504,17 +463,6 @@ class ModelManager:
             and _file_ok(d / ZIPFORMER_STREAMING_FILES[1], 100_000)
             and _file_ok(d / ZIPFORMER_STREAMING_FILES[2], 100_000)
             and _file_ok(d / "bpe.model", 10_000)
-            and _file_ok(d / "tokens.txt", 100)
-        )
-
-    def is_zipformer_en_20m_ready(self) -> bool:
-        d = self.zipformer_en_20m_dir
-        if not _dir_not_downloading(d):
-            return False
-        return (
-            _file_ok(d / "encoder-epoch-99-avg-1.int8.onnx", 5_000_000)
-            and _file_ok(d / "decoder-epoch-99-avg-1.int8.onnx", 100_000)
-            and _file_ok(d / "joiner-epoch-99-avg-1.int8.onnx", 100_000)
             and _file_ok(d / "tokens.txt", 100)
         )
 
@@ -597,28 +545,6 @@ class ModelManager:
     def is_whisper_turbo_ready(self) -> bool:
         return self._whisper_turbo_has_weights() and _file_ok(self.silero_vad_path, 500_000)
 
-    def is_opus_vi_en_ready(self) -> bool:
-        d = self.opus_vi_en_dir
-        if not _dir_not_downloading(d):
-            return False
-        return (
-            _file_ok(d / "model.bin", 10_000_000)
-            and _file_ok(d / "source.spm", 10_000)
-            and _file_ok(d / "target.spm", 10_000)
-            and _file_ok(d / "config.json", 20)
-        )
-
-    def is_opus_en_vi_ready(self) -> bool:
-        d = self.opus_en_vi_dir
-        if not _dir_not_downloading(d):
-            return False
-        return (
-            _file_ok(d / "model.bin", 10_000_000)
-            and _file_ok(d / "source.spm", 10_000)
-            and _file_ok(d / "target.spm", 10_000)
-            and _file_ok(d / "config.json", 20)
-        )
-
     def is_envit5_ready(self) -> bool:
         d = self.envit5_dir
         if not _dir_not_downloading(d):
@@ -653,19 +579,6 @@ class ModelManager:
                     message="Sẵn sàng (Việt Streaming 6000h ~30ms)"
                     if self.is_zipformer_streaming_ready()
                     else "Chưa tải (~51 MB)",
-                ),
-            )
-            zf_en_state = self._states.get(
-                "zipformer-en-20m",
-                DownloadState(
-                    model_id="zipformer-en-20m",
-                    status="ready" if self.is_zipformer_en_20m_ready() else "missing",
-                    progress=100.0 if self.is_zipformer_en_20m_ready() else 0.0,
-                    total_mb=128.0,
-                    downloaded_mb=128.0 if self.is_zipformer_en_20m_ready() else 0.0,
-                    message="Sẵn sàng (Anh Streaming Pass-1 ~6ms)"
-                    if self.is_zipformer_en_20m_ready()
-                    else "Chưa tải (~128 MB)",
                 ),
             )
             moonshine_en_state = self._states.get(
@@ -746,32 +659,6 @@ class ModelManager:
                     else "Chưa tải (~540 MB)",
                 ),
             )
-            opus_ve_state = self._states.get(
-                "opus-vi-en",
-                DownloadState(
-                    model_id="opus-vi-en",
-                    status="ready" if self.is_opus_vi_en_ready() else "missing",
-                    progress=100.0 if self.is_opus_vi_en_ready() else 0.0,
-                    total_mb=77.0,
-                    downloaded_mb=77.0 if self.is_opus_vi_en_ready() else 0.0,
-                    message="Sẵn sàng (Việt → Anh siêu tốc)"
-                    if self.is_opus_vi_en_ready()
-                    else "Chưa tải (~77 MB)",
-                ),
-            )
-            opus_ev_state = self._states.get(
-                "opus-en-vi",
-                DownloadState(
-                    model_id="opus-en-vi",
-                    status="ready" if self.is_opus_en_vi_ready() else "missing",
-                    progress=100.0 if self.is_opus_en_vi_ready() else 0.0,
-                    total_mb=77.0,
-                    downloaded_mb=77.0 if self.is_opus_en_vi_ready() else 0.0,
-                    message="Sẵn sàng (Anh → Việt siêu tốc)"
-                    if self.is_opus_en_vi_ready()
-                    else "Chưa tải (~77 MB)",
-                ),
-            )
             envit5_state = self._states.get(
                 "envit5",
                 DownloadState(
@@ -798,23 +685,9 @@ class ModelManager:
                     else "Chưa tải (~1.05 GB)",
                 ),
             )
-            nllb13_state = self._states.get(
-                "nllb-1.3b",
-                DownloadState(
-                    model_id="nllb-1.3b",
-                    status="ready" if self.is_nllb_13b_ready() else "missing",
-                    progress=100.0 if self.is_nllb_13b_ready() else 0.0,
-                    total_mb=1341.0,
-                    downloaded_mb=1341.0 if self.is_nllb_13b_ready() else 0.0,
-                    message="Sẵn sàng (NLLB-200 1.3B • Chuẩn cao Lào / Thái / 202 NN)"
-                    if self.is_nllb_13b_ready()
-                    else "Chưa tải (~1.34 GB)",
-                ),
-            )
             return {
                 "models_dir": str(self.models_dir),
                 "asr_zipformer_streaming": asdict(zf_state),
-                "asr_zipformer_en_20m": asdict(zf_en_state),
                 "asr_moonshine_en": asdict(moonshine_en_state),
                 "asr_moonshine_ja": asdict(moonshine_ja_state),
                 "asr_moonshine_ko": asdict(moonshine_ko_state),
@@ -831,9 +704,6 @@ class ModelManager:
                 },
                 "mt_hymt2": asdict(hymt2_state),
                 "mt_envit5": asdict(envit5_state),
-                "mt_nllb_13b": asdict(nllb13_state),
-                "mt_opus_vi_en": asdict(opus_ve_state),
-                "mt_opus_en_vi": asdict(opus_ev_state),
                 "mt_nllb_600m": asdict(nllb_state),
             }
 
@@ -1187,22 +1057,6 @@ class ModelManager:
             self._update_state("zipformer-30m-streaming", on_progress, status="error", message=f"Lỗi tải: {exc}")
             raise
 
-    def ensure_zipformer_en_20m(self, on_progress: Optional[Callable[[dict], None]] = None) -> Path:
-        if self.is_zipformer_en_20m_ready():
-            self._update_state("zipformer-en-20m", on_progress, status="ready", progress=100.0)
-            return self.zipformer_en_20m_dir
-
-        return self._download_and_extract_tar_bz2(
-            model_id="zipformer-en-20m",
-            url=ZIPFORMER_EN_20M_URL,
-            dirname=ZIPFORMER_EN_20M_DIRNAME,
-            dest_dir=self.zipformer_en_20m_dir,
-            expected_mb=128.0,
-            start_msg="Đang tải Zipformer-20M Tiếng Anh Streaming (~128 MB)...",
-            ready_msg="Sẵn sàng (Anh Streaming Pass-1 ~6ms)",
-            on_progress=on_progress,
-        )
-
     def ensure_moonshine_en(self, on_progress: Optional[Callable[[dict], None]] = None) -> Path:
         if self.is_moonshine_en_ready():
             self._update_state("moonshine-en", on_progress, status="ready", progress=100.0)
@@ -1371,63 +1225,6 @@ class ModelManager:
             extra_files=[("silero_vad_v5.onnx", SILERO_VAD_URL, 2_313_101)],
         )
 
-    def ensure_opus(self, direction: str, on_progress: Optional[Callable[[dict], None]] = None) -> Path:
-        if direction == "en-vi":
-            model_id, repo_id, target_dir, ready = (
-                "opus-en-vi",
-                OPUS_EN_VI_REPO,
-                self.opus_en_vi_dir,
-                self.is_opus_en_vi_ready(),
-            )
-            label = "Anh → Việt"
-        else:
-            model_id, repo_id, target_dir, ready = (
-                "opus-vi-en",
-                OPUS_VI_EN_REPO,
-                self.opus_vi_en_dir,
-                self.is_opus_vi_en_ready(),
-            )
-            label = "Việt → Anh"
-
-        if ready:
-            self._update_state(model_id, on_progress, status="ready", progress=100.0)
-            return target_dir
-
-        _mark_downloading(target_dir)
-        self._update_state(
-            model_id,
-            on_progress,
-            status="downloading",
-            progress=2.0,
-            downloaded_mb=0.0,
-            total_mb=77.0,
-            message=f"Đang tải Opus-MT {label} INT8 (~77 MB)...",
-        )
-        try:
-            with self._make_http_client() as client:
-                avail = _hf_list_files(client, repo_id)
-            wanted = [
-                (repo_id, fn, avail.get(fn, 0))
-                for fn in avail
-                if fn.endswith((".bin", ".spm", ".json", ".txt")) and not fn.startswith(".")
-            ]
-            got_mb = self._download_hf_files(model_id, wanted, target_dir, 77.0, on_progress=on_progress)
-            _mark_ready(target_dir)
-            self._update_state(
-                model_id,
-                on_progress,
-                status="ready",
-                progress=100.0,
-                downloaded_mb=got_mb or 77.0,
-                total_mb=got_mb or 77.0,
-                message=f"Sẵn sàng ({label} siêu tốc)",
-            )
-            return target_dir
-        except Exception as exc:
-            _clear_downloading(target_dir)
-            self._update_state(model_id, on_progress, status="error", message=f"Lỗi tải: {exc}")
-            raise
-
     def ensure_envit5(self, on_progress: Optional[Callable[[dict], None]] = None) -> Path:
         if self.is_envit5_ready():
             self._update_state("envit5", on_progress, status="ready", progress=100.0)
@@ -1571,57 +1368,11 @@ class ModelManager:
             self._update_state("hy-mt2", on_progress, status="error", message=f"Lỗi tải Hy-MT2-1.8B: {exc}")
             raise
 
-    def ensure_nllb_13b(self, on_progress: Optional[Callable[[dict], None]] = None) -> Path:
-        if self.is_nllb_13b_ready():
-            self._update_state("nllb-1.3b", on_progress, status="ready", progress=100.0)
-            return self.nllb_13b_dir
-
-        _mark_downloading(self.nllb_13b_dir)
-        self._update_state(
-            "nllb-1.3b",
-            on_progress,
-            status="downloading",
-            progress=2.0,
-            downloaded_mb=0.0,
-            total_mb=1341.0,
-            message="Đang tải NLLB-200 1.3B INT8 (~1.34 GB — Chuẩn cao Lào / Thái / 202 NN)...",
-        )
-        try:
-            with self._make_http_client() as client:
-                available = _hf_list_files(client, NLLB_13B_REPO)
-            wanted_names = [f for f in NLLB_REQUIRED_FILES if f in available]
-            for vf in NLLB_OPTIONAL_VOCAB_FILES:
-                if vf in available:
-                    wanted_names.append(vf)
-                    break
-            file_specs = [(NLLB_13B_REPO, fn, available.get(fn, 0)) for fn in wanted_names]
-            got_mb = self._download_hf_files(
-                "nllb-1.3b", file_specs, self.nllb_13b_dir, 1341.0, on_progress=on_progress
-            )
-            _mark_ready(self.nllb_13b_dir)
-            self._update_state(
-                "nllb-1.3b",
-                on_progress,
-                status="ready",
-                progress=100.0,
-                downloaded_mb=got_mb or 1341.0,
-                total_mb=got_mb or 1341.0,
-                message="Sẵn sàng (NLLB-200 1.3B • Chuẩn cao Lào / Thái / 202 NN)",
-            )
-            return self.nllb_13b_dir
-        except Exception as exc:
-            _clear_downloading(self.nllb_13b_dir)
-            self._update_state("nllb-1.3b", on_progress, status="error", message=f"Lỗi tải NLLB-200 1.3B: {exc}")
-            raise
-
     def delete_model(self, model_id: str) -> dict:
         """Delete an optional/redundant local model directory to free disk space cleanly."""
         target_map = {
             "hy-mt2": self.hy_mt2_dir,
-            "nllb-1.3b": self.nllb_13b_dir,
             "nllb-600m": self.nllb_600m_dir,
-            "opus-vi-en": self.opus_vi_en_dir,
-            "opus-en-vi": self.opus_en_vi_dir,
             "envit5": self.envit5_dir,
             "whisper-turbo": self.whisper_turbo_dir,
             "parakeet-eu": self.parakeet_eu_dir,
@@ -1629,12 +1380,20 @@ class ModelManager:
             "moonshine-ja": self.moonshine_ja_dir,
             "moonshine-ko": self.moonshine_ko_dir,
             "zipformer-multi": self.zipformer_multi_dir,
-            "zipformer-en-20m": self.zipformer_en_20m_dir,
             "zipformer-30m-streaming": self.zipformer_streaming_dir,
         }
         target_dir = target_map.get(model_id)
         if target_dir is None:
             raise ValueError(f"Unsupported model_id: {model_id}")
+
+        # Preserve shared Silero VAD v5 before removing an ASR folder (e.g. deleting whisper-turbo)
+        vad_in_target = target_dir / "silero_vad_v5.onnx"
+        shared_vad = self.models_dir / "silero_vad_v5.onnx"
+        if _file_ok(vad_in_target, 500_000) and not _file_ok(shared_vad, 500_000):
+            try:
+                shutil.copy2(vad_in_target, shared_vad)
+            except OSError:
+                pass
 
         freed_bytes = 0
         if target_dir.exists():

@@ -93,7 +93,6 @@ from asr_engine import (
     VietASRBatchRefiner,
     VietASRStreamingEngine,
     WhisperTurboStreamingEngine,
-    ZipformerStreamingEnEngine,
     ZipformerStreamingMultiEngine,
     ZipformerStreamingViEngine,
     restore_vietnamese_casing,
@@ -133,7 +132,6 @@ from translator import (
     HyMT2Translator,
     LocalLLMTranslator,
     NLLBTranslator,
-    OpusMTTranslator,
     TranslationResult,
     evaluate_translations_with_gemini,
     evaluate_translations_with_google_cloud,
@@ -179,8 +177,8 @@ class SessionConfig:
     auto_gain: bool = False            # Broadcast AGC + soft limiter
     source_lang: str = "vie_Latn"
     target_lang: str = "eng_Latn"
-    asr_engine: str = "auto"           # "auto" | "apple-native" | "zipformer-30m-streaming" | "zipformer-en-20m" | "viet-asr"
-    mt_mode: str = "auto-offline"      # "auto-offline" | "hy-mt2" | "opus" | "nllb" | "fast-online" | "local-llm"
+    asr_engine: str = "auto"           # "auto" | "apple-native" | "zipformer-30m-streaming" | "moonshine-en" | "parakeet-eu" | "whisper-turbo" | "viet-asr"
+    mt_mode: str = "auto-offline"      # "auto-offline" | "hy-mt2" | "nllb" | "fast-online" | "cloud-api" | "local-llm"
     paragraph_mode: str = "long"       # "short" | "medium" | "long"
     translate_partials: bool = True
     pass2_refine: bool = True          # 2-Pass Vietnamese refinement (punctuation + ITN + error fix)
@@ -314,6 +312,8 @@ _VI_REDUPLICATIVE_KEEP = frozenset({
     "gọn", "đẹp", "tốt", "hay", "đúng", "sai", "đủ", "nhiều", "ít", "sớm",
     "muộn", "trước", "sau", "trên", "dưới", "trong", "ngoài", "quanh", "đi",
     "lại", "lên", "xuống", "ra", "vào", "qua", "về",
+    "mơ", "màng", "lờ", "mờ", "rập", "rình", "lác", "đác", "lẻ", "tẻ",
+    "rộn", "ràng", "vội", "vã", "thấp", "thoáng", "lập", "lòe",
 })
 
 
@@ -508,7 +508,6 @@ class EngineRuntime:
         self._ws_lock = asyncio.Lock()
 
         self._asr_zf_vi: Optional[ZipformerStreamingViEngine] = None
-        self._asr_zf_en: Optional[ZipformerStreamingEnEngine] = None
         self._asr_hybrid_en: Optional[HybridEnStreamingEngine] = None
         self._asr_hybrid_en_remote: Optional[HybridEnStreamingEngine] = None
         self._asr_moonshine_en: Optional[MoonshineEnStreamingEngine] = None
@@ -529,9 +528,6 @@ class EngineRuntime:
         self._hymt2: Optional[HyMT2Translator] = None
         self._hymt2_idle_timer: Optional[threading.Timer] = None
         self._envit5: Optional[EnViT5Translator] = None
-        self._opus_ve: Optional[OpusMTTranslator] = None
-        self._opus_ev: Optional[OpusMTTranslator] = None
-        self._nllb_13b: Optional[NLLBTranslator] = None
         self._nllb: Optional[NLLBTranslator] = None
         self._fast_online = FastOnlineTranslator()
         self._google_cloud: Optional[GoogleCloudTranslator] = None
@@ -865,14 +861,9 @@ class EngineRuntime:
                 else:
                     self.ensure_onnx_asr_loaded("viet-asr")
                 # Lazy-load strategy: warm up primary VI<->EN model (EnViT5) only.
-                # Do NOT preload 615 MB NLLB-200 or unused Opus models at startup (saves ~800 MB RAM!).
+                # Do NOT preload 615 MB NLLB-200 at startup (saves ~800 MB RAM!).
                 if self.model_manager.is_envit5_ready():
                     self.ensure_envit5_loaded()
-                else:
-                    if self.model_manager.is_opus_vi_en_ready():
-                        self.ensure_opus_loaded("vi-en")
-                    if self.model_manager.is_opus_en_vi_ready():
-                        self.ensure_opus_loaded("en-vi")
                 self.broadcast_threadsafe({"type": "status", "data": self.get_status_payload()})
             except Exception as exc:
                 self._boot_error = str(exc)
@@ -1008,13 +999,6 @@ class EngineRuntime:
                         self._asr_moonshine_ko = slot
                 return slot
 
-            if engine_name == "zipformer-en-20m":
-                if self._asr_zf_en is None:
-                    if not self.model_manager.is_zipformer_en_20m_ready():
-                        raise RuntimeError("Model tiếng Anh Zipformer-20M chưa được tải. Hãy bấm tải hoặc chọn Apple Neural Engine.")
-                    self._asr_zf_en = ZipformerStreamingEnEngine(self.model_manager.zipformer_en_20m_dir)
-                return self._asr_zf_en
-
             if engine_name == "zipformer-multi":
                 if not self.model_manager.is_zipformer_multi_ready():
                     raise RuntimeError("Model Zipformer Streaming Đa ngôn ngữ (Thái/Trung/Indo) chưa được tải (~247 MB).")
@@ -1107,49 +1091,8 @@ class EngineRuntime:
                 )
             return self._envit5
 
-    def ensure_opus_loaded(self, direction: str) -> Optional[OpusMTTranslator]:
-        with self._model_lock:
-            if direction == "vi-en":
-                if self._opus_ve is None and self.model_manager.is_opus_vi_en_ready():
-                    self._opus_ve = OpusMTTranslator(
-                        self.model_manager.opus_vi_en_dir, "vie_Latn", "eng_Latn", "opus-mt-vi-en", intra_threads=2
-                    )
-                return self._opus_ve
-            if direction == "en-vi":
-                if self._opus_ev is None and self.model_manager.is_opus_en_vi_ready():
-                    self._opus_ev = OpusMTTranslator(
-                        self.model_manager.opus_en_vi_dir,
-                        "eng_Latn",
-                        "vie_Latn",
-                        "opus-mt-en-vi",
-                        src_prefix=">>vie<<",
-                        intra_threads=2,
-                    )
-                return self._opus_ev
-            return None
-
-    def ensure_nllb_13b_loaded(self) -> Optional[NLLBTranslator]:
-        with self._model_lock:
-            if self._nllb_13b is None and self.model_manager.is_nllb_13b_ready():
-                self._nllb_13b = NLLBTranslator(
-                    self.model_manager.nllb_13b_dir,
-                    device="cpu",
-                    intra_threads=_adaptive_mt_threads(),
-                    engine_name="nllb-200-1.3b-int8",
-                )
-            return self._nllb_13b
-
-    def ensure_nllb_loaded(self, prefer_13b: bool = False) -> NLLBTranslator:
-        """
-        Empirical YouTube Audit Result (v0.7):
-        NLLB-200-600M is 2x faster (1.22s vs 2.38s), uses 750 MB less RAM (1.21 GB vs 1.95 GB),
-        AND scores higher on Lao fidelity (55.47 vs 52.50 BackTrans-chrF) than NLLB-1.3B!
-        So default prefers NLLB-600M, while `prefer_13b=True` (explicit `nllb-1.3b` mode) uses 1.3B.
-        """
-        if prefer_13b:
-            n13 = self.ensure_nllb_13b_loaded()
-            if n13 is not None:
-                return n13
+    def ensure_nllb_loaded(self) -> NLLBTranslator:
+        """Load lightweight CPU NLLB-200-600M INT8 for all 202 x 202 languages."""
         with self._model_lock:
             if self._nllb is None and self.model_manager.is_nllb_ready():
                 self._nllb = NLLBTranslator(
@@ -1160,11 +1103,8 @@ class EngineRuntime:
                 )
             if self._nllb is not None:
                 return self._nllb
-        n13 = self.ensure_nllb_13b_loaded()
-        if n13 is not None:
-            return n13
         raise RuntimeError(
-            "Chưa tải mô hình dịch Offline trên máy. Hãy bấm 'Tải bộ mô hình lõi' trong mục Mô hình Offline hoặc chuyển sang Cloud API."
+            "Chưa tải mô hình dịch Offline trên máy. Hãy bấm 'Tải Gói 1' trong mục Mô hình Offline hoặc chuyển sang Cloud API."
         )
 
     def get_llm_translator(self, url: str, model: str, api_key: str) -> LocalLLMTranslator:
@@ -1434,25 +1374,17 @@ class EngineRuntime:
                 pass
 
         # 3) VietAI EnViT5 (Ultra-light, faithful VI <-> EN, 266 MB INT8, 0% GPU)
-        if mt_mode in ("auto-offline", "light-offline", "cloud-api", "hy-mt2", "fast-online", "local-llm") and is_vi_en_pair:
+        # Gracefully accept retired "opus" / "nllb-1.3b" values from older client configs
+        eff_mt_mode = "auto-offline" if mt_mode == "opus" else ("nllb" if mt_mode == "nllb-1.3b" else mt_mode)
+        if eff_mt_mode in ("auto-offline", "light-offline", "cloud-api", "hy-mt2", "fast-online", "local-llm") and is_vi_en_pair:
             envit5 = self.ensure_envit5_loaded()
             if envit5 is not None:
                 return _finish(
                     envit5.translate(masked, source_lang, target_lang, beam_size=eff_beam, is_draft=is_draft)
                 )
 
-        if mt_mode in ("opus", "auto-offline", "light-offline", "cloud-api", "hy-mt2", "fast-online", "local-llm") and is_vi_en_pair:
-            if source_lang == "vie_Latn" and target_lang == "eng_Latn":
-                opus = self.ensure_opus_loaded("vi-en")
-                if opus is not None:
-                    return _finish(opus.translate(masked, beam_size=eff_beam))
-            elif source_lang == "eng_Latn" and target_lang == "vie_Latn":
-                opus = self.ensure_opus_loaded("en-vi")
-                if opus is not None:
-                    return _finish(opus.translate(masked, beam_size=eff_beam))
-
-        # 4) Offline NLLB-200 (prefers 600M INT8 — 0% GPU, faithful beam=2 for finals across all 202 langs)
-        nllb = self.ensure_nllb_loaded(prefer_13b=(mt_mode == "nllb-1.3b"))
+        # 4) Offline NLLB-200-600M INT8 (0% GPU, faithful beam=2 for finals across all 202 langs)
+        nllb = self.ensure_nllb_loaded()
         return _finish(nllb.translate(masked, source_lang, target_lang, beam_size=eff_beam))
 
     def _is_asr_model_ready(self, model_id: str) -> bool:
@@ -1476,7 +1408,7 @@ class EngineRuntime:
         """Return declarative 3-tier readiness metadata for any source language."""
         prof = get_source_asr_profile(lang_code)
         pref_ready = self._is_asr_model_ready(prof.preferred_model)
-        # Vietnamese also has built-in viet-asr; English can fall back to zipformer-en-20m
+        # Vietnamese also has built-in viet-asr
         if lang_code == "vie_Latn":
             pref_ready = pref_ready or True
         fallback_ready = self._is_asr_model_ready(prof.fallback_model)
@@ -1484,9 +1416,6 @@ class EngineRuntime:
 
         if pref_ready:
             active_tier = prof.asr_tier
-            ready = True
-        elif lang_code == "eng_Latn" and self.model_manager.is_zipformer_en_20m_ready():
-            active_tier = "fast"
             ready = True
         elif fallback_ready:
             active_tier = "experimental" if prof.asr_tier == "experimental" else "universal"
@@ -1514,6 +1443,8 @@ class EngineRuntime:
 
     def _resolve_asr_choice_for_lang(self, lang_code: str, forced_engine: str = "auto") -> str:
         """Pick optimal ASR backend via 3-tier declarative registry: Fast-Lane -> Universal 99 NN -> OS Native."""
+        if forced_engine == "zipformer-en-20m":
+            forced_engine = "auto"
         if forced_engine != "auto":
             return forced_engine
 
@@ -1526,8 +1457,6 @@ class EngineRuntime:
         if lang_code == "eng_Latn":
             if self.model_manager.is_moonshine_en_ready() and self.model_manager.is_silero_vad_ready():
                 return "hybrid-en"
-            if self.model_manager.is_zipformer_en_20m_ready():
-                return "zipformer-en-20m"
             if self.model_manager.is_moonshine_en_ready():
                 return "moonshine-en"
         elif prof.preferred_model != "whisper-turbo" and self._is_asr_model_ready(prof.preferred_model):
@@ -1570,11 +1499,10 @@ class EngineRuntime:
             "listening": self._listening,
             "active_asr_label": self._active_asr_label,
             "remote_asr_label": self._remote_asr_label,
-            "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_en is not None) or (self._asr_zf_multi is not None) or (self._asr_hybrid_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_moonshine_ja is not None) or (self._asr_moonshine_ko is not None) or (self._asr_parakeet_eu is not None) or (self._asr_whisper is not None),
+            "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_multi is not None) or (self._asr_hybrid_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_moonshine_ja is not None) or (self._asr_moonshine_ko is not None) or (self._asr_parakeet_eu is not None) or (self._asr_whisper is not None),
             "pass2_loaded": self._pass2_refiner is not None,
             "hotwords_active": self._asr_zf_vi._hotwords_count if self._asr_zf_vi is not None else 0,
             "zipformer_ready": self.model_manager.is_zipformer_streaming_ready(),
-            "zipformer_en_ready": self.model_manager.is_zipformer_en_20m_ready(),
             "zipformer_multi_ready": self.model_manager.is_zipformer_multi_ready(),
             "moonshine_en_ready": self.model_manager.is_moonshine_en_ready(),
             "moonshine_ja_ready": self.model_manager.is_moonshine_ja_ready(),
@@ -1586,11 +1514,8 @@ class EngineRuntime:
             "hymt2_backend": self._hymt2.active_backend if (self._hymt2 is not None and self._hymt2.is_running) else "",
             "llama_server_ready": self._llama_server_ready,
             "envit5_ready": self.model_manager.is_envit5_ready(),
-            "opus_en_ready": self.model_manager.is_opus_vi_en_ready(),
-            "opus_en_vi_ready": self.model_manager.is_opus_en_vi_ready(),
-            "nllb_13b_ready": self.model_manager.is_nllb_13b_ready(),
-            "nllb_loaded": (self._nllb is not None) or (self._nllb_13b is not None),
-            "nllb_ready": self.model_manager.is_nllb_ready() or self.model_manager.is_nllb_13b_ready(),
+            "nllb_loaded": self._nllb is not None,
+            "nllb_ready": self.model_manager.is_nllb_ready(),
             "mac_helper_ready": self.mac_helper is not None,
             "system_audio_ready": (self.mac_helper is not None) or has_windows_loopback(),
             "apple_caps": self.apple_caps,
@@ -1622,16 +1547,10 @@ class EngineRuntime:
                 except Exception:
                     pass
                 self._hymt2 = None
-            elif model_id == "nllb-1.3b":
-                self._nllb_13b = None
             elif model_id == "nllb-600m":
                 self._nllb = None
             elif model_id == "envit5":
                 self._envit5 = None
-            elif model_id == "opus-vi-en":
-                self._opus_ve = None
-            elif model_id == "opus-en-vi":
-                self._opus_ev = None
             elif model_id == "moonshine-en":
                 self._en_pass2_refiner = None
                 self._asr_hybrid_en = None
@@ -1663,10 +1582,6 @@ class EngineRuntime:
                 self._asr_hybrid_en_remote = None
             elif model_id == "zipformer-30m-streaming":
                 self._asr_zf_vi = None
-            elif model_id == "zipformer-en-20m":
-                self._asr_zf_en = None
-                self._asr_hybrid_en = None
-                self._asr_hybrid_en_remote = None
             elif model_id == "viet-asr":
                 self._asr_viet = None
                 self._pass2_refiner = None
@@ -1711,16 +1626,11 @@ class EngineRuntime:
             try:
                 if model_id == "nllb-600m":
                     self.model_manager.ensure_nllb_600m(on_progress=_on_progress)
-                elif model_id == "nllb-1.3b":
-                    self.model_manager.ensure_nllb_13b(on_progress=_on_progress)
                 elif model_id == "hy-mt2":
                     self.model_manager.ensure_hymt2(on_progress=_on_progress)
                 elif model_id == "zipformer-30m-streaming":
                     self.model_manager.ensure_zipformer_streaming(on_progress=_on_progress)
                     _try_warm_load(lambda: self.ensure_onnx_asr_loaded("zipformer-30m-streaming"))
-                elif model_id == "zipformer-en-20m":
-                    self.model_manager.ensure_zipformer_en_20m(on_progress=_on_progress)
-                    _try_warm_load(lambda: self.ensure_onnx_asr_loaded("zipformer-en-20m"))
                 elif model_id == "moonshine-en":
                     self.model_manager.ensure_moonshine_en(on_progress=_on_progress)
                     _try_warm_load(self.ensure_en_pass2_refiner)
@@ -1734,12 +1644,6 @@ class EngineRuntime:
                     self.model_manager.ensure_parakeet_eu(on_progress=_on_progress)
                 elif model_id == "whisper-turbo":
                     self.model_manager.ensure_whisper_turbo(on_progress=_on_progress)
-                elif model_id == "opus-vi-en":
-                    self.model_manager.ensure_opus("vi-en", on_progress=_on_progress)
-                    _try_warm_load(lambda: self.ensure_opus_loaded("vi-en"))
-                elif model_id == "opus-en-vi":
-                    self.model_manager.ensure_opus("en-vi", on_progress=_on_progress)
-                    _try_warm_load(lambda: self.ensure_opus_loaded("en-vi"))
                 elif model_id == "envit5":
                     self.model_manager.ensure_envit5(on_progress=_on_progress)
                     _try_warm_load(self.ensure_envit5_loaded)
@@ -1820,17 +1724,8 @@ class EngineRuntime:
             if "nllb-600m" not in keep_mt and self._nllb is not None:
                 self._nllb = None
                 released = True
-            if "nllb-1.3b" not in keep_mt and self._nllb_13b is not None:
-                self._nllb_13b = None
-                released = True
             if "envit5" not in keep_mt and self._envit5 is not None:
                 self._envit5 = None
-                released = True
-            if "opus-vi-en" not in keep_mt and self._opus_ve is not None:
-                self._opus_ve = None
-                released = True
-            if "opus-en-vi" not in keep_mt and self._opus_ev is not None:
-                self._opus_ev = None
                 released = True
 
             if "whisper-turbo" not in keep_asr:
@@ -1858,9 +1753,6 @@ class EngineRuntime:
                 self._pass2_refiner = None
                 released = True
 
-            if "zipformer-en-20m" not in keep_asr and self._asr_zf_en is not None:
-                self._asr_zf_en = None
-                released = True
             if "hybrid-en" not in keep_asr:
                 if self._asr_hybrid_en is not None or self._asr_hybrid_en_remote is not None:
                     self._asr_hybrid_en = None
@@ -1912,8 +1804,8 @@ class EngineRuntime:
             auto_gain=bool(req.auto_gain),
             source_lang=req.source_lang,
             target_lang=req.target_lang,
-            asr_engine=req.asr_engine,
-            mt_mode=req.mt_mode,
+            asr_engine="auto" if req.asr_engine == "zipformer-en-20m" else req.asr_engine,
+            mt_mode="auto-offline" if req.mt_mode == "opus" else ("nllb" if req.mt_mode == "nllb-1.3b" else req.mt_mode),
             paragraph_mode=req.paragraph_mode if req.paragraph_mode in ("short", "medium", "long") else "long",
             translate_partials=req.translate_partials,
             pass2_refine=req.pass2_refine,
@@ -1934,8 +1826,6 @@ class EngineRuntime:
                 and self.model_manager.is_silero_vad_ready()
             ):
                 chosen_asr = "hybrid-en"
-            elif self.config.source_lang == "eng_Latn" and self.model_manager.is_zipformer_en_20m_ready():
-                chosen_asr = "zipformer-en-20m"
             elif self.config.source_lang == "eng_Latn" and self.model_manager.is_moonshine_en_ready():
                 chosen_asr = "moonshine-en"
             elif self.model_manager.is_whisper_turbo_ready():
@@ -1959,25 +1849,20 @@ class EngineRuntime:
             except Exception:
                 pass
         keep_mt: set[str] = set()
-        if is_vi_en_pair and self.config.mt_mode not in ("opus", "nllb", "nllb-1.3b") and self.model_manager.is_envit5_ready():
+        if is_vi_en_pair and self.config.mt_mode != "nllb" and self.model_manager.is_envit5_ready():
             keep_mt.add("envit5")
-        elif is_vi_en_pair and (self.config.mt_mode == "opus" or not self.model_manager.is_envit5_ready()):
-            if self.config.source_lang == "vie_Latn" or self.config.audio_source == "dual":
-                keep_mt.add("opus-vi-en")
-            if self.config.source_lang == "eng_Latn" or self.config.audio_source == "dual":
-                keep_mt.add("opus-en-vi")
         if want_hymt2:
             keep_mt.add("hy-mt2")
         else:
             need_nllb = (
                 self.config.source_lang != self.config.target_lang
                 and (
-                    self.config.mt_mode in ("nllb", "nllb-1.3b")
-                    or (not is_vi_en_pair and self.config.mt_mode in ("auto-offline", "light-offline", "hy-mt2", "opus", "cloud-api"))
+                    self.config.mt_mode == "nllb"
+                    or (not is_vi_en_pair and self.config.mt_mode in ("auto-offline", "light-offline", "hy-mt2", "cloud-api"))
                 )
             )
             if need_nllb:
-                keep_mt.add("nllb-1.3b" if self.config.mt_mode == "nllb-1.3b" else "nllb-600m")
+                keep_mt.add("nllb-600m")
 
         keep_pass2: set[str] = set()
         need_vi_pass2 = self.config.pass2_refine and (
@@ -2003,10 +1888,6 @@ class EngineRuntime:
 
         if "envit5" in keep_mt:
             self.ensure_envit5_loaded()
-        if "opus-vi-en" in keep_mt and self.model_manager.is_opus_vi_en_ready():
-            self.ensure_opus_loaded("vi-en")
-        if "opus-en-vi" in keep_mt and self.model_manager.is_opus_en_vi_ready():
-            self.ensure_opus_loaded("en-vi")
 
         if want_hymt2:
             # Pre-warm Hy-MT2 llama-server in background ONLY when explicitly selected
@@ -2015,10 +1896,8 @@ class EngineRuntime:
                 daemon=True,
                 name="hymt2-warmup",
             ).start()
-        elif ("nllb-600m" in keep_mt or "nllb-1.3b" in keep_mt) and (
-            self.model_manager.is_nllb_13b_ready() or self.model_manager.is_nllb_ready()
-        ):
-            self.ensure_nllb_loaded(prefer_13b=("nllb-1.3b" in keep_mt))
+        elif "nllb-600m" in keep_mt and self.model_manager.is_nllb_ready():
+            self.ensure_nllb_loaded()
 
         if need_vi_pass2:
             self.ensure_pass2_refiner()
@@ -2335,7 +2214,6 @@ class EngineRuntime:
             self._en_pass2_refiner = None
             self._asr_viet = None
             self._asr_zf_vi = None
-            self._asr_zf_en = None
             self._asr_hybrid_en = None
             self._asr_hybrid_en_remote = None
             self._asr_moonshine_en = None
@@ -3025,20 +2903,23 @@ class EngineRuntime:
         else:
             full_text = raw_text
 
-        # Snapshot exact paragraph PCM for Pass-2 refinement when boundaries are clean
+        # Snapshot paragraph PCM for Pass-2 VietASR punctuation/ITN refinement:
+        # `_merge_pass2_punct_and_itn` aligns strictly onto Pass-1 `full_text` and ignores
+        # extra trailing words, so Pass-2 is safe even when `carry_tail` starts the next turn!
+        # Keep the last ~1.8s (18 chunks) of audio for the carried-over start of the next paragraph.
         pcm_snapshot: Optional[np.ndarray] = None
-        if (
-            self._para_pcm_chunks
-            and not carry_tail
-            and not self._para_has_carry_prefix
-            and not self._para_pcm_truncated
-        ):
+        carry_pcm_tail: list[np.ndarray] = []
+        if self._para_pcm_chunks and not self._para_pcm_truncated:
             try:
                 pcm_snapshot = np.concatenate(self._para_pcm_chunks)
             except Exception:
                 pcm_snapshot = None
+            if carry_tail:
+                carry_pcm_tail = list(self._para_pcm_chunks[-18:])
 
         self._para_pcm_chunks.clear()
+        if carry_pcm_tail:
+            self._para_pcm_chunks.extend(carry_pcm_tail)
         self._para_pcm_truncated = False
         self._para_has_active_partial = False
         self._para_has_carry_prefix = bool(carry_tail)
@@ -3196,6 +3077,12 @@ class EngineRuntime:
                     and len(combined.strip()) <= 6
                     and not combined.strip().endswith(("。", "！", "？", ".", "!", "?", "…"))
                 )
+                is_short_ko = (
+                    out.provider == "moonshine-v2-ko"
+                    and not is_stop_flush
+                    and wc < 4
+                    and not combined.rstrip().endswith((".", "!", "?", "…"))
+                )
                 is_incomplete_en = (
                     out.provider == "hybrid-en-vad-moonshine"
                     and not is_stop_flush
@@ -3204,7 +3091,8 @@ class EngineRuntime:
                     and (self._ends_with_connector(combined) or self._ends_with_open_en_modifier(combined))
                 )
                 is_sentence_asr = (
-                    ((out.provider.startswith("whisper-turbo") or out.provider in ("moonshine-v2-ja", "moonshine-v2-ko")) and not is_short_unpunctuated_cjk)
+                    ((out.provider.startswith("whisper-turbo") or out.provider == "moonshine-v2-ja") and not is_short_unpunctuated_cjk)
+                    or (out.provider == "moonshine-v2-ko" and not is_short_ko)
                     or out.provider == "moonshine-v2-en"
                     or (out.provider == "parakeet-tdt-0.6b-ultra" and (wc >= 5 or is_stop_flush))
                     or (out.provider == "hybrid-en-vad-moonshine" and wc >= 5 and not is_incomplete_en)
@@ -3500,6 +3388,11 @@ class EngineRuntime:
                     preserve_case=self._get_capitalized_glossary_words(),
                 )
                 wc = len(combined.split())
+                is_short_ko = (
+                    out.provider == "moonshine-v2-ko"
+                    and wc < 4
+                    and not combined.rstrip().endswith((".", "!", "?", "…"))
+                )
                 is_incomplete_en = (
                     out.provider == "hybrid-en-vad-moonshine"
                     and wc < 24
@@ -3509,7 +3402,9 @@ class EngineRuntime:
                 is_sentence_asr = (
                     out.provider.startswith("whisper-turbo")
                     or out.provider == "moonshine-v2-en"
-                    or out.provider in ("moonshine-v2-ja", "moonshine-v2-ko")
+                    or out.provider == "moonshine-v2-ja"
+                    or (out.provider == "moonshine-v2-ko" and not is_short_ko)
+                    or (out.provider == "parakeet-tdt-0.6b-ultra" and wc >= 5)
                     or (out.provider == "hybrid-en-vad-moonshine" and wc >= 5 and not is_incomplete_en)
                 )
                 is_non_spaced = r_src.startswith(_NON_SPACED_SCRIPT_PREFIXES)
@@ -3833,18 +3728,27 @@ class EngineRuntime:
                 last_draft_mt_ms = min(last_draft_mt_ms, 450.0)
             elapsed_s = now - last_partial_time
 
-            # Calm, readable YouTube cadence: ~0.45s normal (0.75s Eco), gracefully capped at 1.1s under load
+            is_hymt2_non_vien = (
+                cfg.mt_mode == "hy-mt2"
+                and {partial_job["source_lang"], partial_job["target_lang"]} != {"eng_Latn", "vie_Latn"}
+            )
+            # Calm, readable YouTube cadence: ~0.45s normal (0.75s Eco), gracefully capped at 1.1s under load.
+            # When Hy-MT2 handles live non-VI/EN drafts on the shared llama-server slot, widen debounce (>= 0.90s)
+            # and skip prior-turn context on drafts (~40% faster, 0 context-leak retries) so Finals never stall.
             base_debounce = 0.75 if cfg.eco_mode else 0.45
+            if is_hymt2_non_vien:
+                base_debounce = max(base_debounce, 0.90)
             if last_draft_mt_ms > 550.0:
-                base_debounce = min(1.10, max(base_debounce, (last_draft_mt_ms / 1000.0) * 0.85))
+                cap_s = 1.25 if is_hymt2_non_vien else 1.10
+                base_debounce = min(cap_s, max(base_debounce, (last_draft_mt_ms / 1000.0) * 0.85))
 
             if not same_seg:
                 min_first_wc = 2 if partial_job["source_lang"].startswith(_NON_SPACED_SCRIPT_PREFIXES) else 3
                 need_wait = wc_now < min_first_wc and elapsed_s < 0.55
             else:
-                min_delta = 3 if cfg.eco_mode else 2
+                min_delta = 3 if (cfg.eco_mode or is_hymt2_non_vien) else 2
                 need_wait = elapsed_s < base_debounce or (
-                    (wc_now - last_partial_wc) < min_delta and elapsed_s < 0.95
+                    (wc_now - last_partial_wc) < min_delta and elapsed_s < (1.25 if is_hymt2_non_vien else 0.95)
                 )
 
             if need_wait:
@@ -3856,6 +3760,7 @@ class EngineRuntime:
                 continue
 
             try:
+                draft_context = [] if is_hymt2_non_vien else list(self._recent_context)
                 r = self.translate_text(
                     draft_src,
                     partial_job["source_lang"],
@@ -3865,7 +3770,7 @@ class EngineRuntime:
                     llm_url=cfg.llm_url,
                     llm_model=cfg.llm_model,
                     llm_api_key=cfg.llm_api_key,
-                    context=list(self._recent_context),
+                    context=draft_context,
                     is_draft=True,
                 )
 
@@ -4074,18 +3979,14 @@ def api_models_status():
 def api_download_model(model_id: str):
     if model_id not in (
         "hy-mt2",
-        "nllb-1.3b",
         "nllb-600m",
         "zipformer-30m-streaming",
-        "zipformer-en-20m",
         "zipformer-multi",
         "moonshine-en",
         "moonshine-ja",
         "moonshine-ko",
         "parakeet-eu",
         "whisper-turbo",
-        "opus-vi-en",
-        "opus-en-vi",
         "envit5",
     ):
         raise HTTPException(status_code=400, detail="Unsupported model_id")

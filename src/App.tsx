@@ -92,46 +92,35 @@ const VU_BARS = 18;
 
 type DownloadableModelId =
   | "hy-mt2"
-  | "nllb-1.3b"
   | "nllb-600m"
   | "zipformer-30m-streaming"
-  | "zipformer-en-20m"
   | "zipformer-multi"
   | "moonshine-en"
   | "moonshine-ja"
   | "moonshine-ko"
   | "parakeet-eu"
   | "whisper-turbo"
-  | "opus-vi-en"
-  | "opus-en-vi"
   | "envit5";
 
 const MODEL_DISPLAY_NAMES: Record<string, string> = {
   "zipformer-30m-streaming": "Nghe Tiếng Việt (+Hotwords)",
-  "zipformer-en-20m": "Nghe Tiếng Anh (Nháp live)",
   "zipformer-multi": "Nghe Thái / Trung / Indo Siêu tốc (Zipformer-Multi)",
   "moonshine-en": "Nghe Tiếng Anh (Moonshine-v2)",
   "moonshine-ja": "Nghe Tiếng Nhật Siêu tốc (Moonshine-v2 JA)",
   "moonshine-ko": "Nghe Tiếng Hàn Siêu tốc (Moonshine-v2 KO)",
   "parakeet-eu": "Nghe 25 NN Châu Âu Siêu tốc (Parakeet-Ultra)",
-  "whisper-turbo": "Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)",
+  "whisper-turbo": "Nghe Mở rộng 99 NN (Whisper-Turbo)",
   envit5: "Dịch Việt ⇄ Anh (EnViT5)",
   "nllb-600m": "Dịch Lào & 202 NN (NLLB-600M)",
   "hy-mt2": "Dịch Thái / 38 NN (Hy-MT2)",
-  "nllb-1.3b": "Dịch 202 NN (NLLB-1.3B)",
-  "opus-vi-en": "Dịch Việt → Anh (Opus-MT)",
-  "opus-en-vi": "Dịch Anh → Việt (Opus-MT)",
 };
 
 function applyModelStateUpdate(prev: ModelsStatus | null, prog: ModelState): ModelsStatus | null {
   if (!prev) return prev;
   if (prog.model_id === "hy-mt2") return { ...prev, mt_hymt2: prog };
-  if (prog.model_id === "nllb-1.3b") return { ...prev, mt_nllb_13b: prog };
   if (prog.model_id === "nllb-600m") return { ...prev, mt_nllb_600m: prog };
   if (prog.model_id === "zipformer-30m-streaming")
     return { ...prev, asr_zipformer_streaming: prog };
-  if (prog.model_id === "zipformer-en-20m")
-    return { ...prev, asr_zipformer_en_20m: prog };
   if (prog.model_id === "zipformer-multi")
     return { ...prev, asr_zipformer_multi: prog };
   if (prog.model_id === "moonshine-en")
@@ -144,8 +133,6 @@ function applyModelStateUpdate(prev: ModelsStatus | null, prog: ModelState): Mod
     return { ...prev, asr_parakeet_eu: prog };
   if (prog.model_id === "whisper-turbo")
     return { ...prev, asr_whisper_turbo: prog };
-  if (prog.model_id === "opus-vi-en") return { ...prev, mt_opus_vi_en: prog };
-  if (prog.model_id === "opus-en-vi") return { ...prev, mt_opus_en_vi: prog };
   if (prog.model_id === "envit5") return { ...prev, mt_envit5: prog };
   return prev;
 }
@@ -1822,8 +1809,6 @@ export default function App() {
           return models.asr_parakeet_eu;
         case "whisper-turbo":
           return models.asr_whisper_turbo;
-        case "zipformer-en-20m":
-          return models.asr_zipformer_en_20m;
         case "envit5":
           return models.mt_envit5;
         case "nllb-600m":
@@ -1931,17 +1916,14 @@ export default function App() {
   const handleDownloadGlobalPack = async () => {
     setErrorMsg("");
     setShowAdvanced(true);
-    const packIds: Array<"parakeet-eu" | "whisper-turbo"> = ["parakeet-eu", "whisper-turbo"];
-    for (const id of packIds) {
-      const st = getModelStateById(id);
-      if (st?.status !== "ready" && st?.status !== "downloading") {
-        await handleDownloadModel(id);
-      }
+    const st = getModelStateById("parakeet-eu");
+    if (st?.status !== "ready" && st?.status !== "downloading") {
+      await handleDownloadModel("parakeet-eu");
     }
   };
 
   const handleDeleteModel = async (
-    modelId: "hy-mt2" | "moonshine-en" | "moonshine-ja" | "moonshine-ko" | "zipformer-multi" | "parakeet-eu" | "zipformer-en-20m" | "nllb-600m" | "whisper-turbo"
+    modelId: "hy-mt2" | "moonshine-en" | "moonshine-ja" | "moonshine-ko" | "zipformer-multi" | "parakeet-eu" | "nllb-600m" | "whisper-turbo"
   ) => {
     if (
       modelId === "hy-mt2" &&
@@ -2127,9 +2109,8 @@ export default function App() {
         ["Nghe Tiếng Hàn Siêu tốc (Moonshine-v2 KO • ~150ms)", models?.asr_moonshine_ko, "moonshine-ko", "47 MB"],
         ["Nghe Thái / Trung / Indo Siêu tốc (Zipformer • ~15ms)", models?.asr_zipformer_multi, "zipformer-multi", "247 MB"],
         ["Nghe 25 NN Châu Âu Siêu tốc (Parakeet-Ultra • ~0.3s)", models?.asr_parakeet_eu, "parakeet-eu", "465 MB"],
-        ["Nghe Đa ngôn ngữ 99 NN (Whisper-Turbo)", models?.asr_whisper_turbo, "whisper-turbo", "540 MB"],
         ["Dịch Chuyên sâu 38 NN (Hy-MT2 • Nặng GPU)", models?.mt_hymt2, "hy-mt2", "1.05 GB"],
-        ["Nghe Tiếng Anh Siêu nhẹ (Zipformer-20M)", models?.asr_zipformer_en_20m, "zipformer-en-20m", "130 MB"],
+        ["Mở rộng 99 NN (Whisper-Turbo • Hindi, Khmer...)", models?.asr_whisper_turbo, "whisper-turbo", "540 MB"],
       ] as const,
     [models]
   );
@@ -2195,10 +2176,10 @@ export default function App() {
       ),
       buildPack(
         "global",
-        "Gói 3: Toàn cầu & Châu Âu siêu tốc",
-        "~1.0 GB • 0% GPU",
-        "Parakeet-Ultra 25 NN Châu Âu (~0.3s: Pháp, Đức, TBN, Ý, Hà Lan, Ba Lan, Ukraina...) + Whisper 99 NN (Hindi, Khmer...).",
-        ["parakeet-eu", "whisper-turbo"],
+        "Gói 3: Châu Âu siêu tốc (25 NN)",
+        "~465 MB • 0% GPU",
+        "Parakeet-Ultra (~0.3s: Pháp, Đức, TBN, Ý, Bồ Đào Nha, Hà Lan, Ba Lan, Ukraina...). Cần thêm Hindi/Khmer/99 NN? Tải lẻ Whisper-Turbo bên dưới.",
+        ["parakeet-eu"],
         handleDownloadGlobalPack
       ),
     ];
@@ -2842,13 +2823,13 @@ export default function App() {
                   );
                 }
 
-                // 4) Universal 99-language fallback (FR/DE/ES/IT/HI/KM/MS/TL/MY...)
+                // 4) Universal 99-language extension (Hindi, Khmer, Malay, Tagalog, Turkish...)
                 if (wtReady) {
                   return (
                     <div className="lang-readiness-banner ready">
                       <div className="lang-readiness-row">
                         <CheckCircle2 size={12} style={{ flexShrink: 0 }} />
-                        <span>Sẵn sàng Offline — Gói Toàn cầu 99 NN (Whisper-Turbo)</span>
+                        <span>Sẵn sàng Offline — Mở rộng 99 NN (Whisper-Turbo)</span>
                       </div>
                     </div>
                   );
@@ -2861,8 +2842,8 @@ export default function App() {
                     <div className="lang-readiness-row">
                       <div style={{ flex: 1, minWidth: 0 }}>
                         {isDl
-                          ? `Đang tải Gói Toàn cầu 99 NN (${pct}%)...`
-                          : `Cần tải Gói Toàn cầu 99 NN (540 MB) cho ${srcName} offline.`}
+                          ? `Đang tải Mở rộng 99 NN (${pct}%)...`
+                          : `Cần tải Mở rộng 99 NN (Whisper-Turbo • 540 MB) cho ${srcName} offline.`}
                       </div>
                       <button
                         type="button"
@@ -3179,10 +3160,7 @@ export default function App() {
                   </option>
                 )}
                 <option value="zipformer-30m-streaming" disabled={!status?.zipformer_ready}>
-                  Zipformer-30M Tiếng Việt (51MB • ~30ms)
-                </option>
-                <option value="zipformer-en-20m" disabled={!status?.zipformer_en_ready}>
-                  Zipformer-20M Tiếng Anh (30MB • ~20ms)
+                  Zipformer-30M Tiếng Việt (49MB • ~30ms)
                 </option>
                 <option value="viet-asr">VietASR Tiếng Việt (78MB • Dấu câu/ITN)</option>
               </select>
@@ -5279,13 +5257,15 @@ export default function App() {
           models &&
             [
               models.asr_zipformer_streaming,
-              models.asr_zipformer_en_20m,
               models.asr_moonshine_en,
+              models.asr_moonshine_ja,
+              models.asr_moonshine_ko,
+              models.asr_zipformer_multi,
+              models.asr_parakeet_eu,
               models.asr_whisper_turbo,
               models.mt_envit5,
               models.mt_nllb_600m,
               models.mt_hymt2,
-              models.mt_nllb_13b,
             ].some((m) => m?.status === "downloading")
         );
         const isLive = Boolean(status?.listening);

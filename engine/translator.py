@@ -231,75 +231,6 @@ def _split_long_text(text: str, max_words: int = 34) -> list[str]:
     return [c for c in chunks if c.strip()]
 
 
-class OpusMTTranslator:
-    """Ultra-lightweight 77 MB offline MarianMT translator (CTranslate2 INT8) for VI->EN or EN->VI."""
-
-    def __init__(
-        self,
-        model_dir: Path,
-        src_lang: str,
-        tgt_lang: str,
-        engine_name: str,
-        src_prefix: Optional[str] = None,
-        intra_threads: int = 2,
-    ) -> None:
-        self.model_dir = Path(model_dir)
-        self.src_lang = src_lang
-        self.tgt_lang = tgt_lang
-        self.engine_name = engine_name
-        self.src_prefix = src_prefix
-        self._sp_src = _load_sentencepiece(self.model_dir / "source.spm")
-        self._sp_tgt = _load_sentencepiece(self.model_dir / "target.spm")
-        self._translator = ctranslate2.Translator(
-            str(self.model_dir),
-            device="cpu",
-            compute_type="default",
-            intra_threads=_adaptive_mt_threads(intra_threads),
-            inter_threads=1,
-        )
-        self._lock = threading.Lock()
-        self._cache = LRUCache(maxsize=1024)
-
-    def translate(self, text: str, beam_size: int = 1) -> TranslationResult:
-        clean = text.strip()
-        if not clean:
-            return TranslationResult("", "", self.src_lang, self.tgt_lang, 0.0, self.engine_name)
-
-        cache_key = (clean, self.src_lang, self.tgt_lang, beam_size)
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            return TranslationResult(clean, cached, self.src_lang, self.tgt_lang, 0.0, self.engine_name, True)
-
-        t0 = time.perf_counter()
-        chunks = _split_semantic_sentences(clean, max_words=30)
-        batch_tokens = []
-        for c in chunks:
-            subwords = self._sp_src.encode(c, out_type=str)
-            if self.src_prefix:
-                batch_tokens.append([self.src_prefix, *subwords, "</s>"])
-            else:
-                batch_tokens.append([*subwords, "</s>"])
-        max_src_len = max(len(toks) for toks in batch_tokens)
-        with self._lock:
-            results = self._translator.translate_batch(
-                batch_tokens,
-                beam_size=max(1, beam_size),
-                max_decoding_length=min(160, max(36, max_src_len * 3)),
-                repetition_penalty=1.15,
-                no_repeat_ngram_size=3,
-            )
-        decoded_parts: list[str] = []
-        for res in results:
-            out_tokens = [t for t in res.hypotheses[0] if t not in ("</s>", "<s>", "<pad>")]
-            part = self._sp_tgt.decode(out_tokens).strip()
-            if part:
-                decoded_parts.append(part)
-        translated = _clean_punctuation(" ".join(decoded_parts))
-        ms = round((time.perf_counter() - t0) * 1000.0, 1)
-        self._cache.set(cache_key, translated)
-        return TranslationResult(clean, translated, self.src_lang, self.tgt_lang, ms, self.engine_name)
-
-
 class EnViT5Translator:
     """
     VietAI EnViT5-Translation (CTranslate2 INT8, ~266 MB) — Single bidirectional model
@@ -419,6 +350,59 @@ class EnViT5Translator:
         return TranslationResult(clean, translated, src_lang, tgt_lang, ms, "vietai-envit5")
 
 
+_RE_VI_TRIEU_TY = re.compile(
+    r"(?i)(?<!\w)(\d+(?:[.,]\d+)?)\s+triệu\s+t[ỷỉ](?:\s+(đồng|vnd))?(?!\w)"
+)
+_VI_SMALL_NUM_WORDS: dict[str, int] = {
+    "một": 1, "hai": 2, "ba": 3, "bốn": 4, "tư": 4, "năm": 5,
+    "sáu": 6, "bảy": 7, "bẩy": 7, "tám": 8, "chín": 9, "mười": 10,
+}
+_RE_VI_WORD_TRIEU_TY = re.compile(
+    r"(?i)(?<!\w)(" + "|".join(_VI_SMALL_NUM_WORDS.keys()) + r")\s+triệu\s+t[ỷỉ](?:\s+(đồng|vnd))?(?!\w)"
+)
+_CJK_TRILLION_UNITS: dict[str, tuple[str, str]] = {
+    "kor_Hang": ("조", "조 동"),
+    "jpn_Jpan": ("兆", "兆ドン"),
+    "zho_Hans": ("万亿", "万亿越南盾"),
+    "zho_Hant": ("兆", "兆越南盾"),
+}
+
+
+def _normalize_vi_large_units_for_cjk(text: str, src_lang: str, tgt_lang: str) -> str:
+    """
+    Prevent 1,000x magnitude collapse on Vietnamese `triệu tỷ` (10^15) into Korean/Japanese/Chinese
+    trillion (`조`/`兆`, 10^12) and accidental USD/KRW currency hallucinations (`2 triệu tỷ đồng` -> `2조 달러`):
+    convert `X triệu tỷ [đồng]` directly to the exact target-language trillion form
+    (e.g. `5,2 triệu tỷ đồng` -> `5,200조 동` / `5,200兆ドン` / `5,200万亿越南盾`).
+    """
+    if src_lang != "vie_Latn" or tgt_lang not in _CJK_TRILLION_UNITS:
+        return text
+
+    unit_plain, unit_vnd = _CJK_TRILLION_UNITS[tgt_lang]
+
+    def _format_val(val: float, has_currency: bool) -> str:
+        scaled = int(round(val * 1000.0))
+        return f"{scaled:,}{unit_vnd if has_currency else unit_plain}"
+
+    def _repl_digit(m: re.Match[str]) -> str:
+        raw_num = m.group(1).replace(",", ".")
+        try:
+            val = float(raw_num)
+        except ValueError:
+            return m.group(0)
+        return _format_val(val, bool(m.group(2)))
+
+    def _repl_word(m: re.Match[str]) -> str:
+        val = _VI_SMALL_NUM_WORDS.get(m.group(1).lower())
+        if val is None:
+            return m.group(0)
+        return _format_val(float(val), bool(m.group(2)))
+
+    out = _RE_VI_TRIEU_TY.sub(_repl_digit, text)
+    out = _RE_VI_WORD_TRIEU_TY.sub(_repl_word, out)
+    return out
+
+
 class NLLBTranslator:
     """Fast CPU offline translator for all 202 x 202 languages using CTranslate2 + SentencePiece."""
 
@@ -472,7 +456,8 @@ class NLLBTranslator:
         if cached is not None:
             return TranslationResult(clean, cached, src_lang, tgt_lang, 0.0, self.engine_name, True)
 
-        chunks = _split_semantic_sentences(clean, max_words=60)
+        norm_clean = _normalize_vi_large_units_for_cjk(clean, src_lang, tgt_lang)
+        chunks = _split_semantic_sentences(norm_clean, max_words=60)
         batch_tokens = [[src_lang, *self._sp.encode(c, out_type=str), "</s>"] for c in chunks]
         max_src_len = max(len(toks) for toks in batch_tokens)
 
@@ -490,14 +475,15 @@ class NLLBTranslator:
                 length_penalty=1.2,
                 repetition_penalty=1.08,
                 no_repeat_ngram_size=6,
+                suppress_sequences=[["<unk>"]],
             )
             latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
 
         decoded_parts: list[str] = []
         for res in results:
             out_tokens = res.hypotheses[0]
-            filtered = [tok for tok in out_tokens if tok not in (tgt_lang, "</s>", "<s>", "<pad>")]
-            part = self._sp.decode(filtered).strip()
+            filtered = [tok for tok in out_tokens if tok not in (tgt_lang, "</s>", "<s>", "<pad>", "<unk>")]
+            part = self._sp.decode(filtered).replace("\u2047", "").strip()
             if part:
                 decoded_parts.append(part)
 
@@ -977,7 +963,23 @@ class HyMT2Translator:
 
     @staticmethod
     def _content_words(s: str) -> set[str]:
-        return set(re.findall(r"[A-Za-zÀ-ỹ0-9]{3,}", s.lower()))
+        """
+        Script-aware content-unit extractor for context-leak detection across ALL 38 Hy-MT2 languages:
+        - Spaced scripts (Latin/Vietnamese/Cyrillic/Arabic/digits): >=3-char word tokens.
+        - Hangul / CJK / Kana / Thai / Lao / Khmer: overlapping 2-char morpheme bigrams
+          (immune to attached Korean/Japanese particles and unspaced Thai/Chinese runs).
+        """
+        low = (s or "").lower()
+        units: set[str] = set(
+            re.findall(r"[a-z\u00c0-\u024f\u1e00-\u1eff\u0400-\u04ff\u0600-\u06ff0-9]{3,}", low)
+        )
+        for run in re.findall(r"[\uac00-\ud7a3\u3040-\u30ff\u4e00-\u9fff\u0e00-\u0eff\u1780-\u17ff]+", low):
+            if len(run) == 2:
+                units.add(run)
+            elif len(run) >= 3:
+                for i in range(len(run) - 1):
+                    units.add(run[i : i + 2])
+        return units
 
     @classmethod
     def _looks_like_context_leak(cls, clean_src: str, translated: str, ctx_pairs: list[tuple[str, str]]) -> bool:
@@ -985,19 +987,32 @@ class HyMT2Translator:
         if not ctx_pairs or not translated:
             return False
         out_words = cls._content_words(translated)
-        if len(out_words) < 4:
+        if len(out_words) < 3:
             return False
         prev_src = " ".join(s for s, _ in ctx_pairs if s)
         prev_tgt = " ".join(t for _, t in ctx_pairs if t)
         prev_tgt_words = cls._content_words(prev_tgt)
-        if len(prev_tgt_words) < 4:
+        if len(prev_tgt_words) < 3:
             return False
-        overlap_out = len(out_words & prev_tgt_words) / max(min(len(out_words), len(prev_tgt_words)), 1)
+        shared = len(out_words & prev_tgt_words)
+        if shared < 3:
+            return False
+        overlap_out_self = shared / max(len(out_words), 1)
+        overlap_out_min = shared / max(min(len(out_words), len(prev_tgt_words)), 1)
         src_words = cls._content_words(clean_src)
         prev_src_words = cls._content_words(prev_src)
-        overlap_src = len(src_words & prev_src_words) / max(min(len(src_words), len(prev_src_words)), 1) if src_words and prev_src_words else 0.0
-        # Catch both distinct-sentence leaks (55%+) and same-topic near-verbatim copies (72%+)
-        return (overlap_out >= 0.55 and overlap_src <= 0.35) or (overlap_out >= 0.72 and overlap_src < 0.65)
+        overlap_src = (
+            len(src_words & prev_src_words) / max(min(len(src_words), len(prev_src_words)), 1)
+            if src_words and prev_src_words
+            else 0.0
+        )
+        # Catch both distinct-sentence leaks (48%+ of output OR 60%+ of min when prev_tgt >= 5 units)
+        # and same-topic near-verbatim copies (68%+), while avoiding false triggers on 2 shared common words
+        distinct_leak = overlap_src <= 0.35 and (
+            overlap_out_self >= 0.48 or (len(prev_tgt_words) >= 5 and overlap_out_min >= 0.60)
+        )
+        verbatim_leak = overlap_out_min >= 0.68 and overlap_out_self >= 0.48 and overlap_src < 0.65
+        return distinct_leak or verbatim_leak
 
     def _build_prompt(
         self,
@@ -1013,16 +1028,21 @@ class HyMT2Translator:
                 lines.append(f"{s} translates to {t}")
             blocks.append("\n".join(lines))
 
+        tgt_spec = (
+            "polite formal Korean (consistent 합니다/해요 style)"
+            if tgt_name == "Korean"
+            else tgt_name
+        )
         bg = " ".join(s for s, _ in ctx_pairs if s).strip() if ctx_pairs else ""
         if bg:
             blocks.append(bg)
             blocks.append(
                 f"Reference the above context (do NOT translate the context above). "
-                f"Translate ONLY the following segment into {tgt_name}, without additional explanation:\n\n{clean}"
+                f"Translate ONLY the following segment into {tgt_spec}, without additional explanation:\n\n{clean}"
             )
         else:
             blocks.append(
-                f"Translate the following segment into {tgt_name}, without additional explanation.\n\n{clean}"
+                f"Translate the following segment into {tgt_spec}, without additional explanation.\n\n{clean}"
             )
         return "\n\n".join(blocks)
 
@@ -1069,26 +1089,28 @@ class HyMT2Translator:
             if s and t and s.lower() in low_clean:
                 matched_terms.append((s, t))
 
-        # Keep single most recent turn for pronoun/topic continuity on short/medium segments;
-        # skip prior-turn context on long self-contained paragraphs (>=38 words) to prevent 1.8B context-copying
-        # and keep long-sentence latency ~25% faster.
-        ctx_pairs = [] if len(clean.split()) >= 38 else (context or [])[-1:]
+        # Keep single most recent turn for pronoun/topic continuity on medium segments;
+        # skip prior-turn context on very short (<=5 words) or long self-contained paragraphs (>=38 words)
+        # to prevent 1.8B context-overwriting and keep latency crisp.
+        src_wc = len(clean.split())
+        ctx_pairs = [] if (src_wc <= 5 or src_wc >= 38) else (context or [])[-1:]
+        norm_clean = _normalize_vi_large_units_for_cjk(clean, src_lang, tgt_lang)
         term_sig = "|".join(f"{s}->{t}" for s, t in matched_terms)
         ctx_sig = "|".join(s for s, _ in ctx_pairs)
-        cache_key = (f"{term_sig}||{ctx_sig}||{clean}", src_lang, tgt_lang, 2)
+        cache_key = (f"{term_sig}||{ctx_sig}||{norm_clean}", src_lang, tgt_lang, 2)
         cached = self._cache.get(cache_key)
         if cached is not None:
             return TranslationResult(clean, cached, src_lang, tgt_lang, 0.0, "hy-mt2-1.8b", True)
 
         self.ensure_started()
 
-        prompt = self._build_prompt(clean, tgt_name, matched_terms, ctx_pairs)
+        prompt = self._build_prompt(norm_clean, tgt_name, matched_terms, ctx_pairs)
         t0 = time.perf_counter()
-        translated = self._run_completion(prompt, clean)
-        if ctx_pairs and self._looks_like_context_leak(clean, translated, ctx_pairs):
+        translated = self._run_completion(prompt, norm_clean)
+        if ctx_pairs and self._looks_like_context_leak(norm_clean, translated, ctx_pairs):
             # Guardrail: if 1.8B leaked context into output, cleanly retry without context
-            fallback_prompt = self._build_prompt(clean, tgt_name, matched_terms, [])
-            translated = self._run_completion(fallback_prompt, clean)
+            fallback_prompt = self._build_prompt(norm_clean, tgt_name, matched_terms, [])
+            translated = self._run_completion(fallback_prompt, norm_clean)
         ms = round((time.perf_counter() - t0) * 1000.0, 1)
         self._cache.set(cache_key, translated)
         return TranslationResult(clean, translated, src_lang, tgt_lang, ms, "hy-mt2-1.8b")

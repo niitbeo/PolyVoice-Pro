@@ -344,25 +344,6 @@ class ZipformerStreamingViEngine(_SherpaOnlineTransducerBase):
         )
 
 
-class ZipformerStreamingEnEngine(_SherpaOnlineTransducerBase):
-    """English 20M INT8 streaming Zipformer (cross-platform Windows & macOS, crisp 4-7.5s YouTube cadence)."""
-
-    def __init__(self, model_dir: Path, sample_rate: int = 16000, num_threads: int = 2) -> None:
-        d = Path(model_dir)
-        super().__init__(
-            tokens=d / "tokens.txt",
-            encoder=d / "encoder-epoch-99-avg-1.int8.onnx",
-            decoder=d / "decoder-epoch-99-avg-1.int8.onnx",
-            joiner=d / "joiner-epoch-99-avg-1.int8.onnx",
-            provider_label="sherpa-onnx-en-20m",
-            sample_rate=sample_rate,
-            num_threads=num_threads,
-            rule1_silence=1.35,
-            rule2_silence=0.52,
-            rule3_max_len=7.5,
-        )
-
-
 class VietASRStreamingEngine:
     """Embedded 78 MB Vietnamese ASR (`viet-asr`) with built-in Silero VAD, punctuation, and ITN."""
 
@@ -826,18 +807,49 @@ def _transfer_punct_and_caps(pass1_text: str, pass2_text: str) -> str:
                     after_sentence_end = tok.endswith((".", "?", "!"))
                     p2_had_sent_end = after_sentence_end
             else:
+                # Sub-span safe numeric ITN: when a spoken number ("ba mốt" / "hai mươi hai nghìn")
+                # shares a `replace` block with an adjacent non-number word (e.g. "tuổi ba mốt" vs "tôi cũng 31"),
+                # transfer ONLY the clean numeric token onto the spoken-number sub-span while keeping
+                # all surrounding Pass-1 words intact!
+                p1_sub_replaced: list[str] | None = None
+                p2_num_toks = [
+                    t for t in p2_span
+                    if any(ch.isdigit() for ch in _strip_edge_punct(t)[1])
+                    and not any(len(n) >= 5 and n.startswith("20") for n in re.findall(r"\d+", t))
+                ]
+                if len(p2_num_toks) == 1:
+                    num_runs: list[tuple[int, int]] = []
+                    run_start: int | None = None
+                    for idx_r, tok_r in enumerate(p1_span):
+                        core_r = _strip_edge_punct(tok_r)[1].lower()
+                        is_nw = bool(core_r) and (core_r in _VI_NUM_WORDS or core_r.isdigit()) and (core_r not in _VI_MAGNITUDE_WORDS)
+                        if is_nw and run_start is None:
+                            run_start = idx_r
+                        elif not is_nw and run_start is not None:
+                            num_runs.append((run_start, idx_r))
+                            run_start = None
+                    if run_start is not None:
+                        num_runs.append((run_start, len(p1_span)))
+                    if len(num_runs) == 1 and (num_runs[0][1] - num_runs[0][0]) >= 2:
+                        rs, re_idx = num_runs[0]
+                        _, num_core, _ = _strip_edge_punct(p2_num_toks[0])
+                        l_s, _, _ = _strip_edge_punct(p1_span[rs])
+                        _, _, r_e = _strip_edge_punct(p1_span[re_idx - 1])
+                        p1_sub_replaced = [*p1_span[:rs], f"{l_s}{num_core}{r_e}", *p1_span[re_idx:]]
+
+                eff_span = p1_sub_replaced if p1_sub_replaced is not None else p1_span
                 # Keep Pass-1 words; inherit ONLY true sentence-start casing & safe closing punctuation
                 _, _, p2_end_p = _strip_edge_punct(p2_span[-1])
-                for idx_s, t1 in enumerate(p1_span):
+                for idx_s, t1 in enumerate(eff_span):
                     l1, c1, r1 = _strip_edge_punct(t1)
                     is_last = (i1 + idx_s) == len(p1_toks) - 1
                     if idx_s == 0 and after_sentence_end and c1 and c1[0].islower():
                         c1 = c1[0].upper() + c1[1:]
-                    raw_rp = p2_end_p if (idx_s == len(p1_span) - 1 and p2_end_p and not r1) else r1
+                    raw_rp = p2_end_p if (idx_s == len(eff_span) - 1 and p2_end_p and not r1) else r1
                     right_p = _safe_right_punct(c1, raw_rp, is_last)
                     out.append(f"{l1}{c1}{right_p}")
                     after_sentence_end = any(ch in ".?!" for ch in right_p)
-                    p2_had_sent_end = any(ch in ".?!" for ch in p2_end_p) if idx_s == len(p1_span) - 1 else False
+                    p2_had_sent_end = any(ch in ".?!" for ch in p2_end_p) if idx_s == len(eff_span) - 1 else False
         elif tag == "delete":
             # Pass-2 dropped words that Pass-1 heard -> keep Pass-1 words cleanly
             for idx_d, t1 in enumerate(p1_toks[i1:i2]):
@@ -1986,6 +1998,180 @@ _RE_JA_INTERCHAR_SPACE = re.compile(
 )
 
 
+_KO_DIGIT_MAP: dict[str, int] = {
+    "공": 0, "영": 0, "일": 1, "이": 2, "삼": 3, "사": 4,
+    "오": 5, "육": 6, "륙": 6, "칠": 7, "팔": 8, "구": 9,
+}
+_KO_MULT_MAP: dict[str, int] = {"십": 10, "백": 100, "천": 1000}
+_KO_SINO_CHARS = "공영일이삼사오육륙칠팔구십백천"
+_KO_DEC_CHARS = "공영일이삼사오육륙칠팔구"
+
+_KO_ACRONYM_MAP: tuple[tuple[str, str], ...] = (
+    ("챗 지피티", "ChatGPT"),
+    ("챗 쥐피티", "ChatGPT"),
+    ("챗지피티", "ChatGPT"),
+    ("챗쥐피티", "ChatGPT"),
+    ("에이피아이", "API"),
+    ("케이비에스", "KBS"),
+    ("에이아이", "AI"),
+    ("지피티", "GPT"),
+    ("쥐피티", "GPT"),
+    ("엘엘엠", "LLM"),
+    ("엠시피", "MCP"),
+    ("씨이오", "CEO"),
+    ("지디피", "GDP"),
+)
+_RE_KO_ACRONYMS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(rf"(?<![가-힣]){re.escape(k)}"), v) for k, v in _KO_ACRONYM_MAP
+)
+_RE_KO_COVID = re.compile(r"코로나\s*(?:십구|일구)")
+_RE_KO_DECIMAL = re.compile(
+    rf"(?<![가-힣0-9])([{_KO_SINO_CHARS}](?:[\s]*[{_KO_SINO_CHARS}]){{0,8}})\s*[점쩜]\s*([{_KO_DEC_CHARS}](?:\s*[{_KO_DEC_CHARS}]){{0,3}})\s*(퍼센트|달러|원|밀리미터|킬로미터|센티미터|배|조|억|만|포인트)?"
+)
+_RE_KO_LARGE_UNIT = re.compile(
+    rf"(?<![가-힣0-9])([{_KO_SINO_CHARS}](?:[\s]*[{_KO_SINO_CHARS}]){{0,8}})\s*(조|억|만)(?=\s*(?:[{_KO_SINO_CHARS}0-9]|달러|원))"
+)
+_RE_KO_UNIT_INT = re.compile(
+    rf"(?<![가-힣0-9])([{_KO_SINO_CHARS}](?:[\s]*[{_KO_SINO_CHARS}]){{0,8}})\s*(퍼센트|달러|위권|년|월|밀리미터|킬로미터|센티미터)"
+)
+_RE_KO_RANK_INT = re.compile(
+    rf"(?<![가-힣0-9])([{_KO_SINO_CHARS}](?:[\s]*[{_KO_SINO_CHARS}]){{1,5}})\s*위(?=[를을은는이가의로에도]|\s|$)"
+)
+_RE_KO_DAY_AFTER_CTX = re.compile(
+    rf"((?:\d+월|현지\s*시각|지난|오는|이달|내달)\s+)([{_KO_SINO_CHARS}](?:[\s]*[{_KO_SINO_CHARS}]){{0,4}})\s*일(?=[에부터까지은는이가을를의도]|\s|$)"
+)
+_RE_KO_MILLI_INT = re.compile(
+    rf"(?<![가-힣0-9])([{_KO_SINO_CHARS}](?:[\s]*[{_KO_SINO_CHARS}]){{1,6}})\s*미리(?=[가이을를은는의도나]|\s|$)"
+)
+_RE_KO_WON_INT = re.compile(
+    rf"(?<![가-힣0-9])([{_KO_SINO_CHARS}](?:[\s]*[{_KO_SINO_CHARS}]){{1,8}})\s*원(?=[에을를은는이가의도로부터까지짜리대씩]|\s|$)"
+)
+_KO_UNIT_SYMBOL: dict[str, str] = {
+    "퍼센트": "%",
+    "밀리미터": "mm",
+    "킬로미터": "km",
+    "센티미터": "cm",
+}
+
+
+def _parse_sino_ko_int(raw: str) -> int | None:
+    s = re.sub(r"\s+", "", raw or "")
+    if not s or any(ch not in _KO_DIGIT_MAP and ch not in _KO_MULT_MAP for ch in s):
+        return None
+    if all(ch in _KO_DIGIT_MAP for ch in s):
+        if len(s) == 1:
+            return _KO_DIGIT_MAP[s]
+        if len(s) <= 4:
+            return int("".join(str(_KO_DIGIT_MAP[ch]) for ch in s))
+        return None
+    total = 0
+    cur = 0
+    for ch in s:
+        if ch in _KO_DIGIT_MAP:
+            cur = cur * 10 + _KO_DIGIT_MAP[ch] if cur else _KO_DIGIT_MAP[ch]
+        else:
+            mult = _KO_MULT_MAP[ch]
+            total += (cur if cur else 1) * mult
+            cur = 0
+    total += cur
+    return total
+
+
+def _apply_ko_itn(text: str) -> str:
+    """
+    Lightweight, zero-false-positive Korean Inverse Text Normalization (ITN) for Moonshine-v2-KO:
+    converts spoken Sino-Korean decimals/percentages/currencies/units and tech acronyms into
+    canonical digits/symbols so downstream MT preserves exact numbers (e.g. `팔 점 오 퍼센트` -> `8.5%`).
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+
+    for pat, repl in _RE_KO_ACRONYMS:
+        s = pat.sub(repl, s)
+    s = _RE_KO_COVID.sub("코로나19", s)
+
+    def _repl_dec(m: re.Match[str]) -> str:
+        raw_int = re.sub(r"\s+", "", m.group(1))
+        int_val = _parse_sino_ko_int(raw_int)
+        if int_val is None:
+            return m.group(0)
+        frac_chars = re.sub(r"\s+", "", m.group(2))
+        if not frac_chars or any(ch not in _KO_DIGIT_MAP for ch in frac_chars):
+            return m.group(0)
+        unit = m.group(3) or ""
+        # Guard against Korean phrase "이 점 이해..." ("this point, understand...") when no unit follows
+        if not unit:
+            end_pos = m.end()
+            if raw_int == "이" or (end_pos < len(s) and "\uac00" <= s[end_pos] <= "\ud7a3"):
+                return m.group(0)
+        frac_str = "".join(str(_KO_DIGIT_MAP[ch]) for ch in frac_chars)
+        unit_out = _KO_UNIT_SYMBOL.get(unit, unit)
+        return f"{int_val}.{frac_str}{unit_out}"
+
+    s = _RE_KO_DECIMAL.sub(_repl_dec, s)
+
+    def _repl_large(m: re.Match[str]) -> str:
+        val = _parse_sino_ko_int(m.group(1))
+        if val is None or val <= 0:
+            return m.group(0)
+        return f"{val}{m.group(2)}"
+
+    s = _RE_KO_LARGE_UNIT.sub(_repl_large, s)
+    s = _RE_KO_LARGE_UNIT.sub(_repl_large, s)
+
+    def _repl_unit_int(m: re.Match[str]) -> str:
+        raw_num = re.sub(r"\s+", "", m.group(1))
+        unit = m.group(2)
+        val = _parse_sino_ko_int(raw_num)
+        if val is None or val <= 0:
+            return m.group(0)
+        if unit == "월" and not (1 <= val <= 12):
+            return m.group(0)
+        if unit == "년" and len(raw_num) == 1 and raw_num == "이":
+            return m.group(0)
+        unit_out = _KO_UNIT_SYMBOL.get(unit, unit)
+        return f"{val}{unit_out}"
+
+    s = _RE_KO_UNIT_INT.sub(_repl_unit_int, s)
+
+    def _repl_rank(m: re.Match[str]) -> str:
+        val = _parse_sino_ko_int(m.group(1))
+        if val is None or val <= 0:
+            return m.group(0)
+        return f"{val}위"
+
+    s = _RE_KO_RANK_INT.sub(_repl_rank, s)
+
+    def _repl_day(m: re.Match[str]) -> str:
+        val = _parse_sino_ko_int(m.group(2))
+        if val is None or not (1 <= val <= 31):
+            return m.group(0)
+        return f"{m.group(1)}{val}일"
+
+    s = _RE_KO_DAY_AFTER_CTX.sub(_repl_day, s)
+
+    def _repl_milli(m: re.Match[str]) -> str:
+        raw_num = re.sub(r"\s+", "", m.group(1))
+        if not any(ch in _KO_MULT_MAP for ch in raw_num):
+            return m.group(0)
+        val = _parse_sino_ko_int(raw_num)
+        if val is None or val < 10:
+            return m.group(0)
+        return f"{val}미리"
+
+    s = _RE_KO_MILLI_INT.sub(_repl_milli, s)
+
+    def _repl_won(m: re.Match[str]) -> str:
+        val = _parse_sino_ko_int(m.group(1))
+        if val is None or val < 10:
+            return m.group(0)
+        return f"{val}원"
+
+    s = _RE_KO_WON_INT.sub(_repl_won, s)
+    return s
+
+
 def _clean_ja_moonshine_text(raw: str) -> str:
     """Normalize Moonshine-v2 Japanese output: remove stray CJK inter-char spaces & loops."""
     txt = (raw or "").strip()
@@ -2087,7 +2273,10 @@ class MoonshineJaStreamingEngine:
         raw_txt = stream.result.text or ""
         if self._language == "ja":
             return _clean_ja_moonshine_text(raw_txt)
-        return _clean_whisper_text(raw_txt, rms=1.0)
+        cleaned = _clean_whisper_text(raw_txt, rms=1.0)
+        if self._language == "ko":
+            return _apply_ko_itn(cleaned)
+        return cleaned
 
     def accept_pcm(self, pcm_s16: np.ndarray) -> ASROutput:
         t0 = time.perf_counter()
@@ -2174,7 +2363,8 @@ class MoonshineJaStreamingEngine:
             self._last_partial_ts = 0.0
             ms = round((time.perf_counter() - t0) * 1000.0, 1)
             if finals:
-                return ASROutput("final", "".join(finals).strip(), ms, self.active_provider)
+                joiner = "" if self._language == "ja" else " "
+                return ASROutput("final", joiner.join(finals).strip(), ms, self.active_provider)
             return ASROutput("none", "", ms, self.active_provider)
 
     def transcribe_pcm_isolated(self, pcm_s16: np.ndarray, language: Optional[str] = None) -> str:
