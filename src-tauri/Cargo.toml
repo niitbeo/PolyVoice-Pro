@@ -1,6 +1,6 @@
 [package]
 name = "voicerecore"
-version = "0.9.9"
+version = "1.0.0"
 description = "DAU Voice Pro — Real-time Bilingual Conference Speech Translation (202 Languages)"
 authors = ["DAU Voice Pro"]
 edition = "2021"

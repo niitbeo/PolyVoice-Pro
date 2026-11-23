@@ -1,7 +1,7 @@
 {
   "name": "dau-voice-pro",
   "private": true,
-  "version": "0.9.9",
+  "version": "1.0.0",
   "type": "module",
   "description": "Real-time Vietnamese Speech Recognition & 200-Language Local Translator (Windows & macOS)",
   "scripts": {
