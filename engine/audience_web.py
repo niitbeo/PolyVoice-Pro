@@ -548,9 +548,77 @@ AUDIENCE_HTML = (
     .card.live .tgt {
       color: var(--tgt-live);
     }
+    .card.latest {
+      border-color: var(--border-strong);
+      border-left: 3.5px solid var(--brand);
+    }
+    .live-footer {
+      flex-shrink: 0;
+      border-top: 1px solid var(--border);
+      background: var(--header-bg);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      padding: 9px 14px calc(10px + env(safe-area-inset-bottom, 0px));
+      display: none;
+      align-items: center;
+      gap: 9px;
+      min-height: 40px;
+    }
+    .live-footer.show { display: flex; }
+    .live-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #ef4444;
+      box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.22);
+      flex-shrink: 0;
+      animation: audPulse 1.4s ease-in-out infinite;
+    }
+    @keyframes audPulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.45; transform: scale(0.86); }
+    }
+    .live-src-text {
+      font-size: 13px;
+      color: var(--muted);
+      font-style: italic;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      flex: 1;
+      min-width: 0;
+    }
+    .freeze-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      background: rgba(8, 10, 16, 0.94);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      padding: 28px;
+      text-align: center;
+    }
+    .freeze-overlay.show { display: flex; }
+    .freeze-title {
+      font-size: 20px;
+      font-weight: 800;
+      color: #f8fafc;
+      letter-spacing: -0.02em;
+    }
+    .freeze-msg {
+      max-width: 420px;
+      font-size: 15px;
+      line-height: 1.55;
+      color: #cbd5e1;
+    }
     .jump {
       position: fixed;
-      bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+      bottom: calc(62px + env(safe-area-inset-bottom, 0px));
       left: 50%;
       transform: translateX(-50%);
       background: linear-gradient(135deg, #c4000f, #dc2626);
@@ -679,6 +747,17 @@ AUDIENCE_HTML = (
       </div>
     </main>
 
+    <div class="live-footer" id="liveFooter" aria-live="polite">
+      <span class="live-dot" aria-hidden="true"></span>
+      <span class="live-src-text" id="liveSrcText"></span>
+    </div>
+
+    <div class="freeze-overlay" id="freezeOverlay" role="status" aria-live="assertive">
+      __LOGO_IMG__
+      <div class="freeze-title">DAU Voice Pro</div>
+      <div class="freeze-msg" id="freezeMsg">Tạm nghỉ — Phiên dịch hội nghị sẽ tiếp tục trong giây lát</div>
+    </div>
+
     <button class="jump" id="jumpBtn">
       <svg class="lucide" width="14" height="14" viewBox="0 0 24 24">
         <path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>
@@ -703,6 +782,15 @@ AUDIENCE_HTML = (
     const btnBilingual = document.getElementById("btnBilingual");
     const btnTheme = document.getElementById("btnTheme");
     const jumpBtn = document.getElementById("jumpBtn");
+    const liveFooter = document.getElementById("liveFooter");
+    const liveSrcText = document.getElementById("liveSrcText");
+    const freezeOverlay = document.getElementById("freezeOverlay");
+    const freezeMsg = document.getElementById("freezeMsg");
+
+    function setFrozen(frozen, msg) {
+      if (msg) freezeMsg.textContent = msg;
+      freezeOverlay.classList.toggle("show", Boolean(frozen));
+    }
 
     function setAudTheme(t) {
       document.documentElement.setAttribute("data-theme", t);
@@ -764,33 +852,35 @@ AUDIENCE_HTML = (
       return (s || "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
 
+    function renderLiveBar() {
+      const txt = (partial && partial.source_text ? partial.source_text : "").trim();
+      if (txt) {
+        liveSrcText.textContent = txt;
+        liveFooter.classList.add("show");
+      } else {
+        liveFooter.classList.remove("show");
+      }
+    }
+
     function render() {
+      renderLiveBar();
       const grouped = groupByParagraph(entries);
-      if (grouped.length === 0 && !partial) {
+      if (grouped.length === 0) {
         feed.innerHTML = "";
         feed.appendChild(emptyState);
         return;
       }
       let html = "";
-      for (const item of grouped) {
+      for (let i = 0; i < grouped.length; i++) {
+        const item = grouped[i];
+        const isLatest = i === grouped.length - 1;
         const spkBadge = item.speaker === "remote"
           ? `<span class="badge remote">${ICON_HEADPHONES}<span>Đối tác</span></span>`
           : item.speaker === "self" ? `<span class="badge">${ICON_MIC}<span>Diễn giả</span></span>` : "";
-        html += `<div class="card">
+        html += `<div class="card${isLatest ? " latest" : ""}">
           <div class="meta"><span>${escapeHtml(item.timestamp || "")}</span>${spkBadge}</div>
           ${showSource ? `<div class="src" style="font-size:${Math.max(13, fontSize - 5)}px">${escapeHtml(item.source_text)}</div>` : ""}
           <div class="tgt" style="font-size:${fontSize}px">${escapeHtml(item.translated_text || "—")}</div>
-        </div>`;
-      }
-      if (partial) {
-        const hasSplit = Boolean(partial.stable_text || partial.unstable_text);
-        const liveTgtHtml = hasSplit
-          ? `${partial.stable_text ? `<span>${escapeHtml(partial.stable_text)}</span>` : ""}${partial.stable_text && partial.unstable_text ? " " : ""}${partial.unstable_text ? `<span style="opacity:0.68;font-weight:500">${escapeHtml(partial.unstable_text)}</span>` : ""}`
-          : escapeHtml(partial.translated_text || "...");
-        html += `<div class="card live">
-          <div class="meta"><span class="meta-live">${ICON_RADIO}<span>Đang nói...</span></span></div>
-          ${showSource ? `<div class="src" style="font-size:${Math.max(13, fontSize - 5)}px;font-style:italic">${escapeHtml(partial.source_text)}</div>` : ""}
-          <div class="tgt" style="font-size:${fontSize}px">${liveTgtHtml}</div>
         </div>`;
       }
       feed.innerHTML = html;
@@ -857,28 +947,19 @@ AUDIENCE_HTML = (
           const msg = JSON.parse(ev.data);
           if (msg.type === "status") {
             setConnState(msg.data && msg.data.listening ? "live" : "ready");
+            if (msg.data && typeof msg.data.display_frozen === "boolean") {
+              setFrozen(msg.data.display_frozen, msg.data.display_freeze_message);
+            }
+          } else if (msg.type === "display_freeze") {
+            setFrozen(msg.data && msg.data.frozen, msg.data && msg.data.message);
           } else if (msg.type === "history") {
             entries = (msg.data || []).slice(-120);
             if (entries.length === 0) partial = null;
             render();
           } else if (msg.type === "partial") {
             const d = msg.data;
-            const same = partial && partial.id === d.id;
-            partial = {
-              id: d.id, source_text: d.source_text,
-              translated_text: same ? partial.translated_text : "",
-              stable_text: same ? partial.stable_text : "",
-              unstable_text: same ? partial.unstable_text : ""
-            };
-            render();
-          } else if (msg.type === "partial_mt") {
-            const d = msg.data;
-            if (partial && partial.id === d.id) {
-              partial.translated_text = d.translated_text;
-              partial.stable_text = d.stable_text || "";
-              partial.unstable_text = d.unstable_text || "";
-              render();
-            }
+            partial = { id: d.id, source_text: d.source_text };
+            renderLiveBar();
           } else if (msg.type === "final") {
             const e = msg.data;
             if (partial && partial.id === e.id) partial = null;

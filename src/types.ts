@@ -237,6 +237,42 @@ export interface FileTranslateResult {
   srt_source_content?: string;
 }
 
+export interface SlidePageSummary {
+  index: number;
+  title: string;
+  preview: string;
+  has_notes?: boolean;
+  terms?: string[];
+}
+
+export interface SlideContextTerm {
+  source: string;
+  target: string;
+  enabled: boolean;
+  origin?: "slide" | "dau_preset" | "manual";
+}
+
+export interface SlideContextSummary {
+  enabled: boolean;
+  filename: string;
+  topic: string;
+  slide_count: number;
+  term_count: number;
+  active_slide_index: number;
+  active_slide_title: string;
+}
+
+export interface SlideContextPayload {
+  enabled: boolean;
+  filename: string;
+  topic: string;
+  slide_count: number;
+  active_slide_index: number;
+  active_slide_title: string;
+  pages: SlidePageSummary[];
+  terms: SlideContextTerm[];
+}
+
 export interface EngineStatus {
   listening: boolean;
   active_asr_label: string;
@@ -273,6 +309,9 @@ export interface EngineStatus {
   audience?: { connected_count: number; active_languages: string[] };
   glossary_enabled?: boolean;
   glossary_count?: number;
+  slide_context?: SlideContextSummary;
+  display_frozen?: boolean;
+  display_freeze_message?: string;
   cloud_api?: CloudApiStatus;
   cloud_fallback_notice?: string;
   envit5_device?: string;
@@ -284,7 +323,7 @@ export interface EngineStatus {
   boot_error: string;
 }
 
-export type OverlayLayoutMode = "stacked" | "youtube" | "target-only" | "split";
+export type OverlayLayoutMode = "led-stage" | "stacked" | "youtube" | "target-only" | "split";
 export const OVERLAY_LAYOUT_KEY = "polyvoice_overlay_layout";
 
 export interface PartialEvent {

@@ -16,6 +16,8 @@ import {
   Copy,
   Cpu,
   Download,
+  Eye,
+  EyeOff,
   FileAudio,
   FileText,
   FolderOpen,
@@ -31,8 +33,10 @@ import {
   MonitorSpeaker,
   Moon,
   MousePointerClick,
+  Pencil,
   Play,
   Plus,
+  Presentation,
   QrCode,
   RefreshCw,
   Search,
@@ -55,6 +59,7 @@ import {
   Zap,
 } from "lucide-react";
 import { StudioSelect, StudioSelectOption } from "./StudioSelect";
+import { SlideContextModal } from "./SlideContextModal";
 import {
   AsrEngineId,
   AudienceInfo,
@@ -80,6 +85,7 @@ import {
   MtModeId,
   ParagraphModeId,
   PartialEvent,
+  SlideContextPayload,
   SourceLanguageEntry,
   THEME_STORAGE_KEY,
   ThemeMode,
@@ -254,6 +260,12 @@ export default function App() {
   }, []);
   const [glossaryOpen, setGlossaryOpen] = useState(false);
   const [glossary, setGlossary] = useState<GlossaryData | null>(null);
+  const [slideModalOpen, setSlideModalOpen] = useState(false);
+  const [slideContext, setSlideContext] = useState<SlideContextPayload | null>(null);
+  const [displayFrozen, setDisplayFrozen] = useState(false);
+  const [editingHistoryId, setEditingHistoryId] = useState("");
+  const [editingHistoryDraft, setEditingHistoryDraft] = useState("");
+  const [editingHistoryBusy, setEditingHistoryBusy] = useState(false);
   const [newAsrWrong, setNewAsrWrong] = useState("");
   const [newAsrCorrect, setNewAsrCorrect] = useState("");
   const [newLockSource, setNewLockSource] = useState("");
@@ -465,6 +477,9 @@ export default function App() {
           if (msg.type === "status") {
             syncStatusToLocalState(msg.data, false);
             if (!msg.data?.listening) setInflightPartial(null);
+            if (typeof msg.data?.display_frozen === "boolean") {
+              setDisplayFrozen(msg.data.display_frozen);
+            }
             fetch(`${ENGINE_HTTP}/api/models/status`)
               .then((r) => (r.ok ? r.json() : null))
               .then((d) => {
@@ -607,6 +622,26 @@ export default function App() {
               setFileBusy(false);
               setFileCancelling(false);
             }
+          } else if (msg.type === "display_freeze") {
+            setDisplayFrozen(Boolean(msg.data?.frozen));
+          } else if (msg.type === "slide_match") {
+            const idx = Number(msg.data?.slide_index || 0);
+            const title = String(msg.data?.slide_title || "");
+            setSlideContext((prev) =>
+              prev ? { ...prev, active_slide_index: idx, active_slide_title: title } : prev
+            );
+            setStatus((prev) =>
+              prev && prev.slide_context
+                ? {
+                    ...prev,
+                    slide_context: {
+                      ...prev.slide_context,
+                      active_slide_index: idx,
+                      active_slide_title: title,
+                    },
+                  }
+                : prev
+            );
           } else if (msg.type === "cloud_notice") {
             setCloudNotice(String(msg.data?.message || ""));
           } else if (msg.type === "error") {
@@ -1181,6 +1216,53 @@ export default function App() {
       await fetch(`${ENGINE_HTTP}/api/files/cancel`, { method: "POST" });
     } catch {
       // ignore
+    }
+  };
+
+  const handleOpenSlideModal = async () => {
+    setSlideModalOpen(true);
+    try {
+      const res = await fetch(`${ENGINE_HTTP}/api/context`);
+      if (res.ok) setSlideContext(await res.json());
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleToggleDisplayFreeze = async () => {
+    const next = !displayFrozen;
+    setDisplayFrozen(next);
+    try {
+      await fetch(`${ENGINE_HTTP}/api/display/freeze`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ frozen: next }),
+      });
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleSaveHistoryEdit = async (targetId: string, itemIds?: string[]) => {
+    const nextText = editingHistoryDraft.trim();
+    if (!nextText) return;
+    setEditingHistoryBusy(true);
+    try {
+      await fetch(`${ENGINE_HTTP}/api/history/update`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: targetId,
+          translated_text: nextText,
+          item_ids: itemIds && itemIds.length > 0 ? itemIds : [targetId],
+        }),
+      });
+      setEditingHistoryId("");
+      setEditingHistoryDraft("");
+    } catch {
+      // ignore
+    } finally {
+      setEditingHistoryBusy(false);
     }
   };
 
@@ -2663,9 +2745,22 @@ export default function App() {
           <button
             className={`btn ${overlayOpen ? "active" : ""}`}
             onClick={handleToggleOverlay}
-            title="Mở cửa sổ phụ đề trong suốt chia đôi 50/50 (kéo sang màn hình thứ 2)"
+            title="Mở cửa sổ Sân khấu LED / Phụ đề nổi (kéo sang màn hình LED hoặc máy chiếu phụ)"
           >
-            <Layers size={13.5} /> Phụ đề nổi
+            <Layers size={13.5} /> Màn LED
+          </button>
+
+          <button
+            className={`btn icon-only ${displayFrozen ? "active" : ""}`}
+            onClick={handleToggleDisplayFreeze}
+            disabled={!connected}
+            title={
+              displayFrozen
+                ? "Màn hình LED & QR đang TẠM ẨN — bấm để tiếp tục phát phụ đề"
+                : "Tạm ẩn nhanh màn LED & điện thoại QR sang màn chờ DAU (cứu hộ khi nghỉ giải lao / sự cố micro)"
+            }
+          >
+            {displayFrozen ? <Eye size={14} /> : <EyeOff size={14} />}
           </button>
 
           {overlayOpen && isTauriEnv() && (
@@ -2686,6 +2781,32 @@ export default function App() {
           >
             <QrCode size={13.5} /> QR
             {audienceCount > 0 && <span className="btn-badge">{audienceCount}</span>}
+          </button>
+
+          <button
+            className={`btn ${
+              slideModalOpen ||
+              (status?.slide_context?.enabled &&
+                ((status?.slide_context?.slide_count ?? 0) > 0 ||
+                  (status?.slide_context?.term_count ?? 0) > 0))
+                ? "active"
+                : ""
+            }`}
+            onClick={handleOpenSlideModal}
+            disabled={!connected}
+            title="Nạp Slide / Tài liệu hội nghị (.PPTX, .PDF, .DOCX) để nhận dạng & dịch chuẩn tên riêng 100% Offline"
+          >
+            <Presentation size={13.5} /> Slide
+            {status?.slide_context &&
+              (status.slide_context.slide_count > 0 || status.slide_context.term_count > 0) && (
+                <span className={`btn-badge ${status.slide_context.enabled ? "" : "muted"}`}>
+                  {!status.slide_context.enabled
+                    ? "Tắt"
+                    : status.slide_context.slide_count > 0
+                    ? status.slide_context.slide_count
+                    : status.slide_context.term_count}
+                </span>
+              )}
           </button>
 
           <button
@@ -3961,6 +4082,15 @@ export default function App() {
                 </span>
               </span>
               <div className="metric-badges">
+                {status?.slide_context?.enabled && status.slide_context.active_slide_index > 0 && (
+                  <button
+                    className="metric slide-match-pill"
+                    onClick={handleOpenSlideModal}
+                    title={`Slide RAG đang khớp: ${status.slide_context.active_slide_title || ""}`}
+                  >
+                    <Presentation size={10.5} /> Slide #{status.slide_context.active_slide_index}
+                  </button>
+                )}
                 {spotAsrMs > 0 && <span className="metric">ASR {Math.round(spotAsrMs)}ms</span>}
                 {spotMtMs > 0 && <span className="metric">MT {Math.round(spotMtMs)}ms</span>}
                 <div className={`spot-head-actions ${flowCurrTarget ? "ready" : ""}`}>
@@ -4209,6 +4339,16 @@ export default function App() {
                           </button>
                           <button
                             className="btn sm icon-only"
+                            onClick={() => {
+                              setEditingHistoryId(item.id);
+                              setEditingHistoryDraft(item.translated_text || "");
+                            }}
+                            title="Sửa nhanh bản dịch và cập nhật tức thì lên màn LED & điện thoại QR"
+                          >
+                            <Pencil size={11.5} />
+                          </button>
+                          <button
+                            className="btn sm icon-only"
                             onClick={() => speakOfflineTTS(item.translated_text, item.target_lang)}
                             title="Đọc bản dịch"
                           >
@@ -4224,7 +4364,42 @@ export default function App() {
                         </div>
                       </div>
                       <div className="history-vi">{item.source_text}</div>
-                      <div className="history-tr">{item.translated_text || "—"}</div>
+                      {editingHistoryId === item.id ? (
+                        <div className="history-edit-box">
+                          <textarea
+                            className="input"
+                            rows={2}
+                            autoFocus
+                            value={editingHistoryDraft}
+                            onChange={(e) => setEditingHistoryDraft(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Escape") {
+                                setEditingHistoryId("");
+                              } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                                void handleSaveHistoryEdit(item.id, item.item_ids);
+                              }
+                            }}
+                          />
+                          <div className="row" style={{ justifyContent: "flex-end", gap: 6 }}>
+                            <button
+                              className="btn sm"
+                              disabled={editingHistoryBusy}
+                              onClick={() => setEditingHistoryId("")}
+                            >
+                              Hủy
+                            </button>
+                            <button
+                              className="btn primary sm"
+                              disabled={editingHistoryBusy || !editingHistoryDraft.trim()}
+                              onClick={() => void handleSaveHistoryEdit(item.id, item.item_ids)}
+                            >
+                              <Check size={12} /> Lưu lên LED &amp; QR
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="history-tr">{item.translated_text || "—"}</div>
+                      )}
 
                       {itemEv && (
                         <div className="eval-inline-card">
@@ -5648,6 +5823,12 @@ export default function App() {
           </div>
         );
       })()}
+      <SlideContextModal
+        open={slideModalOpen}
+        onClose={() => setSlideModalOpen(false)}
+        context={slideContext}
+        onUpdated={(next) => setSlideContext(next)}
+      />
     </div>
   );
 }

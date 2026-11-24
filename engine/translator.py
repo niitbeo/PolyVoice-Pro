@@ -1060,8 +1060,13 @@ class HyMT2Translator:
         tgt_name: str,
         matched_terms: list[tuple[str, str]],
         ctx_pairs: list[tuple[str, str]],
+        domain_hint: str = "",
     ) -> str:
         blocks: list[str] = []
+        if domain_hint:
+            blocks.append(
+                f"Conference domain note (for terminology accuracy ONLY — do NOT translate or repeat this note): {domain_hint}"
+            )
         if matched_terms:
             lines = ["Reference the following translations:"]
             for s, t in matched_terms:
@@ -1112,6 +1117,7 @@ class HyMT2Translator:
         tgt_lang: str,
         context: Optional[list[tuple[str, str]]] = None,
         term_locks: Optional[list[dict[str, str]]] = None,
+        domain_hint: str = "",
     ) -> TranslationResult:
         clean = text.strip()
         if not clean:
@@ -1123,13 +1129,15 @@ class HyMT2Translator:
         if not tgt_name:
             raise ValueError(f"Language {tgt_lang} is outside Hy-MT2-1.8B supported 38 languages")
 
-        # Filter only glossary terms actually appearing in this sentence (keeps prompt tiny & fast!)
+        # Filter only glossary/slide terms actually appearing in this sentence (keeps prompt tiny & fast!)
         matched_terms: list[tuple[str, str]] = []
+        seen_mt: set[str] = set()
         low_clean = clean.lower()
         for rule in term_locks or []:
             s = str(rule.get("source", "")).strip()
             t = str(rule.get("target", "")).strip()
-            if s and t and s.lower() in low_clean:
+            if s and t and s.lower() not in seen_mt and s.lower() in low_clean:
+                seen_mt.add(s.lower())
                 matched_terms.append((s, t))
 
         # Keep single most recent turn for pronoun/topic continuity on medium segments;
@@ -1140,22 +1148,27 @@ class HyMT2Translator:
         if cand_ctx and len(cand_ctx[0][0]) > max(120, int(len(clean) * 2.2)):
             cand_ctx = []
         ctx_pairs = cand_ctx
+        # Skip domain hint on ultra-short 1-4 word interjections ("Thank you", "Vâng ạ") so 1.8B never over-expands
+        eff_hint = domain_hint.strip() if (domain_hint and src_wc >= 5) else ""
         norm_clean = _normalize_vi_large_units_for_cjk(clean, src_lang, tgt_lang)
         term_sig = "|".join(f"{s}->{t}" for s, t in matched_terms)
         ctx_sig = "|".join(s for s, _ in ctx_pairs)
-        cache_key = (f"{term_sig}||{ctx_sig}||{norm_clean}", src_lang, tgt_lang, 2)
+        cache_key = (f"{eff_hint}||{term_sig}||{ctx_sig}||{norm_clean}", src_lang, tgt_lang, 2)
         cached = self._cache.get(cache_key)
         if cached is not None:
             return TranslationResult(clean, cached, src_lang, tgt_lang, 0.0, "hy-mt2-1.8b", True)
 
         self.ensure_started()
 
-        prompt = self._build_prompt(norm_clean, tgt_name, matched_terms, ctx_pairs)
+        prompt = self._build_prompt(norm_clean, tgt_name, matched_terms, ctx_pairs, domain_hint=eff_hint)
         t0 = time.perf_counter()
         translated = self._run_completion(prompt, norm_clean)
-        if ctx_pairs and self._looks_like_context_leak(norm_clean, translated, ctx_pairs):
-            # Guardrail: if 1.8B leaked context into output, cleanly retry without context
-            fallback_prompt = self._build_prompt(norm_clean, tgt_name, matched_terms, [])
+        leak_ctx = list(ctx_pairs)
+        if eff_hint:
+            leak_ctx.append((eff_hint, eff_hint))
+        if leak_ctx and self._looks_like_context_leak(norm_clean, translated, leak_ctx):
+            # Guardrail: if 1.8B leaked context or domain note into output, cleanly retry with terms only
+            fallback_prompt = self._build_prompt(norm_clean, tgt_name, matched_terms, [], domain_hint="")
             translated = self._run_completion(fallback_prompt, norm_clean)
         ms = round((time.perf_counter() - t0) * 1000.0, 1)
         self._cache.set(cache_key, translated)

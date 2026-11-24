@@ -182,6 +182,7 @@ def build() -> Path:
         "certifi",
         "huggingface_hub",
         "numpy",
+        "pypdf",
         "python_multipart",
         "asr_engine",
         "audience_web",
@@ -192,6 +193,7 @@ def build() -> Path:
         "model_manager",
         "quota_tracker",
         "session_logger",
+        "slide_context",
         "translator",
     ]
     if _has_module("imageio_ffmpeg"):

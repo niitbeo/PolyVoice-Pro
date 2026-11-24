@@ -1342,7 +1342,22 @@ def _clean_moonshine_loops(text: str, dur_s: float = 10.0) -> str:
         max_w = max(5, int(dur_s * 5.5) + 2)
         if len(toks) > max_w:
             return " ".join(toks[:max_w]).strip()
-    return " ".join(toks).strip()
+    out = " ".join(toks).strip()
+    # Fix Moonshine-v2 splitting spoken acronyms ("A. I was", "A. I.", "A. G. I.") which breaks MT
+    out = re.sub(r"\bA\.\s*G\.\s*I\.?(?=$|\s|[,;:!?])", "AGI", out)
+    out = re.sub(r"\bA\.\s*I\.(?=$|\s|[,;:!?])", "AI", out)
+    out = re.sub(
+        r"\b(of|about|on|in|with|for|to|by|from|using|use|building|like|called|into)\s+A\.\s*I\b",
+        r"\1 AI",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"\bA\.\s*I(?=\s+(?:is|was|are|were|will|can|could|has|have|does|models?|tools?|systems?|agents?|technology|research|wave|company|companies)\b)",
+        "AI",
+        out,
+    )
+    return out
 
 
 class MoonshineEnStreamingEngine:

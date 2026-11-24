@@ -18,6 +18,7 @@ import shutil
 import tempfile
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -507,6 +508,7 @@ class GlossaryManager:
         """Apply pre-MT ASR mishearing corrections (longest match first)."""
         if not text:
             return text
+        text = unicodedata.normalize("NFC", text)
         with self._lock:
             if not self._data["enabled"] or not self._data["asr_fixes"]:
                 return text
@@ -557,25 +559,38 @@ class GlossaryManager:
         text: str,
         source_lang: str = "vie_Latn",
         target_lang: str = "eng_Latn",
+        extra_locks: list[dict[str, str]] | None = None,
     ) -> tuple[str, list[tuple[str, str]]]:
         """
-        Replace locked glossary terms AND auto-detected Vietnamese proper names / landmarks
-        with MT-safe placeholders, returning `(masked_text, restore_pairs)`:
+        Replace locked glossary terms, Slide-RAG terms, AND auto-detected Vietnamese proper names /
+        landmarks with MT-safe placeholders, returning `(masked_text, restore_pairs)`:
         - Vietnamese person names -> Latin human-name sentinels (`Marek`, `Davin`...) for
           Latin targets (preserves natural 'Chairman Trương Gia Bình' / 'Mr. Hoàng Nam Tiến'
           grammar and 100% eliminates Chinese Pinyin hallucinations like 'Zhang Jingping'!),
           or opaque `XTermA0X` sentinels for non-Latin targets (Thai/Lao/Chinese/Japanese).
-        - Glossary locks & places/brands -> opaque `XTermA0X` sentinels.
+        - Glossary / Slide-RAG locks & places/brands -> opaque `XTermA0X` sentinels.
         """
         if not text:
             return text, []
+        text = unicodedata.normalize("NFC", text)
         with self._lock:
-            rules = (
-                sorted(self._data["term_locks"], key=lambda r: len(r["source"]), reverse=True)
+            manual_rules = (
+                list(self._data["term_locks"])
                 if self._data.get("enabled", True) and self._data.get("term_locks")
                 else []
             )
             session_snap = dict(self._session_persons)
+
+        # Merge manual Glossary locks (highest priority) + Slide-RAG matched locks, longest-match first
+        combined_rules: list[dict[str, str]] = list(manual_rules)
+        seen_src = {str(r.get("source", "")).lower() for r in combined_rules if r.get("source")}
+        for item in extra_locks or []:
+            src_s = str(item.get("source", "")).strip()
+            tgt_s = str(item.get("target", "")).strip()
+            if src_s and tgt_s and src_s.lower() not in seen_src:
+                seen_src.add(src_s.lower())
+                combined_rules.append({"source": src_s, "target": tgt_s, "target_lang": str(item.get("target_lang", ""))})
+        rules = sorted(combined_rules, key=lambda r: len(r["source"]), reverse=True)
 
         masked = text
         restore_pairs: list[tuple[str, str]] = []

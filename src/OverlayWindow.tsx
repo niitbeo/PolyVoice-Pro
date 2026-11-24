@@ -4,17 +4,21 @@ import {
   ArrowDown,
   Columns2,
   Contrast,
+  Eye,
+  EyeOff,
   GripHorizontal,
   Languages,
   Maximize2,
   Mic,
   Minimize2,
   Minus,
+  MonitorPlay,
   Moon,
   Pin,
   PinOff,
   Plus,
   Presentation,
+  QrCode,
   Radio,
   Rows2,
   Sun,
@@ -24,6 +28,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  AudienceInfo,
   ENGINE_HTTP,
   ENGINE_WS,
   EngineStatus,
@@ -43,13 +48,19 @@ import {
 function getInitialOverlayLayout(): OverlayLayoutMode {
   try {
     const saved = localStorage.getItem(OVERLAY_LAYOUT_KEY);
-    if (saved === "stacked" || saved === "youtube" || saved === "target-only" || saved === "split") {
+    if (
+      saved === "led-stage" ||
+      saved === "stacked" ||
+      saved === "youtube" ||
+      saved === "target-only" ||
+      saved === "split"
+    ) {
       return saved;
     }
   } catch {
     // ignore
   }
-  return "stacked";
+  return "led-stage";
 }
 
 function renderLiveTarget(partial: PartialEvent) {
@@ -95,12 +106,18 @@ export default function OverlayWindow() {
   const [layoutMode, setLayoutMode] = useState<OverlayLayoutMode>(() => getInitialOverlayLayout());
   const [stageMode, setStageMode] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
-  const [fontSize, setFontSize] = useState(26);
-  const [opacity, setOpacity] = useState(0.94);
+  const [fontSize, setFontSize] = useState(32);
+  const [opacity, setOpacity] = useState(0.96);
   const [theme, setTheme] = useState<ThemeMode>(() => getInitialTheme());
   const [alwaysOnTop, setAlwaysOnTop] = useState(true);
   const [filledMonitor, setFilledMonitor] = useState(false);
   const [userScrolledUp, setUserScrolledUp] = useState(false);
+  const [displayFrozen, setDisplayFrozen] = useState(false);
+  const [freezeMessage, setFreezeMessage] = useState(
+    "Tạm nghỉ — Phiên dịch hội nghị sẽ tiếp tục trong giây lát"
+  );
+  const [showCornerQr, setShowCornerQr] = useState(false);
+  const [audienceInfo, setAudienceInfo] = useState<AudienceInfo | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -190,7 +207,17 @@ export default function OverlayWindow() {
         fetch(`${ENGINE_HTTP}/api/health`)
           .then((r) => (r.ok ? r.json() : null))
           .then((d) => {
-            if (d) setStatus(d);
+            if (d) {
+              setStatus(d);
+              if (typeof d.display_frozen === "boolean") setDisplayFrozen(d.display_frozen);
+              if (d.display_freeze_message) setFreezeMessage(d.display_freeze_message);
+            }
+          })
+          .catch(() => {});
+        fetch(`${ENGINE_HTTP}/api/audience/info`)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((info) => {
+            if (info?.qr_svg) setAudienceInfo(info);
           })
           .catch(() => {});
       };
@@ -201,6 +228,15 @@ export default function OverlayWindow() {
           if (msg.type === "status") {
             setStatus(msg.data);
             if (!msg.data?.listening) setInflightPartial(null);
+            if (typeof msg.data?.display_frozen === "boolean") {
+              setDisplayFrozen(msg.data.display_frozen);
+            }
+            if (msg.data?.display_freeze_message) {
+              setFreezeMessage(msg.data.display_freeze_message);
+            }
+          } else if (msg.type === "display_freeze") {
+            setDisplayFrozen(Boolean(msg.data?.frozen));
+            if (msg.data?.message) setFreezeMessage(msg.data.message);
           } else if (msg.type === "partial") {
             const d = msg.data;
             setPartial((prev) => {
@@ -427,9 +463,21 @@ export default function OverlayWindow() {
   const srcLabel = status?.source_lang_meta?.name_vi || "Tiếng Việt";
   const tgtLabel = status?.target_lang_meta?.name_vi || status?.config?.target_lang || "Tiếng Anh";
 
+  const toggleDisplayFreeze = () => {
+    const next = !displayFrozen;
+    setDisplayFrozen(next);
+    fetch(`${ENGINE_HTTP}/api/display/freeze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ frozen: next }),
+    }).catch(() => {});
+  };
+
   const cardBg =
     theme === "light"
       ? `rgba(255, 255, 255, ${opacity})`
+      : layoutMode === "led-stage"
+      ? `rgba(5, 7, 12, ${opacity})`
       : `rgba(11, 14, 23, ${opacity})`;
 
   const isEmpty = entries.length === 0 && !partial;
@@ -521,23 +569,30 @@ export default function OverlayWindow() {
             <div className="overlay-toolbar-left">
               <div className="overlay-layout-seg" role="group" aria-label="Bố cục hiển thị">
                 <button
+                  className={`overlay-layout-btn ${layoutMode === "led-stage" ? "active" : ""}`}
+                  onClick={() => setLayoutMode("led-stage")}
+                  title="Sân khấu LED hội trường: 3–4 câu chốt đứng yên chữ cực lớn + thanh nghe sống mờ ở đáy (0% nhảy sửa chữ)"
+                >
+                  <MonitorPlay size={12} /> Sân khấu LED
+                </button>
+                <button
                   className={`overlay-layout-btn ${layoutMode === "stacked" ? "active" : ""}`}
                   onClick={() => setLayoutMode("stacked")}
-                  title="Xếp tầng chuẩn hội trường: Gốc nhỏ ở trên ↑ • Bản dịch lớn ở dưới ↓"
+                  title="Xếp tầng chuẩn hội trường: Gốc nhỏ ở trên • Bản dịch lớn ở dưới"
                 >
                   <Rows2 size={12} /> Xếp tầng
                 </button>
                 <button
                   className={`overlay-layout-btn ${layoutMode === "youtube" ? "active" : ""}`}
                   onClick={() => setLayoutMode("youtube")}
-                  title="Phụ đề gọn kiểu YouTube (1–2 dòng nổi nền tối bán trong suốt, kéo đặt trực tiếp lên video/Zoom/Slide)"
+                  title="Phụ đề gọn kiểu YouTube (1–2 dòng nổi nền tối bán trong suốt, đặt dưới Slide/Video)"
                 >
                   <Tv size={12} /> YouTube
                 </button>
                 <button
                   className={`overlay-layout-btn ${layoutMode === "target-only" ? "active" : ""}`}
                   onClick={() => setLayoutMode("target-only")}
-                  title="Chỉ hiển thị Bản Dịch cỡ lớn (tối ưu cho khán giả ngồi xa)"
+                  title="Chỉ hiển thị Bản Dịch cỡ lớn"
                 >
                   <Type size={12} /> Chỉ dịch
                 </button>
@@ -589,6 +644,23 @@ export default function OverlayWindow() {
                 onClick={() => setOpacity((o) => (o >= 0.99 ? 0.78 : o >= 0.9 ? 1.0 : 0.94))}
               >
                 <Contrast size={12} /> {Math.round(opacity * 100)}%
+              </button>
+
+              <button
+                className={`btn sm ${showCornerQr ? "info-active" : "overlay-ctrl-btn"}`}
+                title="Hiện/ẩn mã QR nhỏ góc màn LED cho đại biểu quét xem trên điện thoại"
+                onClick={() => setShowCornerQr((v) => !v)}
+              >
+                <QrCode size={12.5} /> QR góc
+              </button>
+
+              <button
+                className={`btn sm ${displayFrozen ? "active" : "overlay-ctrl-btn"}`}
+                title={displayFrozen ? "Đang tạm ẩn màn LED & QR — bấm để phát lại" : "Tạm ẩn màn LED & QR sang màn chờ DAU (khi nghỉ giải lao / sự cố mic)"}
+                onClick={toggleDisplayFreeze}
+              >
+                {displayFrozen ? <Eye size={12.5} /> : <EyeOff size={12.5} />}
+                {displayFrozen ? "Phát lại LED" : "Tạm ẩn"}
               </button>
 
               <button
@@ -644,8 +716,74 @@ export default function OverlayWindow() {
         )}
 
         {/* Scrollable Conference Subtitle Feed */}
-        <div className="overlay-feed" ref={scrollRef} onScroll={handleScroll}>
-          {isEmpty ? (
+        <div
+          className={`overlay-feed ${layoutMode === "led-stage" ? "led-stage" : ""} ${
+            showCornerQr && audienceInfo?.qr_svg && !displayFrozen ? "has-corner-qr" : ""
+          }`}
+          ref={scrollRef}
+          onScroll={handleScroll}
+        >
+          {layoutMode === "led-stage" ? (
+            <div className="overlay-led-container">
+              <div className="overlay-led-sentences">
+                {entries.length === 0 ? (
+                  <div className="overlay-empty-single">
+                    <div className="overlay-empty-card wide">
+                      <div className="overlay-empty-icon info">
+                        <MonitorPlay size={22} />
+                      </div>
+                      <div className="overlay-empty-title">
+                        Sân khấu LED Hội trường{" "}
+                        <span className="overlay-empty-pill info">{srcLabel} → {tgtLabel}</span>
+                      </div>
+                      <p className="overlay-empty-desc">
+                        Bản dịch chỉ hiện khi chốt tròn câu (đứng yên 100%, không nhảy sửa chữ), lưu 3–4 câu gần nhất cỡ chữ lớn dễ đọc từ hàng ghế cuối.
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  (() => {
+                    const visible = entries.slice(-4);
+                    const total = visible.length;
+                    return visible.map((item, idx) => {
+                      const distFromLatest = total - 1 - idx;
+                      const tierClass =
+                        distFromLatest === 0
+                          ? "latest"
+                          : distFromLatest === 1
+                          ? "prev-1"
+                          : distFromLatest === 2
+                          ? "prev-2"
+                          : "prev-3";
+                      return (
+                        <div className={`overlay-led-item ${tierClass}`} key={item.id}>
+                          <div className="overlay-led-tgt" style={{ fontSize: distFromLatest === 0 ? fontSize : Math.max(18, Math.round(fontSize * 0.84)) }}>
+                            {item.translated_text || "—"}
+                          </div>
+                        </div>
+                      );
+                    });
+                  })()
+                )}
+              </div>
+
+              {/* Fixed Bottom Live Source Bar — proves mic pickup live WITHOUT ever jittering translations above */}
+              <div className={`overlay-led-livebar ${partial?.source_text || status?.listening ? "active" : ""}`}>
+                <span className={`overlay-led-dot ${status?.listening ? "live" : ""}`} aria-hidden="true" />
+                <span className="overlay-led-live-label">
+                  {partial?.source_text ? "Đang nghe:" : status?.listening ? "Đang lắng nghe diễn giả..." : "Sẵn sàng hội trường"}
+                </span>
+                {partial?.source_text && (
+                  <span className="overlay-led-live-src">{partial.source_text}</span>
+                )}
+                {status?.slide_context?.active_slide_index ? (
+                  <span className="overlay-led-slide-tag">
+                    Slide #{status.slide_context.active_slide_index}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+          ) : isEmpty ? (
             layoutMode === "split" ? (
               <div className="overlay-empty-split">
                 <div className="overlay-empty-col">
@@ -885,10 +1023,38 @@ export default function OverlayWindow() {
           )}
         </div>
 
-        {userScrolledUp && (
+        {userScrolledUp && layoutMode !== "led-stage" && (
           <button className="overlay-jump-btn" onClick={scrollToBottom}>
             <ArrowDown size={14} /> Xuống câu mới nhất
           </button>
+        )}
+
+        {showCornerQr && audienceInfo?.qr_svg && !displayFrozen && (
+          <div className="overlay-corner-qr" title={audienceInfo.audience_url}>
+            <div
+              className="overlay-corner-qr-box"
+              dangerouslySetInnerHTML={{ __html: audienceInfo.qr_svg }}
+            />
+            <div className="overlay-corner-qr-caption">
+              <strong>Quét QR phụ đề</strong>
+              <span>Chọn ngôn ngữ riêng</span>
+            </div>
+          </div>
+        )}
+
+        {displayFrozen && (
+          <div className="overlay-freeze-curtain" role="status" aria-live="assertive">
+            <img src="/school-logo.png" alt="DAU Voice Pro" className="overlay-freeze-logo" />
+            <div className="overlay-freeze-brand">
+              DAU Voice <span className="brand-pro-tag">PRO</span>
+            </div>
+            <div className="overlay-freeze-msg">{freezeMessage}</div>
+            {!stageMode && (
+              <button className="btn primary sm" onClick={toggleDisplayFreeze} style={{ marginTop: 8 }}>
+                <Eye size={13.5} /> Tiếp tục phát lên màn LED
+              </button>
+            )}
+          </div>
         )}
       </div>
     </div>

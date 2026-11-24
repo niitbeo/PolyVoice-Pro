@@ -124,6 +124,7 @@ from languages import (
 from model_manager import ModelManager
 from quota_tracker import CloudQuotaManager
 from session_logger import SessionLogger
+from slide_context import SlideContextManager
 from translator import (
     AzureTranslator,
     EnViT5Translator,
@@ -497,9 +498,13 @@ class EngineRuntime:
     def __init__(self) -> None:
         self.model_manager = ModelManager()
         self.glossary = GlossaryManager()
+        self.slide_context = SlideContextManager(Path.home() / ".cache" / "voicerecore" / "slide_context.json")
         self.cloud_quota = CloudQuotaManager()
         self.logger = SessionLogger()
         self.config = SessionConfig()
+        self._display_frozen: bool = False
+        self._display_freeze_message: str = "Tạm nghỉ — Phiên dịch hội nghị sẽ tiếp tục trong giây lát"
+        self._last_slide_match_idx: int = 0
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.mac_helper = find_macos_helper()
         self._llama_server_ready: bool = find_llama_server() is not None
@@ -644,6 +649,8 @@ class EngineRuntime:
             "target_lang": self.config.target_lang,
             "source_lang_meta": asdict(src) if src else None,
             "target_lang_meta": asdict(tgt) if tgt else None,
+            "display_frozen": self._display_frozen,
+            "display_freeze_message": self._display_freeze_message,
         }
 
     async def register_audience_ws(self, ws: WebSocket, lang: str = "follow") -> None:
@@ -728,10 +735,11 @@ class EngineRuntime:
             try:
                 if ev_type == "status" and aud_status_payload is not None:
                     await aws.send_json(aud_status_payload)
-                elif ev_type == "partial":
+                elif ev_type in ("partial", "display_freeze"):
                     await aws.send_json(payload)
-                elif ev_type == "history" and isinstance(ev_data, list) and len(ev_data) == 0:
-                    await aws.send_json(payload)
+                elif ev_type == "history" and isinstance(ev_data, list):
+                    if len(ev_data) == 0 or alang == "follow":
+                        await aws.send_json({"type": "history", "data": ev_data[-80:]})
                 elif ev_type in ("partial_mt", "final") and isinstance(ev_data, dict):
                     if alang == "follow" or alang == ev_data.get("target_lang"):
                         await aws.send_json(payload)
@@ -895,16 +903,24 @@ class EngineRuntime:
             return self._en_pass2_refiner
 
     def _get_glossary_hotwords(self) -> list[str]:
-        g = self.glossary.get()
-        if not g.get("enabled", True):
-            return []
         phrases: list[str] = []
-        for rule in g.get("term_locks", []):
-            if rule.get("source"):
-                phrases.append(rule["source"])
-        for rule in g.get("asr_fixes", []):
-            if rule.get("correct"):
-                phrases.append(rule["correct"])
+        seen: set[str] = set()
+        g = self.glossary.get()
+        if g.get("enabled", True):
+            for rule in g.get("term_locks", []):
+                src = rule.get("source")
+                if src and src.lower() not in seen:
+                    seen.add(src.lower())
+                    phrases.append(src)
+            for rule in g.get("asr_fixes", []):
+                cor = rule.get("correct")
+                if cor and cor.lower() not in seen:
+                    seen.add(cor.lower())
+                    phrases.append(cor)
+        for hw in self.slide_context.get_hotwords():
+            if hw and hw.lower() not in seen:
+                seen.add(hw.lower())
+                phrases.append(hw)
         return phrases
 
     def sync_asr_hotwords(self) -> int:
@@ -1253,7 +1269,33 @@ class EngineRuntime:
         if source_lang == target_lang:
             return TranslationResult(clean, clean, source_lang, target_lang, 0.0, "passthrough")
 
-        active_term_locks = self.glossary.get_effective_term_locks(clean, source_lang, target_lang)
+        active_term_locks = list(self.glossary.get_effective_term_locks(clean, source_lang, target_lang))
+        slide_matched_terms: list[dict[str, str]] = []
+        slide_domain_hint = ""
+        if not is_draft:
+            rag = self.slide_context.retrieve_for_utterance(clean, source_lang, target_lang)
+            if rag is not None:
+                slide_domain_hint = rag.domain_hint
+                if rag.matched_terms:
+                    slide_matched_terms = list(rag.matched_terms)
+                    seen_tl = {str(r.get("source", "")).lower() for r in active_term_locks}
+                    for st in rag.matched_terms:
+                        s_low = str(st.get("source", "")).lower()
+                        if s_low and s_low not in seen_tl:
+                            seen_tl.add(s_low)
+                            active_term_locks.append(st)
+                if rag.slide_index > 0 and rag.slide_index != self._last_slide_match_idx:
+                    self._last_slide_match_idx = rag.slide_index
+                    self.broadcast_threadsafe(
+                        {
+                            "type": "slide_match",
+                            "data": {
+                                "slide_index": rag.slide_index,
+                                "slide_title": rag.slide_title,
+                                "score": rag.score,
+                            },
+                        }
+                    )
         is_vi_en_pair = {source_lang, target_lang} == {"vie_Latn", "eng_Latn"}
         can_hymt2 = (
             self._llama_server_ready
@@ -1298,7 +1340,9 @@ class EngineRuntime:
                             self.clear_cloud_cooldown()
                             return res
                         else:
-                            masked_c, restore_c = self.glossary.protect_terms(clean, source_lang, target_lang)
+                            masked_c, restore_c = self.glossary.protect_terms(
+                                clean, source_lang, target_lang, extra_locks=slide_matched_terms
+                            )
                             res = adapter.translate(masked_c, source_lang, target_lang)
                             if not res.cached:
                                 self.cloud_quota.record_usage(pid, len(clean))
@@ -1334,12 +1378,15 @@ class EngineRuntime:
                         target_lang,
                         context=context,
                         term_locks=active_term_locks,
+                        domain_hint=slide_domain_hint,
                     )
             except Exception:
                 pass
 
         # Placeholder-protected paths for CTranslate2 / Online / External LLM
-        masked, restore_pairs = self.glossary.protect_terms(clean, source_lang, target_lang)
+        masked, restore_pairs = self.glossary.protect_terms(
+            clean, source_lang, target_lang, extra_locks=slide_matched_terms
+        )
 
         # Standalone proper-name utterance (e.g. "Trương Gia Bình.") -> preserve verbatim with 0ms MT!
         if restore_pairs:
@@ -1574,6 +1621,21 @@ class EngineRuntime:
             "audience": self.get_audience_summary(),
             "glossary_enabled": g["enabled"],
             "glossary_count": len(g["asr_fixes"]) + len(g["term_locks"]),
+            "slide_context": {
+                "enabled": self.slide_context.enabled,
+                "filename": self.slide_context.filename,
+                "topic": self.slide_context.topic,
+                "slide_count": len(self.slide_context.pages),
+                "term_count": len(self.slide_context.terms),
+                "active_slide_index": self.slide_context.active_slide_index,
+                "active_slide_title": (
+                    self.slide_context.pages[self.slide_context.active_slide_index - 1].title
+                    if 1 <= self.slide_context.active_slide_index <= len(self.slide_context.pages)
+                    else ""
+                ),
+            },
+            "display_frozen": self._display_frozen,
+            "display_freeze_message": self._display_freeze_message,
             "cloud_api": self.cloud_quota.get_public_status(),
             "cloud_fallback_notice": self.get_cloud_fallback_notice(),
             "envit5_device": self._envit5.device if self._envit5 is not None else "cpu",
@@ -2446,6 +2508,18 @@ class EngineRuntime:
         self.broadcast_threadsafe({"type": "history", "data": list(self._history)})
         return True
 
+    def set_display_freeze(self, frozen: bool, message: Optional[str] = None) -> dict[str, Any]:
+        self._display_frozen = bool(frozen)
+        if message is not None and message.strip():
+            self._display_freeze_message = message.strip()[:160]
+        payload = {
+            "frozen": self._display_frozen,
+            "message": self._display_freeze_message,
+        }
+        self.broadcast_threadsafe({"type": "display_freeze", "data": payload})
+        self.broadcast_threadsafe({"type": "status", "data": self.get_status_payload()})
+        return payload
+
     def evaluate_translations(self, req: EvaluateRequest) -> dict[str, Any]:
         """Evaluate semantic translation quality using saved Google Gemini (or fallback Google Cloud) API key."""
         if req.items:
@@ -2723,7 +2797,11 @@ class EngineRuntime:
             "nên", "với", "cho", "trong", "khi", "cũng", "hay", "như", "tại",
             "cái", "những", "các", "một", "đôi", "sẽ", "đang", "có", "bị", "được",
             "tận", "cả", "đối", "rằng", "liệu", "tuy", "dù", "mặc", "bởi", "chứ",
-            "and", "but", "so", "to", "that", "because", "with", "the", "of", "in", "for", "or", "a", "an",
+            "giữa", "bằng", "về", "từ", "sau", "trước", "nhằm", "sang", "vào", "ra",
+            "lên", "xuống", "so", "theo", "qua", "bên", "ngoài",
+            "phải", "cần", "đã", "luôn", "vẫn", "chỉ", "càng",
+            "and", "but", "so", "to", "that", "because", "with", "the", "of", "in",
+            "for", "or", "a", "an", "between", "from", "into", "about", "through",
         }
         if words[-1] in single_connectors:
             return True
@@ -2732,6 +2810,9 @@ class EngineRuntime:
             if last2 in {
                 "nhưng mà", "để mà", "có thể", "tức là", "gọi là", "bất kể",
                 "cũng như", "hay là", "cho nên", "sẽ có", "có cái", "thì đôi",
+                "so với", "như là", "khi mà", "đối với", "từ phía", "về phía",
+                "giữa các", "tách biệt", "liên quan", "dựa trên",
+                "luôn phải", "cần phải", "sẽ phải", "đang phải", "vẫn đang", "không thể",
             }:
                 return True
         return False
@@ -3026,9 +3107,9 @@ class EngineRuntime:
                 protected_terms=prot_terms,
             )
         )
-        # On Stop, drop an orphaned 1-word trailing connector/filler (e.g. "Là" -> "Is") so
-        # Spotlight & History never end on a stray fragment when the user stops mid-sentence.
-        if is_stop_flush and len(display_text.split()) == 1 and self._ends_with_connector(display_text):
+        # Drop orphaned 1-2 word dangling connectors (e.g. "Là", "So với") so LED/History
+        # never display meaningless stray fragments when speech pauses or stops mid-clause.
+        if len(display_text.split()) <= 2 and self._ends_with_connector(display_text):
             return
         speaker_tag = "self" if self.config.audio_source == "dual" else ""
         self.broadcast_threadsafe(
@@ -4251,6 +4332,74 @@ def api_history_update(req: HistoryUpdateRequest):
         source_text=req.source_text,
     )
     return {"ok": True, "updated": updated}
+
+
+class SlideContextTextRequest(BaseModel):
+    text: Optional[str] = None
+    topic: Optional[str] = None
+    terms: Optional[list[dict[str, Any]]] = None
+    enabled: Optional[bool] = None
+    apply_dau_preset: bool = False
+    active_slide_index: Optional[int] = None
+
+
+class DisplayFreezeRequest(BaseModel):
+    frozen: bool
+    message: Optional[str] = None
+
+
+@app.get("/api/context")
+def api_get_context():
+    return runtime.slide_context.get_payload()
+
+
+@app.post("/api/context/upload")
+async def api_upload_context(file: UploadFile = File(...)):
+    orig_name = file.filename or "slides.txt"
+    data = await file.read()
+    if len(data) > 40 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File tài liệu vượt quá giới hạn 40 MB.")
+    try:
+        payload = await asyncio.to_thread(runtime.slide_context.ingest_file, orig_name, data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Lỗi đọc tài liệu: {exc}") from exc
+    runtime._last_slide_match_idx = payload.get("active_slide_index", 0)
+    runtime.sync_asr_hotwords()
+    runtime.broadcast_threadsafe({"type": "status", "data": runtime.get_status_payload()})
+    return {"ok": True, **payload}
+
+
+@app.post("/api/context/text")
+def api_update_context_text(req: SlideContextTextRequest):
+    payload = runtime.slide_context.ingest_text(
+        text=req.text,
+        topic=req.topic,
+        terms=req.terms,
+        enabled=req.enabled,
+        apply_dau_preset=req.apply_dau_preset,
+        active_slide_index=req.active_slide_index,
+    )
+    runtime._last_slide_match_idx = payload.get("active_slide_index", 0)
+    runtime.sync_asr_hotwords()
+    runtime.broadcast_threadsafe({"type": "status", "data": runtime.get_status_payload()})
+    return {"ok": True, **payload}
+
+
+@app.delete("/api/context")
+def api_clear_context():
+    payload = runtime.slide_context.clear()
+    runtime._last_slide_match_idx = 0
+    runtime.sync_asr_hotwords()
+    runtime.broadcast_threadsafe({"type": "status", "data": runtime.get_status_payload()})
+    return {"ok": True, **payload}
+
+
+@app.post("/api/display/freeze")
+def api_display_freeze(req: DisplayFreezeRequest):
+    res = runtime.set_display_freeze(req.frozen, req.message)
+    return {"ok": True, **res}
 
 
 @app.get("/api/files/progress")
