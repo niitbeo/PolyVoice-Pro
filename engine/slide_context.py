@@ -188,16 +188,33 @@ def _infer_term_lang(s: str) -> str:
     return ""
 
 
-def _term_word_match(term_low: str, term_fold: str, q_low: str, q_fold: str) -> bool:
-    """Unicode word-boundary matching (prevents 'AI' matching 'đại học' or 'khoa' matching 'khoảng cách')."""
+def _term_word_match(
+    term_low: str,
+    term_fold: str,
+    q_low: str,
+    q_fold: str,
+    _cache: dict[str, "re.Pattern[str]"] | None = None,
+) -> bool:
+    """Unicode word-boundary matching (prevents 'AI' matching 'đại học' or 'khoa' matching 'khoảng cách').
+    Pass _cache dict to reuse compiled patterns across calls for the same term (significant speedup at >50 terms).
+    """
     if not term_low:
         return False
     # Non-spaced CJK/Thai/Khmer scripts can match directly by substring
     if any("\u3040" <= ch <= "\u9fff" or "\u0e00" <= ch <= "\u0e7f" or "\u1780" <= ch <= "\u17ff" for ch in term_low):
         return term_low in q_low
-    pat_exact = rf"(?<!\w){re.escape(term_low)}(?!\w)"
-    if re.search(pat_exact, q_low, re.UNICODE):
-        return True
+    # Use cached compiled pattern when available
+    if _cache is not None:
+        pat_exact = _cache.get(term_low)
+        if pat_exact is None:
+            pat_exact = re.compile(rf"(?<!\w){re.escape(term_low)}(?!\w)", re.UNICODE)
+            _cache[term_low] = pat_exact
+        if pat_exact.search(q_low):
+            return True
+    else:
+        pat_exact = rf"(?<!\w){re.escape(term_low)}(?!\w)"
+        if re.search(pat_exact, q_low, re.UNICODE):
+            return True
     # Accent-folded fallback ONLY for multi-word phrases (len >= 6) with word boundaries
     # so missing Vietnamese tone marks from ASR still lock multi-word terms with zero single-word collisions
     if " " in term_fold and len(term_fold) >= 6:
@@ -568,6 +585,8 @@ class SlideContextManager:
         self.active_slide_index: int = 0  # 1-based; 0 means none matched yet
         self._page_tokens: list[set[str]] = []
         self._idf: dict[str, float] = {}
+        # Cache compiled word-boundary regex per term_low to avoid re-compiling on every utterance
+        self._term_regex_cache: dict[str, re.Pattern[str]] = {}
         self._load()
 
     def _rebuild_index_locked(self) -> None:
@@ -580,6 +599,8 @@ class SlideContextManager:
                 df[t] += 1
         n = max(len(self.pages), 1)
         self._idf = {t: math.log((n + 1.0) / (c + 0.5)) + 1.0 for t, c in df.items()}
+        # Invalidate term regex cache when slide/term content changes
+        self._term_regex_cache.clear()
 
     def _load(self) -> None:
         if not self.store_path.is_file():
@@ -877,7 +898,7 @@ class SlideContextManager:
                 is_verbatim = s_low == t_low
 
                 if is_verbatim:
-                    if _term_word_match(s_low, s_fold, q_low, q_fold):
+                    if _term_word_match(s_low, s_fold, q_low, q_fold, self._term_regex_cache):
                         raw_matches.append({"source": t.source, "target": eff_target})
                     continue
 
@@ -888,7 +909,7 @@ class SlideContextManager:
                 fwd_lang_ok = (not tgt_inferred) or (tgt_inferred == tgt_lang) or (
                     tgt_inferred == "zho_Hant" and tgt_lang.startswith("zho_")
                 )
-                if fwd_lang_ok and _term_word_match(s_low, s_fold, q_low, q_fold):
+                if fwd_lang_ok and _term_word_match(s_low, s_fold, q_low, q_fold, self._term_regex_cache):
                     raw_matches.append({"source": t.source, "target": eff_target})
                     continue
 
@@ -896,7 +917,7 @@ class SlideContextManager:
                 rev_lang_ok = (not src_inferred) or (src_inferred == tgt_lang) or (
                     src_inferred == "zho_Hant" and tgt_lang.startswith("zho_")
                 )
-                if rev_lang_ok and _term_word_match(t_low, t_fold, q_low, q_fold):
+                if rev_lang_ok and _term_word_match(t_low, t_fold, q_low, q_fold, self._term_regex_cache):
                     raw_matches.append({"source": eff_target, "target": t.source})
 
             # Rank longest phrase first and drop redundant sub-spans already covered by a longer match

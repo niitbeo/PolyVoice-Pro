@@ -631,9 +631,13 @@ class EngineRuntime:
     async def register_ws(self, ws: WebSocket) -> None:
         async with self._ws_lock:
             self._ws_clients.add(ws)
-        await ws.send_json({"type": "status", "data": self.get_status_payload()})
-        if self._history:
-            await ws.send_json({"type": "history", "data": self._history[-100:]})
+        try:
+            await ws.send_json({"type": "status", "data": self.get_status_payload()})
+            if self._history:
+                await ws.send_json({"type": "history", "data": self._history[-100:]})
+        except Exception:
+            # Client disconnected immediately after handshake — harmless, will unregister on close
+            pass
 
     async def unregister_ws(self, ws: WebSocket) -> None:
         async with self._ws_lock:
@@ -657,7 +661,10 @@ class EngineRuntime:
         req_lang = lang.strip() if lang and lang.strip() else "follow"
         async with self._ws_lock:
             self._audience_ws[ws] = req_lang
-        await ws.send_json({"type": "status", "data": self.get_audience_status_payload()})
+        try:
+            await ws.send_json({"type": "status", "data": self.get_audience_status_payload()})
+        except Exception:
+            return  # Client disconnected immediately — unregister handled by ws_audience_endpoint finally
         # Send recent history (capped at last 8 entries to avoid MT lock starvation on connect)
         recent = list(self._history)[-8:]
         if recent:
@@ -4045,11 +4052,11 @@ class EngineRuntime:
             mt_engine = self.config.mt_mode
             try:
                 mt = self.translate_text(sample, src, tgt, mt_mode=self.config.mt_mode, beam_size=self.config.beam_size)
-                tr_final = mt.translated_text
+                tr_final = mt.translated_text or sample  # fallback: show source if MT empty
                 mt_ms = mt.latency_ms
                 mt_engine = mt.engine
             except Exception:
-                pass
+                tr_final = sample  # fallback: show source text instead of blank
 
             entry = {
                 "id": seg_id,
@@ -4064,6 +4071,8 @@ class EngineRuntime:
                 "timestamp": time.strftime("%H:%M:%S"),
             }
             self._history.append(entry)
+            if len(self._history) > 300:
+                self._history = self._history[-300:]
             self.broadcast_threadsafe({"type": "final", "data": entry})
             self._fanout_audience_final(entry)
 
