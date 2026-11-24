@@ -4,7 +4,15 @@ Tất cả thay đổi đáng chú ý của **DAU Voice Pro** được ghi nhậ
 
 ---
 
-## [1.1.1] — 2026-11-24 *(Bản phát hành chính thức mới nhất)*
+## [1.1.2] — 2026-11-24 *(Bản phát hành chính thức mới nhất)*
+
+### ✨ Tinh chỉnh giao diện & Tài liệu
+- **Hộp thoại thoát ứng dụng gọn, chuyên nghiệp:** Thu gọn hộp thoại (`390px`), tiêu đề `Thoát DAU Voice Pro?`, thông điệp 1 dòng rõ ràng theo ngữ cảnh (bình thường / đang dịch live / đang chạy tác vụ), bỏ các ghi chú thừa và căn phải 2 nút `Hủy` | `Thoát`.
+- **Hoàn thiện tài liệu phát hành:** Bổ sung `CHANGELOG.md` đầy đủ và cập nhật `README.md` cho dòng `v1.1.x`.
+
+---
+
+## [1.1.1] — 2026-11-24
 
 Bản phát hành hoàn chỉnh mang đến **Sân khấu LED Hội trường**, **Slide-Aware RAG 100% Offline**, **Bảo mật Wi-Fi LAN hội nghị** và toàn bộ bản vá độ ổn định qua kiểm định đa lớp cho **Windows x64** và **macOS Apple Silicon**.
 
