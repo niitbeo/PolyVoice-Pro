@@ -48,19 +48,23 @@ Thay vì phụ thuộc vào các thư viện AI nặng nề (như PyTorch hàng 
   - **Đa ngôn ngữ (20 ngôn ngữ nói):** Tự động định tuyến sang `Whisper` / `SenseVoice` (Thái, Lào, Trung, Nhật, Hàn, Pháp, Đức, Nga...).
 - **Dịch máy 2 tầng (Việt ⇄ Anh & 202 Ngôn ngữ):** `VietAI EnViT5` chuyên biệt cho cặp Việt ⇄ Anh (`~134–212 ms`), `Meta NLLB-200 600M INT8` cho **202 ngôn ngữ**, và tùy chọn mở rộng `Hy-MT2-1.8B` (`llama.cpp` GGUF) cho máy cấu hình cao.
 
-### 2. Kiểm định Chất lượng Dịch & Chính xác Ngữ nghĩa bằng Google AI *(Mới ở v0.9.5)*
+### 2. Sân khấu LED Hội trường & Slide-Aware RAG 100% Offline *(Mới ở v1.1)*
+- **Chế độ Sân khấu LED (`led-stage`):** Hiển thị 3–4 câu chốt hoàn chỉnh đứng yên cỡ chữ lớn cho hàng ghế cuối (0% nhảy sửa chữ), kèm thanh nghe sống mờ ở đáy màn hình, **QR góc màn LED** không che chữ, **Sửa nhanh bản dịch trực tiếp lên LED & QR**, và nút **Tạm ẩn màn chờ DAU** tức thì khi nghỉ giải lao.
+- **Nạp Slide & Bối cảnh Hội nghị (`engine/slide_context.py`):** Kéo thả `.PPTX`, `.PDF`, `.DOCX` hoặc dán chương trình hội nghị trước giờ G — tự động rút tên riêng/thuật ngữ (gồm bộ chuẩn **DAU Preset**) vào **ASR Hotwords** và đối chiếu vị trí trang Slide theo thời gian thực (`<1ms`, 100% offline).
+
+### 3. Kiểm định Chất lượng Dịch & Chính xác Ngữ nghĩa bằng Google AI
 - **2 điểm chạm trực tiếp trong Lịch sử:** Nút **`Đánh giá`** trên thanh công cụ để chấm toàn bộ phiên họp, và icon chiếc khiên (`ShieldCheck`) trên từng thẻ hội thoại để kiểm định tức thì riêng từng câu.
 - **Phân tích chuyên sâu qua `Google Gemini 2.5 Flash`** *(tự dự phòng sang Google Cloud Translation v2)*:
   - Chấm **điểm tổng `0–100%`** kèm 3 chỉ số thành phần: *Chính xác ngữ nghĩa*, *Tự nhiên & ngữ cảnh*, *Đầu vào nghe (ASR)*.
   - Phân biệt chính xác 4 loại trạng thái: `Chuẩn sát nghĩa`, `Hơi thô / Sắc thái`, `Sai / Lệch nghĩa`, và **`Nghe nhầm ASR`**.
   - **Sửa lỗi 1 chạm:** Bấm **`Áp dụng bản sửa`** để cập nhật ngay vào Lịch sử & file xuất `.TXT`/`.SRT`; bấm chip **`+ Thêm Từ điển`** để tự sửa lỗi nghe nhầm tên riêng/thuật ngữ cho các lần dịch sau.
 
-### 3. Công tắc 1 chạm `Offline | Cloud API` Chính Thức
+### 4. Công tắc 1 chạm `Offline | Cloud API` Chính Thức
 - Chuyển đổi tức thì giữa **100% Offline** và **Cloud API** ngay trong lúc đang dịch: hỗ trợ **Google Gemini (`gemini-2.5-flash`)**, **Microsoft Azure Translator (Free F0 — 2 triệu ký tự/tháng)** và **Google Cloud Translation (500 nghìn ký tự/tháng)**.
 - **Tiết kiệm ~85% hạn mức:** Nháp chữ chạy trực tiếp lúc diễn giả đang nói luôn dùng engine Offline, chỉ gọi Cloud API cho câu chốt hoàn chỉnh, kèm bộ đếm hạn mức tự khóa ở ngưỡng miễn phí (0 đồng).
 
-### 4. Trọn bộ Công cụ Hội trường, Họp Trực tuyến & Livestream
-- **Cửa sổ Phụ đề Nổi đa chế độ:** Hỗ trợ **`Xếp tầng`**, **`YouTube`**, **`Chỉ dịch`**, **`50/50 Song ngữ`**, kéo sang màn hình chiếu thứ 2, **`Đầy màn hình`**, **`Xuyên chuột`**, điều chỉnh cỡ chữ & độ trong suốt linh hoạt.
+### 5. Trọn bộ Công cụ Hội trường, Họp Trực tuyến & Livestream
+- **Cửa sổ Phụ đề Nổi đa chế độ:** Hỗ trợ **`Sân khấu LED`**, **`Xếp tầng`**, **`YouTube`**, **`Chỉ dịch`**, **`50/50 Song ngữ`**, kéo sang màn hình chiếu thứ 2, **`Đầy màn hình`**, **`Xuyên chuột`**, **`Tạm ẩn màn chờ`**, điều chỉnh cỡ chữ & độ trong suốt linh hoạt.
 - **Phát phụ đề đa ngôn ngữ qua QR Wi-Fi Nội bộ (`/audience`):** Đại biểu quét mã QR trên điện thoại (chạy qua mạng LAN/Wi-Fi, không cần cài app, không cần Internet) và **tự chọn ngôn ngữ phụ đề riêng** (Anh, Thái, Lào, Khmer, Trung, Nhật, Hàn...).
 - **OBS Browser Source (`/obs`):** Nền trong suốt sẵn sàng ghép trực tiếp vào OBS Studio / vMix / Livestream sự kiện.
 - **Thu âm 2 chiều (`[Bạn]` + `[Đối tác]`):** Ghi đồng thời Micro/Mixer và Âm thanh hệ thống (Zoom, Google Meet, Microsoft Teams, YouTube) bằng `ScreenCaptureKit` native trên macOS và `WASAPI Loopback` trên Windows.
@@ -234,14 +238,16 @@ pnpm tauri dev
 VOICERECORE/
 ├── src/                         # Frontend React 19 + TypeScript + CSS
 │   ├── App.tsx                  # Giao diện chính, Spotlight 2 tầng, Lịch sử & Google AI Audit
-│   ├── OverlayWindow.tsx        # Cửa sổ Phụ đề Nổi Hội trường (50/50, YouTube, Xếp tầng)
-│   ├── types.ts                 # Kiểu dữ liệu Transcript, EvaluationReport & Glossary
+│   ├── OverlayWindow.tsx        # Cửa sổ Sân khấu LED & Phụ đề Nổi (LED, 50/50, YouTube, Xếp tầng)
+│   ├── SlideContextModal.tsx    # Modal nạp Slide (.PPTX/.PDF/.DOCX) & quản lý bối cảnh RAG
+│   ├── types.ts                 # Kiểu dữ liệu Transcript, SlideContext, EvaluationReport & Glossary
 │   └── styles.css               # Hệ thống giao diện Crimson Academic Pro (Dark & Light)
 ├── src-tauri/                   # Desktop Shell Rust (Tauri 2)
 │   ├── src/lib.rs               # Quản lý sidecar, Overlay xuyên chuột, phím tắt & Auto-Updater
 │   └── tauri.conf.json          # Cấu hình cửa sổ, bundle & khóa công khai Ed25519
 ├── engine/                      # Local AI Backend Sidecar (Python 3.12 + FastAPI)
 │   ├── server.py                # FastAPI + WebSocket hub, pipeline đa luồng & API đánh giá
+│   ├── slide_context.py         # Slide-Aware RAG offline (.PPTX/.PDF/.DOCX), DAU Preset & Hotwords
 │   ├── asr_engine.py            # Zipformer, VietASR Pass-2, Hybrid Silero VAD + Moonshine-v2
 │   ├── translator.py            # EnViT5, NLLB-600M, Hy-MT2, Cloud API & Google AI Auditor
 │   ├── audio_capture.py         # Thu âm Micro (blocking read), macOS Helper & Windows WASAPI
@@ -259,10 +265,10 @@ VOICERECORE/
 ### Phát hành phiên bản mới (1 lệnh duy nhất)
 
 ```bash
-bash scripts/release.sh 0.9.5 "Mô tả tính năng hoặc bản sửa lỗi mới"
+bash scripts/release.sh 1.1.1 "Sân khấu LED hội trường, Slide-Aware RAG & nâng cấp ổn định"
 ```
 
-Script tự động đồng bộ phiên bản (`package.json`, `tauri.conf.json`, `Cargo.toml`), tạo git tag `vX.Y.Z` và đẩy lên GitHub để **GitHub Actions** tự build bản cài đặt **Windows (`.exe`/`.msi`)** + **macOS (`.dmg`)**, smoke-test sidecar, ký số **Ed25519** và phát hành kèm `latest.json` cho toàn bộ người dùng.
+Script tự động kiểm tra working tree sạch & không trùng tag, đồng bộ phiên bản trên toàn bộ manifest & lockfile (`package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, `engine/pyproject.toml`, `engine/uv.lock`, `engine/server.py`, `engine/model_manager.py`, `src/App.tsx`), tạo git tag `vX.Y.Z` và đẩy lên GitHub để **GitHub Actions** tự build bản cài đặt **Windows (`.exe`/`.msi`)** + **macOS (`.dmg`)**, smoke-test sidecar, ký số **Ed25519** và phát hành kèm `latest.json` cho toàn bộ người dùng.
 
 ---
 

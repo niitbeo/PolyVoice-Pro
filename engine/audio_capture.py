@@ -887,6 +887,7 @@ class WindowsLoopbackStream:
                 src_ch = max(1, int(loopback["maxInputChannels"]))
                 frames_per_100ms = max(160, int(round(src_rate * CHUNK_MS / 1000)))
 
+                pcm_lock = threading.Lock()
                 state = {
                     "last_pkt": time.monotonic(),
                     "pcm_buf": np.empty(0, dtype=np.int16),
@@ -896,7 +897,8 @@ class WindowsLoopbackStream:
                 def _cb(in_data, frame_count, time_info, status_flags):
                     if not self._running.is_set():
                         return (None, pyaudio.paComplete)
-                    state["last_pkt"] = time.monotonic()
+                    now_ts = time.monotonic()
+                    ready_blocks: list[np.ndarray] = []
                     if in_data:
                         if state["use_float32"]:
                             arr = np.frombuffer(in_data, dtype=np.float32)
@@ -906,16 +908,26 @@ class WindowsLoopbackStream:
                         if mono16k.size > 0:
                             pcm, level, clipping = self._cond.process_float(mono16k)
                             self._emit_meter(level, clipping)
-                            if state["pcm_buf"].size > 0:
-                                combined = np.concatenate((state["pcm_buf"], pcm))
-                            else:
-                                combined = pcm
-                            pos = 0
-                            n = combined.size
-                            while pos + BLOCK_SIZE <= n:
-                                self._enqueue_pcm(combined[pos : pos + BLOCK_SIZE].copy())
-                                pos += BLOCK_SIZE
-                            state["pcm_buf"] = combined[pos:]
+                            with pcm_lock:
+                                state["last_pkt"] = now_ts
+                                if state["pcm_buf"].size > 0:
+                                    combined = np.concatenate((state["pcm_buf"], pcm))
+                                else:
+                                    combined = pcm
+                                pos = 0
+                                n = combined.size
+                                while pos + BLOCK_SIZE <= n:
+                                    ready_blocks.append(combined[pos : pos + BLOCK_SIZE].copy())
+                                    pos += BLOCK_SIZE
+                                state["pcm_buf"] = combined[pos:]
+                        else:
+                            with pcm_lock:
+                                state["last_pkt"] = now_ts
+                    else:
+                        with pcm_lock:
+                            state["last_pkt"] = now_ts
+                    for blk in ready_blocks:
+                        self._enqueue_pcm(blk)
                     return (None, pyaudio.paContinue)
 
                 try:
@@ -953,14 +965,20 @@ class WindowsLoopbackStream:
                     # WASAPI loopback emits zero callbacks when system audio is silent.
                     # First flush any trailing <100ms speech samples trapped in `pcm_buf` (zero-padded),
                     # then feed silence chunks after 200ms idle so VAD/Zipformer endpoints finalize cleanly.
-                    if (time.monotonic() - state["last_pkt"]) >= 0.20:
-                        rem = state["pcm_buf"]
-                        if rem.size > 0:
+                    flush_idle = False
+                    rem = None
+                    with pcm_lock:
+                        if (time.monotonic() - state["last_pkt"]) >= 0.20:
+                            flush_idle = True
+                            if state["pcm_buf"].size > 0:
+                                rem = state["pcm_buf"]
+                                state["pcm_buf"] = np.empty(0, dtype=np.int16)
+                    if flush_idle:
+                        if rem is not None and rem.size > 0:
                             padded = np.zeros(BLOCK_SIZE, dtype=np.int16)
                             n_copy = min(rem.size, BLOCK_SIZE)
                             padded[:n_copy] = rem[:n_copy]
                             self._enqueue_pcm(padded)
-                            state["pcm_buf"] = np.empty(0, dtype=np.int16)
                         else:
                             self._enqueue_pcm(silence_chunk)
                         self._emit_meter(0.0, False)

@@ -75,7 +75,10 @@ def _stage_mac(tmp: Path) -> Path:
     extract_dir = tmp / "extracted"
     extract_dir.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:gz") as tf:
-        tf.extractall(extract_dir)
+        if sys.version_info >= (3, 12):
+            tf.extractall(extract_dir, filter="data")
+        else:
+            tf.extractall(extract_dir)
 
     # Locate folder containing `llama-server`
     found_bins = list(extract_dir.rglob("llama-server"))

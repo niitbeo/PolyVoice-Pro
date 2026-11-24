@@ -31,7 +31,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -498,7 +498,8 @@ class EngineRuntime:
     def __init__(self) -> None:
         self.model_manager = ModelManager()
         self.glossary = GlossaryManager()
-        self.slide_context = SlideContextManager(Path.home() / ".cache" / "voicerecore" / "slide_context.json")
+        _cache_dir = Path(os.environ.get("VOICERECORE_CACHE_DIR", str(Path.home() / ".cache" / "voicerecore")))
+        self.slide_context = SlideContextManager(_cache_dir / "slide_context.json")
         self.cloud_quota = CloudQuotaManager()
         self.logger = SessionLogger()
         self.config = SessionConfig()
@@ -518,6 +519,12 @@ class EngineRuntime:
         self._ws_clients: set[WebSocket] = set()
         self._audience_ws: dict[WebSocket, str] = {}
         self._ws_lock = asyncio.Lock()
+        self._audience_snap_lock = threading.Lock()
+        self._aud_backfill_lock = threading.Lock()
+        self._aud_backfill_cache: OrderedDict[tuple[str, str], tuple[str, str]] = OrderedDict()
+        self._aud_backfill_inflight: dict[tuple[str, str, str], asyncio.Task[str]] = {}
+        self._aud_backfill_sem: Optional[asyncio.Semaphore] = None
+        self._aud_backfill_sem_loop: Optional[asyncio.AbstractEventLoop] = None
 
         self._asr_zf_vi: Optional[ZipformerStreamingViEngine] = None
         self._asr_hybrid_en: Optional[HybridEnStreamingEngine] = None
@@ -561,7 +568,7 @@ class EngineRuntime:
         self._active_asr_label: str = ""
         self._remote_asr_label: str = ""
 
-        self._final_mt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._final_mt_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=32)
         self._partial_lock = threading.Lock()
         self._pending_partial: Optional[dict[str, Any]] = None
         self._committed_seg_ids: deque[str] = deque(maxlen=64)
@@ -603,6 +610,7 @@ class EngineRuntime:
 
         self._current_segment_id: str = ""
         self._last_level_emit = 0.0
+        self._history_lock = threading.Lock()
         self._history: list[dict[str, Any]] = []
         self._boot_error: str = ""
         self._file_job_progress: dict[str, Any] = {"active": False}
@@ -628,16 +636,100 @@ class EngineRuntime:
             return
         asyncio.run_coroutine_threadsafe(self.broadcast(payload), self.loop)
 
+    @staticmethod
+    async def _send_json_safe(ws: WebSocket, payload: dict[str, Any], timeout_s: float = 2.0) -> bool:
+        try:
+            await asyncio.wait_for(ws.send_json(payload), timeout=timeout_s)
+            return True
+        except Exception:
+            return False
+
+    def _get_backfill_semaphore(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        if self._aud_backfill_sem is None or self._aud_backfill_sem_loop is not loop:
+            self._aud_backfill_sem = asyncio.Semaphore(2)
+            self._aud_backfill_sem_loop = loop
+        return self._aud_backfill_sem
+
+    def _cache_audience_translation(
+        self,
+        entry_id: str,
+        lang: str,
+        source_text: str,
+        translated_text: str,
+    ) -> None:
+        if not entry_id or not lang:
+            return
+        key = (str(entry_id), str(lang))
+        with self._aud_backfill_lock:
+            self._aud_backfill_cache[key] = (source_text, translated_text)
+            self._aud_backfill_cache.move_to_end(key)
+            while len(self._aud_backfill_cache) > 512:
+                self._aud_backfill_cache.popitem(last=False)
+
+    def _invalidate_audience_cache(self, entry_ids: Optional[set[str]] = None) -> None:
+        with self._aud_backfill_lock:
+            if entry_ids is None:
+                self._aud_backfill_cache.clear()
+                return
+            for key in [k for k in self._aud_backfill_cache if k[0] in entry_ids]:
+                self._aud_backfill_cache.pop(key, None)
+
+    async def _translate_audience_backfill(
+        self,
+        entry_id: str,
+        source_text: str,
+        source_lang: str,
+        req_lang: str,
+    ) -> str:
+        """Single-flight + LRU-cached + concurrency-capped backfill translation so 20+ simultaneous
+        QR joins never queue 160 redundant MT calls or starve live LED translation."""
+        cache_key = (str(entry_id), str(req_lang))
+        with self._aud_backfill_lock:
+            cached = self._aud_backfill_cache.get(cache_key)
+            if cached is not None and cached[0] == source_text:
+                self._aud_backfill_cache.move_to_end(cache_key)
+                return cached[1]
+
+        inflight_key = (str(entry_id), str(req_lang), source_text)
+        task = self._aud_backfill_inflight.get(inflight_key)
+        if task is None or task.done():
+            sem = self._get_backfill_semaphore()
+
+            async def _run() -> str:
+                try:
+                    async with sem:
+                        tr = await asyncio.to_thread(
+                            self.translate_text,
+                            source_text,
+                            source_lang,
+                            req_lang,
+                            self.config.mt_mode,
+                            1,
+                            update_slide_state=False,
+                        )
+                    self._cache_audience_translation(entry_id, req_lang, source_text, tr.translated_text)
+                    return tr.translated_text
+                finally:
+                    if self._aud_backfill_inflight.get(inflight_key) is task_ref:
+                        self._aud_backfill_inflight.pop(inflight_key, None)
+
+            task_ref = asyncio.create_task(_run())
+            self._aud_backfill_inflight[inflight_key] = task_ref
+            task = task_ref
+
+        return await asyncio.shield(task)
+
     async def register_ws(self, ws: WebSocket) -> None:
         async with self._ws_lock:
             self._ws_clients.add(ws)
-        try:
-            await ws.send_json({"type": "status", "data": self.get_status_payload()})
-            if self._history:
-                await ws.send_json({"type": "history", "data": self._history[-100:]})
-        except Exception:
-            # Client disconnected immediately after handshake — harmless, will unregister on close
-            pass
+        ok = await self._send_json_safe(ws, {"type": "status", "data": self.get_status_payload()})
+        if not ok:
+            return
+        with self._history_lock:
+            hist_snap = list(self._history[-100:])
+        if hist_snap:
+            await self._send_json_safe(ws, {"type": "history", "data": hist_snap})
 
     async def unregister_ws(self, ws: WebSocket) -> None:
         async with self._ws_lock:
@@ -660,16 +752,17 @@ class EngineRuntime:
     async def register_audience_ws(self, ws: WebSocket, lang: str = "follow") -> None:
         req_lang = lang.strip() if lang and lang.strip() else "follow"
         async with self._ws_lock:
-            self._audience_ws[ws] = req_lang
-        try:
-            await ws.send_json({"type": "status", "data": self.get_audience_status_payload()})
-        except Exception:
+            with self._audience_snap_lock:
+                self._audience_ws[ws] = req_lang
+        if not await self._send_json_safe(ws, {"type": "status", "data": self.get_audience_status_payload()}):
             return  # Client disconnected immediately — unregister handled by ws_audience_endpoint finally
-        # Send recent history (capped at last 8 entries to avoid MT lock starvation on connect)
-        recent = list(self._history)[-8:]
+        # Send recent history (capped at last 8 entries + single-flight cached to avoid MT lock starvation)
+        with self._history_lock:
+            recent = list(self._history[-8:])
         if recent:
             if req_lang == "follow":
-                await ws.send_json({"type": "history", "data": recent})
+                if not await self._send_json_safe(ws, {"type": "history", "data": recent}):
+                    return
             else:
                 customized = []
                 for e in recent:
@@ -677,30 +770,32 @@ class EngineRuntime:
                         customized.append(e)
                     else:
                         try:
-                            tr = await asyncio.to_thread(
-                                self.translate_text,
-                                e["source_text"],
-                                e["source_lang"],
+                            tr_txt = await self._translate_audience_backfill(
+                                str(e.get("id", "")),
+                                str(e.get("source_text", "")),
+                                str(e.get("source_lang", self.config.source_lang)),
                                 req_lang,
-                                self.config.mt_mode,
-                                1,
                             )
-                            customized.append({**e, "target_lang": req_lang, "translated_text": tr.translated_text})
+                            customized.append({**e, "target_lang": req_lang, "translated_text": tr_txt})
                         except Exception as exc:
                             logger.warning("Audience history backfill failed for %s: %s", req_lang, exc)
                             customized.append(e)
-                await ws.send_json({"type": "history", "data": customized})
+                if not await self._send_json_safe(ws, {"type": "history", "data": customized}):
+                    return
         await self.broadcast({"type": "audience_count", "data": self.get_audience_summary()})
 
     async def unregister_audience_ws(self, ws: WebSocket) -> None:
         async with self._ws_lock:
-            self._audience_ws.pop(ws, None)
+            with self._audience_snap_lock:
+                self._audience_ws.pop(ws, None)
         await self.broadcast({"type": "audience_count", "data": self.get_audience_summary()})
 
     def get_audience_summary(self) -> dict[str, Any]:
-        langs = sorted({l for l in self._audience_ws.values() if l != "follow"})
+        with self._audience_snap_lock:
+            count = len(self._audience_ws)
+            langs = sorted({l for l in self._audience_ws.values() if l != "follow"})
         return {
-            "connected_count": len(self._audience_ws),
+            "connected_count": count,
             "active_languages": langs,
         }
 
@@ -723,12 +818,6 @@ class EngineRuntime:
         async with self._ws_lock:
             clients = list(self._ws_clients)
             aud_items = list(self._audience_ws.items())
-        dead: list[WebSocket] = []
-        for ws in clients:
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(ws)
 
         ev_type = payload.get("type")
         ev_data = payload.get("data")
@@ -737,28 +826,54 @@ class EngineRuntime:
             if ev_type == "status" and aud_items
             else None
         )
-        dead_aud: list[WebSocket] = []
+
+        # Build bounded-parallel send tasks (timeout=2.0s per socket) so one half-open conference Wi-Fi phone
+        # NEVER head-of-line stalls delivery to 50+ other attendees.
+        admin_jobs: list[tuple[WebSocket, dict[str, Any]]] = (
+            [] if ev_type == "history_patch" else [(ws, payload) for ws in clients]
+        )
+        aud_jobs: list[tuple[WebSocket, dict[str, Any]]] = []
         for aws, alang in aud_items:
-            try:
-                if ev_type == "status" and aud_status_payload is not None:
-                    await aws.send_json(aud_status_payload)
-                elif ev_type in ("partial", "display_freeze"):
-                    await aws.send_json(payload)
-                elif ev_type == "history" and isinstance(ev_data, list):
-                    if len(ev_data) == 0 or alang == "follow":
-                        await aws.send_json({"type": "history", "data": ev_data[-80:]})
-                elif ev_type in ("partial_mt", "final") and isinstance(ev_data, dict):
-                    if alang == "follow" or alang == ev_data.get("target_lang"):
-                        await aws.send_json(payload)
-            except Exception:
-                dead_aud.append(aws)
+            if ev_type == "status" and aud_status_payload is not None:
+                aud_jobs.append((aws, aud_status_payload))
+            elif ev_type in ("partial", "display_freeze"):
+                aud_jobs.append((aws, payload))
+            elif ev_type == "history" and isinstance(ev_data, list):
+                if len(ev_data) == 0 or alang == "follow":
+                    aud_jobs.append((aws, {"type": "history", "data": ev_data[-80:]}))
+            elif ev_type == "history_patch" and isinstance(ev_data, dict):
+                patch_entry = ev_data.get("entry")
+                if isinstance(patch_entry, dict) and alang != "follow" and alang == patch_entry.get("target_lang"):
+                    aud_jobs.append((aws, payload))
+            elif ev_type in ("partial_mt", "final") and isinstance(ev_data, dict):
+                if alang == "follow" or alang == ev_data.get("target_lang"):
+                    aud_jobs.append((aws, payload))
+
+        if not admin_jobs and not aud_jobs:
+            return
+
+        sem = asyncio.Semaphore(32)
+
+        async def _bounded_send(sock: WebSocket, msg: dict[str, Any]) -> bool:
+            async with sem:
+                return await self._send_json_safe(sock, msg, timeout_s=2.0)
+
+        all_results = await asyncio.gather(
+            *(_bounded_send(ws, msg) for ws, msg in admin_jobs),
+            *(_bounded_send(aws, msg) for aws, msg in aud_jobs),
+        )
+        n_admin = len(admin_jobs)
+        dead = [admin_jobs[i][0] for i in range(n_admin) if not all_results[i]]
+        dead_aud = [aud_jobs[i][0] for i in range(len(aud_jobs)) if not all_results[n_admin + i]]
 
         if dead or dead_aud:
             async with self._ws_lock:
                 for ws in dead:
                     self._ws_clients.discard(ws)
-                for aws in dead_aud:
-                    self._audience_ws.pop(aws, None)
+                if dead_aud:
+                    with self._audience_snap_lock:
+                        for aws in dead_aud:
+                            self._audience_ws.pop(aws, None)
 
     def _ensure_fanout_worker(self) -> None:
         with self._fanout_lock:
@@ -779,13 +894,19 @@ class EngineRuntime:
                 continue
             if entry is None:
                 break
-            if not self._audience_ws or self.loop is None or self.loop.is_closed():
+            if self.loop is None or self.loop.is_closed():
                 continue
+            with self._audience_snap_lock:
+                snap_langs = list(self._audience_ws.values())
+            if not snap_langs:
+                continue
+            removed_ids = list(entry.get("_removed_ids") or [])
+            base_entry = {k: v for k, v in entry.items() if k != "_removed_ids"}
             extra_langs = sorted(
                 {
                     lang
-                    for lang in list(self._audience_ws.values())
-                    if lang != "follow" and lang != entry.get("target_lang")
+                    for lang in snap_langs
+                    if lang != "follow" and lang != base_entry.get("target_lang")
                 }
             )
             for tgt in extra_langs:
@@ -793,31 +914,53 @@ class EngineRuntime:
                     break
                 try:
                     tr = self.translate_text(
-                        entry["source_text"],
-                        entry["source_lang"],
+                        base_entry["source_text"],
+                        base_entry["source_lang"],
                         tgt,
                         mt_mode=self.config.mt_mode,
                         beam_size=1,
                         llm_url=self.config.llm_url,
                         llm_model=self.config.llm_model,
                         llm_api_key=self.config.llm_api_key,
+                        update_slide_state=False,
+                    )
+                    self._cache_audience_translation(
+                        str(base_entry.get("id", "")),
+                        tgt,
+                        str(base_entry.get("source_text", "")),
+                        tr.translated_text,
                     )
                     custom_entry = {
-                        **entry,
+                        **base_entry,
                         "target_lang": tgt,
                         "translated_text": tr.translated_text,
                         "mt_ms": tr.latency_ms,
                         "mt_engine": tr.engine,
                     }
+                    wire_payload = (
+                        {"type": "history_patch", "data": {"entry": custom_entry, "removed_ids": removed_ids}}
+                        if removed_ids
+                        else {"type": "final", "data": custom_entry}
+                    )
 
-                    async def _push(target_code=tgt, payload={"type": "final", "data": custom_entry}) -> None:
+                    async def _push(target_code=tgt, payload=wire_payload) -> None:
                         async with self._ws_lock:
                             targets = [ws for ws, l in self._audience_ws.items() if l == target_code]
-                        for ws in targets:
-                            try:
-                                await ws.send_json(payload)
-                            except Exception:
-                                pass
+                        if not targets:
+                            return
+                        sem = asyncio.Semaphore(32)
+
+                        async def _one(sock: WebSocket) -> bool:
+                            async with sem:
+                                return await self._send_json_safe(sock, payload, timeout_s=2.0)
+
+                        results = await asyncio.gather(*(_one(ws) for ws in targets))
+                        dead_targets = [targets[i] for i, ok in enumerate(results) if not ok]
+                        if dead_targets:
+                            async with self._ws_lock:
+                                with self._audience_snap_lock:
+                                    for dws in dead_targets:
+                                        self._audience_ws.pop(dws, None)
 
                     if self.loop and not self.loop.is_closed():
                         asyncio.run_coroutine_threadsafe(_push(), self.loop)
@@ -826,11 +969,15 @@ class EngineRuntime:
 
     def _fanout_audience_final(self, entry: dict[str, Any]) -> None:
         """Enqueue a committed sentence onto the bounded FIFO audience fan-out worker."""
-        if not self._audience_ws or self.loop is None or self.loop.is_closed():
+        if self.loop is None or self.loop.is_closed():
+            return
+        with self._audience_snap_lock:
+            snap_langs = list(self._audience_ws.values())
+        if not snap_langs:
             return
         extra_langs = {
             lang
-            for lang in list(self._audience_ws.values())
+            for lang in snap_langs
             if lang != "follow" and lang != entry.get("target_lang")
         }
         if not extra_langs:
@@ -1266,6 +1413,7 @@ class EngineRuntime:
         llm_api_key: str = "local",
         context: Optional[list[tuple[str, str]]] = None,
         is_draft: bool = False,
+        update_slide_state: bool = False,
     ) -> TranslationResult:
         clean = self.glossary.apply_asr_fixes(text.strip())
         if not clean:
@@ -1277,10 +1425,12 @@ class EngineRuntime:
             return TranslationResult(clean, clean, source_lang, target_lang, 0.0, "passthrough")
 
         active_term_locks = list(self.glossary.get_effective_term_locks(clean, source_lang, target_lang))
-        slide_matched_terms: list[dict[str, str]] = []
+        slide_matched_terms: list[dict[str, Any]] = []
         slide_domain_hint = ""
         if not is_draft:
-            rag = self.slide_context.retrieve_for_utterance(clean, source_lang, target_lang)
+            rag = self.slide_context.retrieve_for_utterance(
+                clean, source_lang, target_lang, update_state=update_slide_state
+            )
             if rag is not None:
                 slide_domain_hint = rag.domain_hint
                 if rag.matched_terms:
@@ -1291,7 +1441,7 @@ class EngineRuntime:
                         if s_low and s_low not in seen_tl:
                             seen_tl.add(s_low)
                             active_term_locks.append(st)
-                if rag.slide_index > 0 and rag.slide_index != self._last_slide_match_idx:
+                if update_slide_state and rag.slide_index > 0 and rag.slide_index != self._last_slide_match_idx:
                     self._last_slide_match_idx = rag.slide_index
                     self.broadcast_threadsafe(
                         {
@@ -1314,7 +1464,7 @@ class EngineRuntime:
         # 0) Official Cloud API Mode (`cloud-api`: Google Cloud / Microsoft Azure F0 / Google Gemini)
         #    HYBRID ARCHITECTURE (saves ~85% monthly quota!):
         #    - Live drafts (`is_draft=True` when `draft_offline=True`): ALWAYS skip Cloud API and use Local Offline!
-        #    - Final sentences (`is_draft=False`): Check monthly hard cap ($0 guard) -> call official Cloud API
+        #    - Final sentences (`is_draft=False`): Check API key & monthly hard cap ($0 guard) -> call official Cloud API
         #      -> record usage only on cache misses -> fall back seamlessly to Offline SOTA on cap/offline/error!
         if mt_mode == "cloud-api":
             creds = self.cloud_quota.get_credentials()
@@ -1322,7 +1472,16 @@ class EngineRuntime:
             should_call_cloud = (not is_draft) or (not creds.get("draft_offline", True))
             in_cooldown = time.time() < self._cloud_cooldown_until
             if should_call_cloud and not in_cooldown:
-                if not self.cloud_quota.can_spend(pid, len(clean)):
+                if not str(creds.get("api_key", "")).strip():
+                    with self._cloud_notice_lock:
+                        key_msg = "Chưa cấu hình Cloud API Key — đang tự dịch bằng Offline."
+                        if self._cloud_fallback_reason != key_msg:
+                            self._cloud_fallback_reason = key_msg
+                            self._cloud_cooldown_until = time.time() + 120
+                            self.broadcast_threadsafe(
+                                {"type": "cloud_notice", "data": {"message": key_msg, "cooldown_s": 120}}
+                            )
+                elif not self.cloud_quota.can_spend(pid, len(clean)):
                     with self._cloud_notice_lock:
                         cap_msg = "Đã chạm ngưỡng miễn phí tháng này ($0) — đang tự dịch bằng Offline."
                         if self._cloud_fallback_reason != cap_msg:
@@ -1628,19 +1787,7 @@ class EngineRuntime:
             "audience": self.get_audience_summary(),
             "glossary_enabled": g["enabled"],
             "glossary_count": len(g["asr_fixes"]) + len(g["term_locks"]),
-            "slide_context": {
-                "enabled": self.slide_context.enabled,
-                "filename": self.slide_context.filename,
-                "topic": self.slide_context.topic,
-                "slide_count": len(self.slide_context.pages),
-                "term_count": len(self.slide_context.terms),
-                "active_slide_index": self.slide_context.active_slide_index,
-                "active_slide_title": (
-                    self.slide_context.pages[self.slide_context.active_slide_index - 1].title
-                    if 1 <= self.slide_context.active_slide_index <= len(self.slide_context.pages)
-                    else ""
-                ),
-            },
+            "slide_context": self.slide_context.get_status_summary(),
             "display_frozen": self._display_frozen,
             "display_freeze_message": self._display_freeze_message,
             "cloud_api": self.cloud_quota.get_public_status(),
@@ -1806,8 +1953,10 @@ class EngineRuntime:
                 if self._hymt2 is not None and not self._listening:
                     try:
                         self._hymt2.stop()
+                        getattr(self._hymt2, "close", lambda: None)()
                     except Exception:
                         pass
+                    self._hymt2 = None
             gc.collect()
             self.broadcast_threadsafe({"type": "status", "data": self.get_status_payload()})
 
@@ -2011,8 +2160,16 @@ class EngineRuntime:
 
         if want_hymt2:
             # Pre-warm Hy-MT2 llama-server in background ONLY when explicitly selected
+            def _warmup_hymt2() -> None:
+                try:
+                    h = self.ensure_hymt2_loaded()
+                    if h is not None:
+                        h.ensure_started()
+                except Exception:
+                    pass
+
             threading.Thread(
-                target=lambda: self.ensure_hymt2_loaded() and self.ensure_hymt2_loaded().ensure_started(),
+                target=_warmup_hymt2,
                 daemon=True,
                 name="hymt2-warmup",
             ).start()
@@ -2405,8 +2562,8 @@ class EngineRuntime:
             if (
                 self.config.mt_mode == "hy-mt2"
                 and self._nllb is not None
-                and self.config.source_lang in HYMT2_LANG_NAMES
-                and req.target_lang in HYMT2_LANG_NAMES
+                and bool(get_hymt2_lang_name(self.config.source_lang))
+                and bool(get_hymt2_lang_name(req.target_lang))
             ):
                 with self._model_lock:
                     self._nllb = None
@@ -2451,7 +2608,9 @@ class EngineRuntime:
         return payload
 
     def clear_history(self) -> None:
-        self._history.clear()
+        with self._history_lock:
+            self._history.clear()
+        self._invalidate_audience_cache(None)
         with self._group_lock:
             self._active_group_id = ""
             self._active_group_words = 0
@@ -2470,8 +2629,9 @@ class EngineRuntime:
         source_text: Optional[str] = None,
     ) -> bool:
         """
-        Apply a Gemini-verified improved translation onto a History entry or merged paragraph,
-        syncing all UI windows and future .TXT/.SRT exports cleanly.
+        Apply a Quick-Edit or Gemini-verified improved translation onto a History entry or merged paragraph,
+        syncing main UI, LED overlay, OBS, matching-language audience phones, and re-translating for
+        other-language audience phones when `source_text` changes.
         """
         ids_set = {str(x) for x in (item_ids or []) if x}
         if target_id:
@@ -2479,40 +2639,71 @@ class EngineRuntime:
         if not ids_set:
             return False
 
-        matched_indices = [
-            idx
-            for idx, e in enumerate(self._history)
-            if str(e.get("id", "")) in ids_set or str(e.get("paragraph_id", "")) in ids_set
-        ]
-        if not matched_indices:
-            return False
+        removed_ids: list[str] = []
+        with self._history_lock:
+            matched_indices = [
+                idx
+                for idx, e in enumerate(self._history)
+                if str(e.get("id", "")) in ids_set or str(e.get("paragraph_id", "")) in ids_set
+            ]
+            if not matched_indices:
+                return False
 
-        first_idx = matched_indices[0]
-        if len(matched_indices) == 1:
-            entry = dict(self._history[first_idx])
-            entry["translated_text"] = translated_text.strip()
-            if source_text is not None and source_text.strip():
-                entry["source_text"] = source_text.strip()
-            self._history[first_idx] = entry
-        else:
-            # Merge grouped paragraph entries cleanly into the first entry so exports & UI never duplicate text
-            first = dict(self._history[first_idx])
-            if source_text is not None and source_text.strip():
-                first["source_text"] = source_text.strip()
+            first_idx = matched_indices[0]
+            if len(matched_indices) == 1:
+                entry = dict(self._history[first_idx])
+                old_source = str(entry.get("source_text", "")).strip()
+                entry["translated_text"] = translated_text.strip()
+                if source_text is not None and source_text.strip():
+                    entry["source_text"] = source_text.strip()
+                self._history[first_idx] = entry
+                updated_entry = dict(entry)
             else:
-                merged_src = " ".join(
+                # Merge grouped paragraph entries cleanly into the first entry so exports & UI never duplicate text
+                first = dict(self._history[first_idx])
+                old_source = " ".join(
                     str(self._history[i].get("source_text", "")).strip()
                     for i in matched_indices
                     if str(self._history[i].get("source_text", "")).strip()
                 ).strip()
-                if merged_src:
-                    first["source_text"] = merged_src
-            first["translated_text"] = translated_text.strip()
-            self._history[first_idx] = first
-            for idx in reversed(matched_indices[1:]):
-                self._history.pop(idx)
+                if source_text is not None and source_text.strip():
+                    first["source_text"] = source_text.strip()
+                elif old_source:
+                    first["source_text"] = old_source
+                first["translated_text"] = translated_text.strip()
+                self._history[first_idx] = first
+                for idx in reversed(matched_indices[1:]):
+                    rem = self._history.pop(idx)
+                    if rem.get("id"):
+                        removed_ids.append(str(rem["id"]))
+                updated_entry = dict(first)
 
-        self.broadcast_threadsafe({"type": "history", "data": list(self._history)})
+            history_snap = list(self._history)
+            source_changed = str(updated_entry.get("source_text", "")).strip() != old_source
+
+        inv_ids = set(removed_ids)
+        if updated_entry.get("id"):
+            inv_ids.add(str(updated_entry["id"]))
+        self._invalidate_audience_cache(inv_ids)
+
+        # Sync main UI, overlay, `/obs` & `"follow"` phones via full history
+        self.broadcast_threadsafe({"type": "history", "data": history_snap})
+        # Sync non-`"follow"` phones explicitly set to `entry["target_lang"]`
+        self.broadcast_threadsafe(
+            {
+                "type": "history_patch",
+                "data": {"entry": updated_entry, "removed_ids": removed_ids},
+            }
+        )
+        # Re-translate & fan out to other-language phones when source_text changed (or merged)
+        if source_changed or removed_ids:
+            try:
+                fanout_item = dict(updated_entry)
+                if removed_ids:
+                    fanout_item["_removed_ids"] = removed_ids
+                self._fanout_audience_final(fanout_item)
+            except Exception as exc:
+                logger.warning("Audience fan-out after quick-edit failed: %s", exc)
         return True
 
     def set_display_freeze(self, frozen: bool, message: Optional[str] = None) -> dict[str, Any]:
@@ -2532,6 +2723,8 @@ class EngineRuntime:
         if req.items:
             raw_items = [it.model_dump() for it in req.items if it.source_text.strip()]
         else:
+            with self._history_lock:
+                hist_tail = list(self._history[-40:])
             raw_items = [
                 {
                     "id": str(e.get("id", "")),
@@ -2541,7 +2734,7 @@ class EngineRuntime:
                     "target_lang": str(e.get("target_lang", self.config.target_lang)),
                     "timestamp": str(e.get("timestamp", "")),
                 }
-                for e in list(self._history)[-40:]
+                for e in hist_tail
                 if str(e.get("source_text", "")).strip()
             ]
         if not raw_items:
@@ -3132,7 +3325,7 @@ class EngineRuntime:
                 },
             }
         )
-        self._final_mt_queue.put(
+        self._enqueue_final_mt(
             {
                 "id": seg_id,
                 "source_text": display_text,
@@ -3160,6 +3353,26 @@ class EngineRuntime:
                 }
             )
         self._mt_wakeup.set()
+
+    def _enqueue_final_mt(self, item: dict[str, Any]) -> None:
+        """Bounded FIFO enqueue for final MT jobs: drops oldest item with warning on overflow to cap RAM & latency."""
+        try:
+            self._final_mt_queue.put_nowait(item)
+        except queue.Full:
+            dropped = None
+            try:
+                dropped = self._final_mt_queue.get_nowait()
+            except queue.Empty:
+                pass
+            logger.warning(
+                "Final MT queue full (maxsize=%d); dropped oldest queued utterance %s to bound RAM/latency.",
+                self._final_mt_queue.maxsize,
+                dropped.get("id") if isinstance(dropped, dict) else "?",
+            )
+            try:
+                self._final_mt_queue.put_nowait(item)
+            except queue.Full:
+                pass
 
     def _flush_paragraph_now(self, is_stop_flush: bool = True) -> None:
         with self._para_lock:
@@ -3483,7 +3696,7 @@ class EngineRuntime:
         if not full_text:
             return
         # Remote partner speaks `target_lang` -> translated back into our `source_lang`!
-        self._final_mt_queue.put(
+        self._enqueue_final_mt(
             {
                 "id": seg_id,
                 "source_text": full_text,
@@ -3791,6 +4004,7 @@ class EngineRuntime:
                         llm_api_key=cfg.llm_api_key,
                         context=list(self._recent_context),
                         is_draft=False,
+                        update_slide_state=True,
                     )
                     translated = res.translated_text
                     mt_ms = res.latency_ms
@@ -3822,16 +4036,20 @@ class EngineRuntime:
                     "mt_engine": mt_engine,
                     "timestamp": item["timestamp"],
                 }
-                self._history.append(entry)
-                if len(self._history) > 300:
-                    self._history = self._history[-300:]
+                with self._history_lock:
+                    self._history.append(entry)
+                    if len(self._history) > 300:
+                        self._history = self._history[-300:]
                 try:
                     self.logger.append_entry(entry)
                     entry["log_saved_count"] = self.logger.get_status()["saved_count"]
                 except Exception:
                     pass
                 self.broadcast_threadsafe({"type": "final", "data": entry})
-                self._fanout_audience_final(entry)
+                try:
+                    self._fanout_audience_final(entry)
+                except Exception as exc:
+                    logger.warning("Audience fan-out enqueue failed: %s", exc)
                 continue
             except queue.Empty:
                 pass
@@ -4026,7 +4244,15 @@ class EngineRuntime:
                     }
                 )
                 try:
-                    mt = self.translate_text(partial_src, src, tgt, mt_mode=self.config.mt_mode, beam_size=1)
+                    mt = self.translate_text(
+                        partial_src,
+                        src,
+                        tgt,
+                        mt_mode=self.config.mt_mode,
+                        beam_size=1,
+                        is_draft=True,
+                        update_slide_state=False,
+                    )
                     st_txt, unst_txt, full_txt = demo_tracker.update(seg_id, tgt, mt.translated_text)
                     self.broadcast_threadsafe(
                         {
@@ -4051,7 +4277,14 @@ class EngineRuntime:
             mt_ms = 0.0
             mt_engine = self.config.mt_mode
             try:
-                mt = self.translate_text(sample, src, tgt, mt_mode=self.config.mt_mode, beam_size=self.config.beam_size)
+                mt = self.translate_text(
+                    sample,
+                    src,
+                    tgt,
+                    mt_mode=self.config.mt_mode,
+                    beam_size=self.config.beam_size,
+                    update_slide_state=False,
+                )
                 tr_final = mt.translated_text or sample  # fallback: show source if MT empty
                 mt_ms = mt.latency_ms
                 mt_engine = mt.engine
@@ -4070,11 +4303,15 @@ class EngineRuntime:
                 "mt_engine": mt_engine,
                 "timestamp": time.strftime("%H:%M:%S"),
             }
-            self._history.append(entry)
-            if len(self._history) > 300:
-                self._history = self._history[-300:]
+            with self._history_lock:
+                self._history.append(entry)
+                if len(self._history) > 300:
+                    self._history = self._history[-300:]
             self.broadcast_threadsafe({"type": "final", "data": entry})
-            self._fanout_audience_final(entry)
+            try:
+                self._fanout_audience_final(entry)
+            except Exception as exc:
+                logger.warning("Demo audience fan-out failed: %s", exc)
 
         threading.Thread(target=_run_demo, daemon=True, name="demo-sim").start()
         return {"ok": True, "source_lang": src, "target_lang": tgt}
@@ -4091,6 +4328,61 @@ async def lifespan(_app: FastAPI):
     runtime.shutdown()
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient", "::ffff:127.0.0.1"})
+_PUBLIC_HTTP_PATHS = frozenset({"/audience", "/obs", "/school-logo.png", "/favicon.ico"})
+_PUBLIC_WS_PATHS = frozenset({"/ws/audience"})
+
+
+def _is_loopback_host(host: Optional[str]) -> bool:
+    return (host or "").strip().lower() in _LOOPBACK_HOSTS
+
+
+class LoopbackGuardMiddleware:
+    """Restrict admin `/api/*` and `/ws` routes strictly to loopback clients.
+    Non-loopback LAN clients may ONLY access `GET /audience`, `GET /obs`,
+    `GET /school-logo.png`, `GET /favicon.ico`, and WS `/ws/audience`.
+    """
+
+    def __init__(self, asgi_app: Any) -> None:
+        self.app = asgi_app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        scope_type = scope.get("type")
+        if scope_type not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+
+        client = scope.get("client")
+        client_host = client[0] if client and len(client) >= 1 else ""
+        if _is_loopback_host(client_host):
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path") or ""
+        if scope_type == "http":
+            method = (scope.get("method") or "GET").upper()
+            if method in ("GET", "HEAD") and path in _PUBLIC_HTTP_PATHS:
+                await self.app(scope, receive, send)
+                return
+            resp = JSONResponse(
+                {"detail": "Forbidden: admin endpoint is restricted to localhost"},
+                status_code=403,
+            )
+            await resp(scope, receive, send)
+            return
+
+        if path in _PUBLIC_WS_PATHS:
+            await self.app(scope, receive, send)
+            return
+        await send(
+            {
+                "type": "websocket.close",
+                "code": 1008,
+                "reason": "Admin WebSocket restricted to localhost",
+            }
+        )
+
+
 app = FastAPI(title="VOICERECORE Local Engine", version="0.8.4", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
@@ -4099,6 +4391,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(LoopbackGuardMiddleware)
 
 
 @app.post("/api/shutdown")
@@ -4306,11 +4599,15 @@ def api_audience_info():
 
 @app.post("/api/session/summarize")
 def api_session_summarize():
+    with runtime._history_lock:
+        hist_snap = list(runtime._history)
     return summarize_meeting_entries(
-        list(runtime._history),
+        hist_snap,
         runtime.config.source_lang,
         runtime.config.target_lang,
-        translate_fn=lambda txt, s, t: runtime.translate_text(txt, s, t, mt_mode=runtime.config.mt_mode, beam_size=1),
+        translate_fn=lambda txt, s, t: runtime.translate_text(
+            txt, s, t, mt_mode=runtime.config.mt_mode, beam_size=1, update_slide_state=False
+        ),
     )
 
 
@@ -4365,9 +4662,18 @@ def api_get_context():
 @app.post("/api/context/upload")
 async def api_upload_context(file: UploadFile = File(...)):
     orig_name = file.filename or "slides.txt"
-    data = await file.read()
-    if len(data) > 40 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File tài liệu vượt quá giới hạn 40 MB.")
+    max_bytes = 40 * 1024 * 1024
+    chunks: list[bytes] = []
+    total_bytes = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            raise HTTPException(status_code=400, detail="File tài liệu vượt quá giới hạn 40 MB.")
+        chunks.append(chunk)
+    data = b"".join(chunks)
     try:
         payload = await asyncio.to_thread(runtime.slide_context.ingest_file, orig_name, data)
     except ValueError as exc:
@@ -4375,7 +4681,7 @@ async def api_upload_context(file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Lỗi đọc tài liệu: {exc}") from exc
     runtime._last_slide_match_idx = payload.get("active_slide_index", 0)
-    runtime.sync_asr_hotwords()
+    await asyncio.to_thread(runtime.sync_asr_hotwords)
     runtime.broadcast_threadsafe({"type": "status", "data": runtime.get_status_payload()})
     return {"ok": True, **payload}
 
@@ -4537,14 +4843,18 @@ def api_demo_simulate(req: DemoRequest):
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    client_host = ws.client.host if ws.client else ""
+    if not _is_loopback_host(client_host):
+        await ws.close(code=1008, reason="Admin WebSocket restricted to localhost")
+        return
     await ws.accept()
-    await runtime.register_ws(ws)
     try:
+        await runtime.register_ws(ws)
         while True:
             msg = await ws.receive_text()
             if msg == "ping":
                 await ws.send_json({"type": "pong"})
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, Exception):
         pass
     finally:
         await runtime.unregister_ws(ws)
@@ -4553,13 +4863,13 @@ async def ws_endpoint(ws: WebSocket):
 @app.websocket("/ws/audience")
 async def ws_audience_endpoint(ws: WebSocket, lang: str = "follow"):
     await ws.accept()
-    await runtime.register_audience_ws(ws, lang=lang)
     try:
+        await runtime.register_audience_ws(ws, lang=lang)
         while True:
             msg = await ws.receive_text()
             if msg == "ping":
                 await ws.send_json({"type": "pong"})
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, Exception):
         pass
     finally:
         await runtime.unregister_audience_ws(ws)

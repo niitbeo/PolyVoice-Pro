@@ -28,6 +28,7 @@
   --accent-text: #fca5a5;
   --accent-soft: rgba(196, 0, 15, 0.18);
   --accent-soft-2: rgba(196, 0, 15, 0.28);
+  --accent-border: rgba(239, 68, 68, 0.38);
   --green: #34d399;
   --green-text: #6ee7b7;
   --green-soft: rgba(52, 211, 153, 0.13);
@@ -90,6 +91,7 @@
   --accent-text: #b0000d;
   --accent-soft: rgba(196, 0, 15, 0.085);
   --accent-soft-2: rgba(196, 0, 15, 0.14);
+  --accent-border: rgba(196, 0, 15, 0.28);
   --green: #059669;
   --green-text: #047857;
   --green-soft: rgba(5, 150, 105, 0.1);
@@ -290,9 +292,15 @@ body.overlay-body #root {
 .topbar-right {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   flex-wrap: nowrap;
   flex-shrink: 0;
+}
+
+.topbar-right .topbar-btn {
+  padding: 5px 9px;
+  font-size: 11.5px;
+  gap: 4.5px;
 }
 
 .topbar-divider {
@@ -301,6 +309,76 @@ body.overlay-body #root {
   background: var(--border);
   margin: 0 2px;
   flex-shrink: 0;
+}
+
+@media (max-width: 1180px) {
+  .topbar {
+    padding: 0 12px;
+    gap: 8px;
+  }
+
+  .topbar-left {
+    gap: 7px;
+  }
+
+  .brand {
+    gap: 7px;
+  }
+
+  .brand-crest {
+    width: 31px;
+    height: 31px;
+  }
+
+  .brand-title {
+    font-size: 13.5px;
+    gap: 5px;
+  }
+
+  .brand-sub {
+    font-size: 10px;
+  }
+
+  .topbar-left .pill {
+    padding: 3.5px 8px;
+    font-size: 11px;
+    gap: 5px;
+  }
+
+  .topbar-right {
+    gap: 4px;
+  }
+
+  .topbar-right .topbar-btn {
+    padding: 5px 7.5px;
+    font-size: 11px;
+    gap: 4px;
+  }
+
+  .topbar-right .btn.icon-only {
+    min-width: 28px;
+    height: 28px;
+    padding: 5px;
+  }
+
+  .topbar-divider {
+    margin: 0 1px;
+  }
+}
+
+@media (max-width: 1020px) {
+  .brand-sub {
+    display: none;
+  }
+
+  .topbar-right .topbar-btn {
+    padding: 5px 6.5px;
+    font-size: 10.5px;
+  }
+
+  .topbar-right .topbar-btn-label {
+    display: none;
+  }
 }
 
 /* ---------- Pills & Status Badges ---------- */
@@ -1970,7 +2048,8 @@ kbd {
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
-  z-index: 6;
+  position: relative;
+  z-index: 60;
   max-height: 150px;
   overflow: hidden;
   transition: max-height 0.28s ease, opacity 0.24s ease;
@@ -3676,7 +3755,7 @@ kbd {
   height: 7px;
   border-radius: 50%;
   background: var(--accent);
-  animation: pulseDot 1.3s ease-in-out infinite;
+  animation: pulse 1.3s ease-in-out infinite;
 }
 
 .exit-confirm-desc {
@@ -3808,6 +3887,10 @@ kbd {
 .overlay-feed.has-corner-qr .overlay-feed-inner.target-only,
 .overlay-feed.has-corner-qr .overlay-yt-stage {
   padding-right: 182px;
+}
+
+.overlay-feed.has-corner-qr .overlay-feed-inner.split .overlay-cell.right {
+  padding-right: 176px;
 }
 
 .overlay-led-item {
@@ -3975,7 +4058,7 @@ kbd {
 .overlay-freeze-curtain {
   position: absolute;
   inset: 0;
-  z-index: 50;
+  z-index: 40;
   background: rgba(6, 8, 14, 0.96);
   backdrop-filter: blur(14px);
   display: flex;
@@ -4020,10 +4103,16 @@ kbd {
 }
 
 .slide-modal-body {
+  padding: 14px 18px 16px;
   display: flex;
   flex-direction: column;
   gap: 10px;
   overflow-y: auto;
+  transition: box-shadow 0.15s ease;
+}
+
+.slide-modal-body.drag-over {
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 
 .slide-action-bar {
@@ -4065,9 +4154,19 @@ kbd {
   transition: border-color 0.15s ease, background-color 0.15s ease;
 }
 
-.slide-dropzone:hover {
+.slide-dropzone:hover,
+.slide-dropzone.drag-over {
   border-color: var(--accent);
   background: var(--accent-soft);
+}
+
+.slide-dropzone.compact {
+  flex-direction: row;
+  justify-content: center;
+  padding: 8px 12px;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-1);
 }
 
 .slide-topic-row {

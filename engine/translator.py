@@ -803,6 +803,8 @@ class HyMT2Translator:
         self.base_url = f"http://127.0.0.1:{port}"
         self.active_backend: str = ""
         self._proc: Optional[subprocess.Popen] = None
+        self._proc_lock = threading.Lock()
+        self._stop_requested = threading.Event()
         self._stderr_ring: deque[str] = deque()
         self._stderr_bytes: int = 0
         self._stderr_lock = threading.Lock()
@@ -854,12 +856,38 @@ class HyMT2Translator:
         with self._stderr_lock:
             return "".join(self._stderr_ring).strip()
 
+    @staticmethod
+    def _kill_proc_obj(proc: Optional[subprocess.Popen]) -> None:
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+
+    def _terminate_proc(self) -> None:
+        with self._proc_lock:
+            proc = self._proc
+            self._proc = None
+        self._kill_proc_obj(proc)
+
     @property
     def is_running(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
+        with self._proc_lock:
+            proc = self._proc
+        return proc is not None and proc.poll() is None
 
     def ensure_started(self) -> None:
+        if self._stop_requested.is_set():
+            raise RuntimeError("Hy-MT2 llama-server đã dừng.")
         with self._lock:
+            if self._stop_requested.is_set():
+                raise RuntimeError("Hy-MT2 llama-server đã dừng.")
             if self.is_running:
                 return
             llama_bin = find_llama_server()
@@ -893,6 +921,10 @@ class HyMT2Translator:
             last_err = ""
             gguf_arg = _windows_short_path_file(self.gguf_path)
             for backend_label, extra_flags in attempts:
+                if self._stop_requested.is_set():
+                    self._terminate_proc()
+                    self.active_backend = ""
+                    raise RuntimeError("Hy-MT2 llama-server đã dừng.")
                 cmd = [
                     str(llama_bin),
                     "-m", gguf_arg,
@@ -916,17 +948,29 @@ class HyMT2Translator:
                     kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
 
                 proc = subprocess.Popen(cmd, **kwargs)
-                self._proc = proc
+                with self._proc_lock:
+                    if self._stop_requested.is_set():
+                        self._proc = None
+                        self._kill_proc_obj(proc)
+                        self.active_backend = ""
+                        raise RuntimeError("Hy-MT2 llama-server đã dừng.")
+                    self._proc = proc
                 self._start_stderr_drainer(proc)
 
                 gpu_timeout = 30.0 if backend_label == "vulkan" else 20.0
                 deadline = time.monotonic() + (gpu_timeout if len(attempts) > 1 and backend_label != "cpu" else 45.0)
                 started = False
                 while time.monotonic() < deadline:
+                    if self._stop_requested.is_set():
+                        self._terminate_proc()
+                        self.active_backend = ""
+                        raise RuntimeError("Hy-MT2 llama-server đã dừng.")
                     if proc.poll() is not None:
                         time.sleep(0.05)
                         last_err = self._get_recent_stderr()
-                        self._proc = None
+                        with self._proc_lock:
+                            if self._proc is proc:
+                                self._proc = None
                         break
                     try:
                         with self._client_lock:
@@ -939,26 +983,21 @@ class HyMT2Translator:
                     time.sleep(0.15)
 
                 if started:
+                    if self._stop_requested.is_set():
+                        self._terminate_proc()
+                        self.active_backend = ""
+                        raise RuntimeError("Hy-MT2 llama-server đã dừng.")
                     self.active_backend = backend_label
                     return
-                self.stop()
+                self._terminate_proc()
 
             self.active_backend = ""
             raise RuntimeError(f"Hy-MT2 llama-server khởi động thất bại: {last_err[:400] or 'quá thời gian chờ'}")
 
     def stop(self) -> None:
-        proc = self._proc
-        self._proc = None
-        if proc is not None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=2.0)
-            except Exception:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=1.0)
-                except Exception:
-                    pass
+        self._stop_requested.set()
+        self.active_backend = ""
+        self._terminate_proc()
 
     def close(self) -> None:
         try:
@@ -1110,6 +1149,16 @@ class HyMT2Translator:
         data = resp.json()
         return self._clean_output(data["choices"][0]["message"]["content"])
 
+    @staticmethod
+    def _term_matches_text(term: str, text: str, case_sensitive: bool = False) -> bool:
+        """Unicode word-boundary match so 'AI'/'API' never trigger inside 'Đại học'/'capital'."""
+        if not term or not text:
+            return False
+        if any("\u3040" <= ch <= "\u9fff" or "\u0e00" <= ch <= "\u0e7f" or "\u1780" <= ch <= "\u17ff" for ch in term):
+            return (term in text) if case_sensitive else (term.lower() in text.lower())
+        flags = re.UNICODE if case_sensitive else (re.IGNORECASE | re.UNICODE)
+        return bool(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text, flags))
+
     def translate(
         self,
         text: str,
@@ -1129,14 +1178,18 @@ class HyMT2Translator:
         if not tgt_name:
             raise ValueError(f"Language {tgt_lang} is outside Hy-MT2-1.8B supported 38 languages")
 
-        # Filter only glossary/slide terms actually appearing in this sentence (keeps prompt tiny & fast!)
+        # Filter only glossary/slide terms actually appearing in this sentence using word boundaries!
         matched_terms: list[tuple[str, str]] = []
         seen_mt: set[str] = set()
-        low_clean = clean.lower()
         for rule in term_locks or []:
             s = str(rule.get("source", "")).strip()
             t = str(rule.get("target", "")).strip()
-            if s and t and s.lower() not in seen_mt and s.lower() in low_clean:
+            if (
+                s
+                and t
+                and s.lower() not in seen_mt
+                and self._term_matches_text(s, clean, case_sensitive=bool(rule.get("case_sensitive", False)))
+            ):
                 seen_mt.add(s.lower())
                 matched_terms.append((s, t))
 
@@ -1398,7 +1451,13 @@ class GeminiCloudTranslator:
 
         active_terms = [
             r for r in (term_locks or [])
-            if r.get("source") and r["source"].lower() in clean.lower()
+            if r.get("source")
+            and r.get("target")
+            and HyMT2Translator._term_matches_text(
+                str(r["source"]).strip(),
+                clean,
+                case_sensitive=bool(r.get("case_sensitive", False)),
+            )
         ]
         terms_key = "|".join(f"{r['source']}={r['target']}" for r in active_terms)
         ctx_key = context[-1][0][:40] if context else ""

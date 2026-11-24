@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Check,
   FileText,
@@ -13,6 +13,27 @@ import {
   X,
 } from "lucide-react";
 import { ENGINE_HTTP, SlideContextPayload, SlideContextTerm } from "./types";
+
+const MAX_UPLOAD_BYTES = 40 * 1024 * 1024; // 40 MB
+
+async function parseJsonSafe<T>(res: Response): Promise<T | null> {
+  try {
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+function formatSlideError(e: unknown, fallback: string): string {
+  if (e instanceof Error) {
+    const msg = e.message.trim();
+    if (!msg || /failed to fetch|networkerror|load failed|unexpected token|json/i.test(msg)) {
+      return fallback;
+    }
+    return msg;
+  }
+  return fallback;
+}
 
 interface SlideContextModalProps {
   open: boolean;
@@ -35,7 +56,16 @@ export function SlideContextModal({
   const [newSrc, setNewSrc] = useState("");
   const [newTgt, setNewTgt] = useState("");
   const [topicEditing, setTopicEditing] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setErr("");
+      setTopicEditing(false);
+      setDragOver(false);
+    }
+  }, [open]);
 
   if (!open) return null;
 
@@ -45,7 +75,7 @@ export function SlideContextModal({
   const enabled = ctx?.enabled ?? true;
   const activeSlideIdx = ctx?.active_slide_index ?? 0;
 
-  const postTextUpdate = async (body: Record<string, unknown>) => {
+  const postTextUpdate = async (body: Record<string, unknown>): Promise<boolean> => {
     setBusy(true);
     setErr("");
     try {
@@ -54,17 +84,25 @@ export function SlideContextModal({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Không thể cập nhật bối cảnh");
+      const data = await parseJsonSafe<SlideContextPayload & { detail?: string }>(res);
+      if (!res.ok || !data) {
+        throw new Error(data?.detail || "Không thể cập nhật bối cảnh hội nghị");
+      }
       onUpdated(data);
+      return true;
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      setErr(formatSlideError(e, "Không thể kết nối tới dịch vụ AI để cập nhật bối cảnh."));
+      return false;
     } finally {
       setBusy(false);
     }
   };
 
   const handleUploadFile = async (file: File) => {
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setErr("Tệp vượt quá giới hạn 40 MB. Vui lòng nén hoặc tách nhỏ tài liệu trước khi nạp.");
+      return;
+    }
     setBusy(true);
     setErr("");
     try {
@@ -74,12 +112,14 @@ export function SlideContextModal({
         method: "POST",
         body: fd,
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Lỗi đọc tài liệu");
+      const data = await parseJsonSafe<SlideContextPayload & { detail?: string }>(res);
+      if (!res.ok || !data) {
+        throw new Error(data?.detail || "Lỗi đọc tài liệu Slide");
+      }
       onUpdated(data);
       setTab("slides");
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      setErr(formatSlideError(e, "Không thể kết nối tới dịch vụ AI hoặc không đọc được tệp tài liệu."));
     } finally {
       setBusy(false);
     }
@@ -90,14 +130,16 @@ export function SlideContextModal({
     setErr("");
     try {
       const res = await fetch(`${ENGINE_HTTP}/api/context`, { method: "DELETE" });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Không thể xóa bối cảnh");
+      const data = await parseJsonSafe<SlideContextPayload & { detail?: string }>(res);
+      if (!res.ok || !data) {
+        throw new Error(data?.detail || "Không thể xóa bối cảnh phiên họp");
+      }
       onUpdated(data);
       setPasteDraft("");
       setTopicDraft("");
       setTopicEditing(false);
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      setErr(formatSlideError(e, "Không thể kết nối tới dịch vụ AI để xóa bối cảnh."));
     } finally {
       setBusy(false);
     }
@@ -108,6 +150,7 @@ export function SlideContextModal({
   };
 
   const handleAddTerm = () => {
+    if (busy) return;
     const s = newSrc.trim();
     if (!s) return;
     const next: SlideContextTerm[] = [
@@ -117,6 +160,12 @@ export function SlideContextModal({
     setNewSrc("");
     setNewTgt("");
     saveTerms(next);
+  };
+
+  const handleSaveTopic = async () => {
+    if (busy) return;
+    const ok = await postTextUpdate({ topic: topicDraft });
+    if (ok) setTopicEditing(false);
   };
 
   return (
@@ -148,7 +197,24 @@ export function SlideContextModal({
           </button>
         </div>
 
-        <div className="modal-body slide-modal-body">
+        <div
+          className={`modal-body-pad slide-modal-body ${dragOver ? "drag-over" : ""}`}
+          onDragOver={(e) => {
+            e.preventDefault();
+            if (!dragOver) setDragOver(true);
+          }}
+          onDragLeave={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+              setDragOver(false);
+            }
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragOver(false);
+            const f = e.dataTransfer.files?.[0];
+            if (f && !busy) void handleUploadFile(f);
+          }}
+        >
           {/* Quick Action Strip: Upload + DAU Preset + Enable Toggle + Clear */}
           <div className="slide-action-bar">
             <input
@@ -168,7 +234,7 @@ export function SlideContextModal({
               onClick={() => fileInputRef.current?.click()}
             >
               {busy ? <Loader2 size={13} className="spin" /> : <Upload size={13} />}
-              Nạp Slide / Tài liệu (.PPTX, .PDF, .DOCX)
+              {pages.length > 0 ? "Thay Slide / Tài liệu mới" : "Nạp Slide / Tài liệu (.PPTX, .PDF, .DOCX)"}
             </button>
 
             <button
@@ -183,7 +249,7 @@ export function SlideContextModal({
             <div style={{ flex: 1 }} />
 
             <label className="slide-enable-toggle" title="Bật/tắt đối chiếu Slide RAG & Hotwords">
-              <span>Đang bật</span>
+              <span>{enabled ? "Đang bật" : "Đang tắt"}</span>
               <span className="switch">
                 <input
                   type="checkbox"
@@ -209,16 +275,10 @@ export function SlideContextModal({
 
           {err && <div className="slide-err-banner">{err}</div>}
 
-          {/* Drag & Drop Zone when no file loaded yet */}
-          {pages.length === 0 && tab !== "paste" && (
+          {/* Drag & Drop Zone: full when empty, compact strip when slides are loaded */}
+          {pages.length === 0 && tab !== "paste" ? (
             <div
-              className="slide-dropzone"
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={(e) => {
-                e.preventDefault();
-                const f = e.dataTransfer.files?.[0];
-                if (f && !busy) void handleUploadFile(f);
-              }}
+              className={`slide-dropzone ${dragOver ? "drag-over" : ""}`}
               onClick={() => !busy && fileInputRef.current?.click()}
             >
               <Presentation size={22} color="var(--accent-text)" />
@@ -226,9 +286,27 @@ export function SlideContextModal({
                 Kéo thả file Slide (.PPTX, .PDF, .DOCX, .TXT) vào đây trước khi hội nghị bắt đầu
               </div>
               <div style={{ fontSize: 11.5, color: "var(--text-2)" }}>
-                Xử lý 100% nội bộ trên máy trong 2 giây — đọc cả ghi chú diễn giả (Speaker Notes) để nghe &amp; dịch chuẩn tên riêng
+                Xử lý 100% nội bộ trên máy trong 2 giây (tối đa 40 MB) — đọc cả ghi chú diễn giả (Speaker Notes) để nghe &amp; dịch chuẩn tên riêng
               </div>
             </div>
+          ) : (
+            tab === "slides" && (
+              <div
+                className={`slide-dropzone compact ${dragOver ? "drag-over" : ""}`}
+                onClick={() => !busy && fileInputRef.current?.click()}
+              >
+                <Upload size={14} color="var(--accent-text)" />
+                <span>
+                  {ctx?.filename ? (
+                    <>
+                      Đang nạp: <b>{ctx.filename}</b> — kéo thả hoặc bấm để thay Slide mới (≤ 40 MB)
+                    </>
+                  ) : (
+                    "Kéo thả file .PPTX / .PDF / .DOCX mới vào bất kỳ đâu để thay Slide (≤ 40 MB)"
+                  )}
+                </span>
+              </div>
+            )
           )}
 
           {/* Active Topic Banner */}
@@ -242,16 +320,25 @@ export function SlideContextModal({
                   className="input"
                   style={{ flex: 1, padding: "4px 8px", fontSize: 12 }}
                   value={topicDraft}
+                  autoFocus
+                  disabled={busy}
                   onChange={(e) => setTopicDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleSaveTopic();
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setTopicEditing(false);
+                    }
+                  }}
                   placeholder="VD: Hội thảo Quốc tế Kiến trúc Bền vững — Đại học Kiến trúc Đà Nẵng (DAU)"
                 />
                 <button
                   className="btn primary sm"
                   disabled={busy}
-                  onClick={() => {
-                    setTopicEditing(false);
-                    void postTextUpdate({ topic: topicDraft });
-                  }}
+                  onClick={() => void handleSaveTopic()}
                 >
                   <Check size={12} /> Lưu
                 </button>
@@ -259,6 +346,7 @@ export function SlideContextModal({
             ) : (
               <button
                 className="slide-topic-value"
+                disabled={busy}
                 onClick={() => {
                   setTopicDraft(ctx?.topic || "");
                   setTopicEditing(true);
@@ -305,6 +393,7 @@ export function SlideContextModal({
                     <button
                       key={p.index}
                       type="button"
+                      disabled={busy}
                       className={`slide-page-card ${isActive ? "active" : ""}`}
                       onClick={() => void postTextUpdate({ active_slide_index: p.index })}
                       title="Bấm để ghim trang Slide này làm vị trí hiện tại của diễn giả"
@@ -338,6 +427,7 @@ export function SlideContextModal({
                   className="input"
                   style={{ flex: 1 }}
                   value={newSrc}
+                  disabled={busy}
                   onChange={(e) => setNewSrc(e.target.value)}
                   placeholder="Tên riêng / Thuật ngữ gốc (VD: PGS.TS. Phạm Anh Tuấn)"
                   onKeyDown={(e) => e.key === "Enter" && handleAddTerm()}
@@ -346,6 +436,7 @@ export function SlideContextModal({
                   className="input"
                   style={{ flex: 1 }}
                   value={newTgt}
+                  disabled={busy}
                   onChange={(e) => setNewTgt(e.target.value)}
                   placeholder="Bản dịch khóa (để trống = giữ nguyên)"
                   onKeyDown={(e) => e.key === "Enter" && handleAddTerm()}
@@ -365,6 +456,7 @@ export function SlideContextModal({
                       <input
                         type="checkbox"
                         checked={t.enabled}
+                        disabled={busy}
                         onChange={(e) => {
                           const next = terms.map((x, i) =>
                             i === idx ? { ...x, enabled: e.target.checked } : x
@@ -380,6 +472,7 @@ export function SlideContextModal({
                       </span>
                       <button
                         className="btn sm icon-only"
+                        disabled={busy}
                         title="Xóa thuật ngữ"
                         onClick={() => saveTerms(terms.filter((_, i) => i !== idx))}
                       >
@@ -397,6 +490,7 @@ export function SlideContextModal({
               <textarea
                 className="input"
                 rows={7}
+                disabled={busy}
                 style={{ resize: "vertical", lineHeight: 1.5 }}
                 value={pasteDraft}
                 onChange={(e) => setPasteDraft(e.target.value)}
@@ -409,8 +503,11 @@ export function SlideContextModal({
                   className="btn primary sm"
                   disabled={busy || !pasteDraft.trim()}
                   onClick={async () => {
-                    await postTextUpdate({ text: pasteDraft });
-                    setTab("slides");
+                    const ok = await postTextUpdate({ text: pasteDraft });
+                    if (ok) {
+                      setPasteDraft("");
+                      setTab("slides");
+                    }
                   }}
                 >
                   {busy ? <Loader2 size={12.5} className="spin" /> : <Check size={12.5} />}

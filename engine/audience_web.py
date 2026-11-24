@@ -9,7 +9,11 @@ Self-contained Offline Web Views served directly by DAU Voice Pro Local Engine:
 from __future__ import annotations
 
 import base64
+import ipaddress
+import os
+import re
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -44,22 +48,81 @@ _FAVICON_TAG = (
 )
 
 
+def _is_usable_lan_ipv4(ip: str) -> bool:
+    try:
+        addr = ipaddress.IPv4Address(ip)
+    except Exception:
+        return False
+    return not (addr.is_loopback or addr.is_link_local or addr.is_unspecified or addr.is_multicast)
+
+
+def _is_rfc1918_ipv4(ip: str) -> bool:
+    try:
+        addr = ipaddress.IPv4Address(ip)
+    except Exception:
+        return False
+    return addr.is_private and not (addr.is_loopback or addr.is_link_local or addr.is_unspecified)
+
+
 def get_local_lan_ip() -> str:
-    """Detect the machine's active LAN IPv4 address for local Wi-Fi QR sharing."""
+    """Detect the machine's active LAN IPv4 address for local Wi-Fi QR sharing (works 100% air-gapped offline)."""
+    # 1) Query OS routing table via UDP connect (sends 0 packets); try Internet + RFC1918 LAN targets
+    #    so air-gapped conference routers with no default WAN gateway still yield the Wi-Fi LAN IP!
+    for target in (
+        ("8.8.8.8", 80),
+        ("10.255.255.255", 1),
+        ("192.168.1.1", 80),
+        ("192.168.0.1", 80),
+        ("172.16.0.1", 80),
+    ):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(target)
+                ip = s.getsockname()[0]
+                if _is_usable_lan_ipv4(ip):
+                    return ip
+        except Exception:
+            continue
+
+    # 2) Hostname / mDNS (.local on macOS) & adapter list resolution
+    candidates: list[str] = []
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            if ip and not ip.startswith("127."):
-                return ip
+        host = socket.gethostname()
+        for h in (host, f"{host}.local"):
+            try:
+                for info in socket.getaddrinfo(h, None, socket.AF_INET):
+                    ip = info[4][0]
+                    if _is_usable_lan_ipv4(ip) and ip not in candidates:
+                        candidates.append(ip)
+            except Exception:
+                pass
+        try:
+            for ip in socket.gethostbyname_ex(host)[2]:
+                if _is_usable_lan_ipv4(ip) and ip not in candidates:
+                    candidates.append(ip)
+        except Exception:
+            pass
     except Exception:
         pass
-    try:
-        hostname_ip = socket.gethostbyname(socket.gethostname())
-        if hostname_ip and not hostname_ip.startswith("127."):
-            return hostname_ip
-    except Exception:
-        pass
+
+    # 3) Air-gapped interface scan fallback (macOS/Linux `ifconfig` / `ip -4 addr`)
+    if not candidates and os.name != "nt":
+        for cmd in (["ifconfig"], ["ip", "-4", "-o", "addr", "show"]):
+            try:
+                out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=1.5)
+                for ip in re.findall(r"\binet\s+(\d+\.\d+\.\d+\.\d+)", out):
+                    if _is_usable_lan_ipv4(ip) and ip not in candidates:
+                        candidates.append(ip)
+                if candidates:
+                    break
+            except Exception:
+                continue
+
+    for ip in candidates:
+        if _is_rfc1918_ipv4(ip):
+            return ip
+    if candidates:
+        return candidates[0]
     return "127.0.0.1"
 
 
@@ -819,7 +882,11 @@ AUDIENCE_HTML = (
     let fontSize = 20;
     let showSource = true;
     let selectedLang = new URLSearchParams(location.search).get("lang") || "follow";
-    if ([...langSelect.options].some(o => o.value === selectedLang)) langSelect.value = selectedLang;
+    if ([...langSelect.options].some(o => o.value === selectedLang)) {
+      langSelect.value = selectedLang;
+    } else {
+      selectedLang = langSelect.value || "follow";
+    }
     function syncLangLabel() {
       const opt = langSelect.options[langSelect.selectedIndex];
       if (langLabel && opt) langLabel.textContent = opt.textContent;
@@ -849,7 +916,7 @@ AUDIENCE_HTML = (
     }
 
     function escapeHtml(s) {
-      return (s || "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      return String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
 
     function renderLiveBar() {
@@ -956,6 +1023,20 @@ AUDIENCE_HTML = (
             entries = (msg.data || []).slice(-120);
             if (entries.length === 0) partial = null;
             render();
+          } else if (msg.type === "history_patch" && msg.data && msg.data.entry) {
+            const e = msg.data.entry;
+            const removed = new Set((msg.data.removed_ids || []).map(String));
+            if (removed.size > 0) {
+              entries = entries.filter(x => !removed.has(String(x.id)));
+            }
+            const idx = entries.findIndex(x => String(x.id) === String(e.id));
+            if (idx >= 0) {
+              entries[idx] = { ...entries[idx], ...e };
+            } else {
+              entries.push(e);
+              if (entries.length > 150) entries = entries.slice(-150);
+            }
+            render();
           } else if (msg.type === "partial") {
             const d = msg.data;
             partial = { id: d.id, source_text: d.source_text };
@@ -963,7 +1044,10 @@ AUDIENCE_HTML = (
           } else if (msg.type === "final") {
             const e = msg.data;
             if (partial && partial.id === e.id) partial = null;
-            if (!entries.some(x => x.id === e.id)) {
+            const idx = entries.findIndex(x => String(x.id) === String(e.id));
+            if (idx >= 0) {
+              entries[idx] = { ...entries[idx], ...e };
+            } else {
               entries.push(e);
               if (entries.length > 150) entries = entries.slice(-150);
             }
@@ -1022,6 +1106,11 @@ OBS_HTML = (
     .src { color: #cbd5e1; font-weight: 500; margin-bottom: 6px; text-shadow: 0 2px 6px rgba(0,0,0,0.85); }
     .tgt { color: #ffffff; font-weight: 800; line-height: 1.35; text-shadow: 0 2px 8px rgba(0,0,0,0.9); }
     .tgt.draft { color: #fecaca; }
+    .box.frozen {
+      border-color: rgba(251, 191, 36, 0.72);
+      background: rgba(15, 23, 42, 0.92);
+    }
+    .box.frozen .tgt { color: #fde68a; }
   </style>
 </head>
 <body>
@@ -1052,8 +1141,11 @@ OBS_HTML = (
     let lastFinal = null;
     let prevFinal = null;
     let dwellHoldUntil = 0;
+    let isFrozen = false;
+    let freezeMessage = "Tạm nghỉ — Phiên dịch hội nghị sẽ tiếp tục trong giây lát";
 
     function render(prevTgt, src, tgt, isDraft) {
+      if (isFrozen) return;
       if (!src && !tgt) return;
       if (prevTgt) {
         prevEl.textContent = prevTgt;
@@ -1062,23 +1154,100 @@ OBS_HTML = (
         prevEl.textContent = "";
         prevEl.classList.remove("show");
       }
+      srcEl.style.display = showSrc ? "" : "none";
       srcEl.textContent = src || "";
       tgtEl.textContent = tgt || "...";
       tgtEl.classList.toggle("draft", Boolean(isDraft));
-      box.classList.remove("hidden");
+      box.classList.remove("frozen", "hidden");
       if (hideTimer) clearTimeout(hideTimer);
-      hideTimer = setTimeout(() => box.classList.add("hidden"), 18000);
+      hideTimer = setTimeout(() => { if (!isFrozen) box.classList.add("hidden"); }, 18000);
     }
+
+    function clearDisplay() {
+      if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+      prevEl.textContent = "";
+      prevEl.classList.remove("show");
+      srcEl.textContent = "";
+      tgtEl.textContent = "";
+      tgtEl.classList.remove("draft");
+      box.classList.remove("frozen");
+      box.classList.add("hidden");
+    }
+
+    function setFrozen(frozen, msg) {
+      isFrozen = Boolean(frozen);
+      if (msg) freezeMessage = String(msg);
+      if (isFrozen) {
+        if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+        prevEl.textContent = "";
+        prevEl.classList.remove("show");
+        srcEl.style.display = "none";
+        srcEl.textContent = "";
+        tgtEl.textContent = freezeMessage;
+        tgtEl.classList.remove("draft");
+        box.classList.add("frozen");
+        box.classList.remove("hidden");
+      } else {
+        box.classList.remove("frozen");
+        if (lastFinal && (lastFinal.source_text || lastFinal.translated_text)) {
+          render(prevFinal ? prevFinal.translated_text : "", lastFinal.source_text, lastFinal.translated_text, false);
+        } else {
+          clearDisplay();
+        }
+      }
+    }
+
     function connect() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(`${proto}//${location.host}/ws/audience?lang=${encodeURIComponent(lang)}`);
       ws.onmessage = (ev) => {
         try {
           const m = JSON.parse(ev.data);
-          if (m.type === "partial") {
+          if (m.type === "status") {
+            if (m.data && typeof m.data.display_frozen === "boolean") {
+              setFrozen(m.data.display_frozen, m.data.display_freeze_message);
+            }
+          } else if (m.type === "display_freeze") {
+            setFrozen(m.data && m.data.frozen, m.data && m.data.message);
+          } else if (m.type === "history") {
+            const list = Array.isArray(m.data) ? m.data : [];
+            if (list.length === 0) {
+              activeId = "";
+              pendingSrc = "";
+              lastFinal = null;
+              prevFinal = null;
+              if (!isFrozen) clearDisplay();
+            } else {
+              const tail = list.slice(-2);
+              const prevItem = tail.length >= 2 ? tail[0] : null;
+              const lastItem = tail[tail.length - 1];
+              prevFinal = prevItem ? { id: String(prevItem.id || ""), source_text: prevItem.source_text || "", translated_text: prevItem.translated_text || "" } : null;
+              lastFinal = { id: String(lastItem.id || ""), source_text: lastItem.source_text || "", translated_text: lastItem.translated_text || "" };
+              if (!isFrozen) {
+                render(prevFinal ? prevFinal.translated_text : "", lastFinal.source_text, lastFinal.translated_text, false);
+              }
+            }
+          } else if (m.type === "history_patch" && m.data && m.data.entry) {
+            const ent = m.data.entry;
+            const entId = String(ent.id || "");
+            const removed = new Set((m.data.removed_ids || []).map(String));
+            let changed = false;
+            if (lastFinal && (lastFinal.id === entId || removed.has(lastFinal.id))) {
+              lastFinal = { id: entId, source_text: ent.source_text || "", translated_text: ent.translated_text || "" };
+              if (prevFinal && (prevFinal.id === entId || removed.has(prevFinal.id))) prevFinal = null;
+              changed = true;
+            } else if (prevFinal && (prevFinal.id === entId || removed.has(prevFinal.id))) {
+              prevFinal = { id: entId, source_text: ent.source_text || "", translated_text: ent.translated_text || "" };
+              changed = true;
+            }
+            if (changed && !isFrozen && lastFinal) {
+              render(prevFinal ? prevFinal.translated_text : "", lastFinal.source_text, lastFinal.translated_text, false);
+            }
+          } else if (m.type === "partial") {
             const same = m.data.id === activeId;
             activeId = m.data.id;
             pendingSrc = m.data.source_text || "";
+            if (isFrozen) return;
             // Atomic hold: NEVER wipe out the previous sentence with "..." before new MT arrives!
             if (same && tgtEl.textContent && tgtEl.textContent !== "...") {
               render(lastFinal ? lastFinal.translated_text : "", pendingSrc, tgtEl.textContent, true);
@@ -1086,6 +1255,7 @@ OBS_HTML = (
               render("", pendingSrc, "...", true);
             }
           } else if (m.type === "partial_mt" && m.data.id === activeId) {
+            if (isFrozen) return;
             const draftTgt = m.data.translated_text || "";
             const wc = draftTgt.trim().split(/\s+/).filter(Boolean).length;
             if (lastFinal && Date.now() < dwellHoldUntil && wc < 6) {
@@ -1093,13 +1263,23 @@ OBS_HTML = (
             }
             render(lastFinal ? lastFinal.translated_text : "", pendingSrc, draftTgt, true);
           } else if (m.type === "final") {
-            activeId = "";
-            pendingSrc = "";
-            prevFinal = lastFinal;
-            lastFinal = { source_text: m.data.source_text || "", translated_text: m.data.translated_text || "" };
-            const wc = lastFinal.translated_text.trim().split(/\s+/).filter(Boolean).length;
-            dwellHoldUntil = Date.now() + Math.min(2400, Math.max(1200, wc * 85));
-            render(prevFinal ? prevFinal.translated_text : "", lastFinal.source_text, lastFinal.translated_text, false);
+            const eid = String(m.data.id || "");
+            const updated = { id: eid, source_text: m.data.source_text || "", translated_text: m.data.translated_text || "" };
+            if (eid && lastFinal && lastFinal.id === eid) {
+              lastFinal = updated;
+            } else if (eid && prevFinal && prevFinal.id === eid) {
+              prevFinal = updated;
+            } else {
+              activeId = "";
+              pendingSrc = "";
+              prevFinal = lastFinal;
+              lastFinal = updated;
+              const wc = lastFinal.translated_text.trim().split(/\s+/).filter(Boolean).length;
+              dwellHoldUntil = Date.now() + Math.min(2400, Math.max(1200, wc * 85));
+            }
+            if (!isFrozen && lastFinal) {
+              render(prevFinal ? prevFinal.translated_text : "", lastFinal.source_text, lastFinal.translated_text, false);
+            }
           }
         } catch {}
       };

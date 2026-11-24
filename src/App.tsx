@@ -99,7 +99,7 @@ import {
   speakOfflineTTS,
 } from "./types";
 
-const APP_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.8.4";
+const APP_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "1.1.0";
 const GITHUB_REPO = "niitbeo/PolyVoice-Pro";
 const VU_BARS = 18;
 
@@ -333,6 +333,8 @@ export default function App() {
     body?: string;
     downloadUrl?: string;
     nativeUpdate?: {
+      download: (cb?: (ev: { event: string; data?: { contentLength?: number; chunkLength?: number } }) => void) => Promise<void>;
+      install: () => Promise<void>;
       downloadAndInstall: (cb?: (ev: { event: string; data?: { contentLength?: number; chunkLength?: number } }) => void) => Promise<void>;
     };
   } | null>(null);
@@ -361,8 +363,11 @@ export default function App() {
 
   const ttsRef = useRef(ttsEnabled);
   ttsRef.current = ttsEnabled;
+  const connectedRef = useRef(false);
+  connectedRef.current = connected;
   const listeningRef = useRef(false);
   listeningRef.current = Boolean(status?.listening);
+  const partialRef = useRef<PartialEvent | null>(null);
   const updateInstallingRef = useRef(false);
   updateInstallingRef.current = updateInstalling;
   const toggleListeningRef = useRef<() => void>(() => {});
@@ -411,6 +416,7 @@ export default function App() {
     }
     if (typeof h.logs?.saved_count === "number") setSavedLogCount(h.logs.saved_count);
     if (typeof h.audience?.connected_count === "number") setAudienceCount(h.audience.connected_count);
+    if (typeof h.display_frozen === "boolean") setDisplayFrozen(h.display_frozen);
     if (typeof h.cloud_fallback_notice === "string") setCloudNotice(h.cloud_fallback_notice);
   }, []);
 
@@ -476,7 +482,11 @@ export default function App() {
           const msg = JSON.parse(ev.data);
           if (msg.type === "status") {
             syncStatusToLocalState(msg.data, false);
-            if (!msg.data?.listening) setInflightPartial(null);
+            if (!msg.data?.listening) {
+              partialRef.current = null;
+              setPartial(null);
+              setInflightPartial(null);
+            }
             if (typeof msg.data?.display_frozen === "boolean") {
               setDisplayFrozen(msg.data.display_frozen);
             }
@@ -495,48 +505,53 @@ export default function App() {
             }
           } else if (msg.type === "partial") {
             const d = msg.data;
-            setPartial((prev) => {
-              const same = Boolean(prev && prev.id === d.id && prev.target_lang === d.target_lang);
-              if (
-                !same &&
-                prev &&
-                prev.id !== d.id &&
-                (prev.translated_text || prev.stable_text || prev.unstable_text)
-              ) {
-                setInflightPartial(prev);
-              }
-              return {
-                id: d.id,
-                speaker: d.speaker,
-                source_text: d.source_text,
-                translated_text: same && prev ? prev.translated_text : "",
-                stable_text: same && prev ? prev.stable_text : "",
-                unstable_text: same && prev ? prev.unstable_text : "",
-                source_lang: d.source_lang || "vie_Latn",
-                target_lang: d.target_lang,
-                asr_ms: d.asr_ms ?? 0,
-                mt_ms: same && prev ? prev.mt_ms : 0,
-                mt_engine: same && prev ? prev.mt_engine : undefined,
-              };
-            });
+            const prev = partialRef.current;
+            const same = Boolean(prev && prev.id === d.id && prev.target_lang === d.target_lang);
+            if (
+              !same &&
+              prev &&
+              prev.id !== d.id &&
+              (prev.translated_text || prev.stable_text || prev.unstable_text)
+            ) {
+              setInflightPartial(prev);
+            }
+            const nextPartial: PartialEvent = {
+              id: d.id,
+              speaker: d.speaker,
+              source_text: d.source_text,
+              translated_text: same && prev ? prev.translated_text : "",
+              stable_text: same && prev ? prev.stable_text : "",
+              unstable_text: same && prev ? prev.unstable_text : "",
+              source_lang: d.source_lang || "vie_Latn",
+              target_lang: d.target_lang,
+              asr_ms: d.asr_ms ?? 0,
+              mt_ms: same && prev ? prev.mt_ms : 0,
+              mt_engine: same && prev ? prev.mt_engine : undefined,
+            };
+            partialRef.current = nextPartial;
+            setPartial(nextPartial);
           } else if (msg.type === "partial_mt") {
             const d = msg.data;
             setInflightPartial((cur) => (cur && cur.id !== d.id ? null : cur));
-            setPartial((prev) =>
-              prev && prev.id === d.id
-                ? {
-                    ...prev,
-                    translated_text: d.translated_text,
-                    stable_text: d.stable_text ?? "",
-                    unstable_text: d.unstable_text ?? "",
-                    mt_ms: d.mt_ms ?? 0,
-                    mt_engine: d.mt_engine,
-                  }
-                : prev
-            );
+            const prev = partialRef.current;
+            if (prev && prev.id === d.id) {
+              const updated: PartialEvent = {
+                ...prev,
+                translated_text: d.translated_text,
+                stable_text: d.stable_text ?? "",
+                unstable_text: d.unstable_text ?? "",
+                mt_ms: d.mt_ms ?? 0,
+                mt_engine: d.mt_engine,
+              };
+              partialRef.current = updated;
+              setPartial(updated);
+            }
           } else if (msg.type === "final") {
             const entry: TranscriptEntry = msg.data;
-            setPartial((prev) => (prev && prev.id === entry.id ? null : prev));
+            if (partialRef.current && partialRef.current.id === entry.id) {
+              partialRef.current = null;
+              setPartial(null);
+            }
             setInflightPartial((prev) => (prev && prev.id === entry.id ? null : prev));
             setHistory((prev) => {
               if (prev.some((x) => x.id === entry.id)) return prev;
@@ -562,6 +577,7 @@ export default function App() {
             const list: TranscriptEntry[] = msg.data || [];
             setHistory([...list].reverse());
             if (list.length === 0) {
+              partialRef.current = null;
               setPartial(null);
               setInflightPartial(null);
             }
@@ -654,6 +670,10 @@ export default function App() {
 
       ws.onclose = () => {
         setConnected(false);
+        partialRef.current = null;
+        setPartial(null);
+        setInflightPartial(null);
+        setLevel(0);
         if (!closed) {
           retryTimer = window.setTimeout(connect, 1200);
         }
@@ -770,6 +790,7 @@ export default function App() {
     Promise.all([import("@tauri-apps/api/event"), import("@tauri-apps/api/core")])
       .then(([{ listen }, { invoke }]) => {
         listen("toggle-listening", () => {
+          if (!connectedRef.current) return;
           toggleListeningRef.current();
         })
           .then((fn) => {
@@ -778,7 +799,9 @@ export default function App() {
           })
           .catch(() => {});
         listen<boolean>("overlay-visibility", (ev) => {
-          setOverlayOpen(Boolean(ev.payload));
+          const visible = Boolean(ev.payload);
+          setOverlayOpen(visible);
+          if (!visible) setClickThrough(false);
         })
           .then((fn) => {
             if (cancelled) fn();
@@ -816,10 +839,11 @@ export default function App() {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         if (exitConfirmOpen && !exitBusy) setExitConfirmOpen(false);
+        else if (slideModalOpen) setSlideModalOpen(false);
         else if (glossaryOpen) setGlossaryOpen(false);
         else if (qrOpen) setQrOpen(false);
         else if (summaryOpen) setSummaryOpen(false);
-        else if (evalOpen) setEvalOpen(false);
+        else if (evalOpen && !evalBusy) setEvalOpen(false);
         else if (cloudOpen) setCloudOpen(false);
         else if (fileModalOpen && !fileBusy) setFileModalOpen(false);
         else if (updateModalOpen && !updateInstalling) setUpdateModalOpen(false);
@@ -841,10 +865,12 @@ export default function App() {
   }, [
     exitConfirmOpen,
     exitBusy,
+    slideModalOpen,
     glossaryOpen,
     qrOpen,
     summaryOpen,
     evalOpen,
+    evalBusy,
     cloudOpen,
     fileModalOpen,
     fileBusy,
@@ -1223,23 +1249,33 @@ export default function App() {
     setSlideModalOpen(true);
     try {
       const res = await fetch(`${ENGINE_HTTP}/api/context`);
-      if (res.ok) setSlideContext(await res.json());
+      if (!res.ok) {
+        setErrorMsg("Không thể tải dữ liệu Slide & Bối cảnh từ dịch vụ AI.");
+        return;
+      }
+      setSlideContext(await res.json());
     } catch {
-      // ignore
+      setErrorMsg("Không thể kết nối dịch vụ AI để tải dữ liệu Slide.");
     }
   };
 
   const handleToggleDisplayFreeze = async () => {
-    const next = !displayFrozen;
+    const prev = displayFrozen;
+    const next = !prev;
     setDisplayFrozen(next);
     try {
-      await fetch(`${ENGINE_HTTP}/api/display/freeze`, {
+      const res = await fetch(`${ENGINE_HTTP}/api/display/freeze`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ frozen: next }),
       });
+      if (!res.ok) {
+        setDisplayFrozen(prev);
+        setErrorMsg("Không thể thay đổi trạng thái tạm ẩn màn LED.");
+      }
     } catch {
-      // ignore
+      setDisplayFrozen(prev);
+      setErrorMsg("Mất kết nối dịch vụ AI khi chuyển trạng thái màn LED.");
     }
   };
 
@@ -1247,20 +1283,61 @@ export default function App() {
     const nextText = editingHistoryDraft.trim();
     if (!nextText) return;
     setEditingHistoryBusy(true);
+    const ids = itemIds && itemIds.length > 0 ? itemIds : [targetId];
+    const applyLocalUpdate = () => {
+      const idsSet = new Set([...ids, targetId]);
+      setHistory((prev) => {
+        const matched = prev.filter(
+          (e) => idsSet.has(e.id) || (e.paragraph_id ? idsSet.has(e.paragraph_id) : false)
+        );
+        if (matched.length === 0) return prev;
+        const primaryId = matched[0].id;
+        const mergedSrc =
+          matched.length > 1
+            ? [...matched]
+                .reverse()
+                .map((m) => m.source_text)
+                .filter(Boolean)
+                .join(" ")
+                .trim()
+            : matched[0].source_text;
+        return prev
+          .filter(
+            (e) =>
+              e.id === primaryId ||
+              (!idsSet.has(e.id) && !(e.paragraph_id && idsSet.has(e.paragraph_id)))
+          )
+          .map((e) =>
+            e.id === primaryId ? { ...e, source_text: mergedSrc, translated_text: nextText } : e
+          );
+      });
+    };
     try {
-      await fetch(`${ENGINE_HTTP}/api/history/update`, {
+      const res = await fetch(`${ENGINE_HTTP}/api/history/update`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           id: targetId,
           translated_text: nextText,
-          item_ids: itemIds && itemIds.length > 0 ? itemIds : [targetId],
+          item_ids: ids,
         }),
       });
+      let data: { ok?: boolean; updated?: boolean; detail?: string } | null = null;
+      try {
+        data = await res.json();
+      } catch {
+        data = null;
+      }
+      if (!res.ok) {
+        setErrorMsg(data?.detail || "Không thể lưu bản dịch đã sửa lên màn LED & QR.");
+        return;
+      }
+      // Always sync local state too (handles Quick-Translate `txt-...` local items where updated === false)
+      applyLocalUpdate();
       setEditingHistoryId("");
       setEditingHistoryDraft("");
     } catch {
-      // ignore
+      setErrorMsg("Mất kết nối dịch vụ AI khi lưu bản dịch đã sửa.");
     } finally {
       setEditingHistoryBusy(false);
     }
@@ -1853,20 +1930,13 @@ export default function App() {
     }
     setUpdateInstalling(true);
     setUpdateProgress(0);
-    setUpdateProgressText("Đang dừng engine cục bộ & chuẩn bị tải bản cập nhật...");
+    setUpdateProgressText("Đang chuẩn bị tải bản cập nhật...");
     let totalBytes = 0;
     let downloadedBytes = 0;
+    let sidecarStopped = false;
     try {
-      if (isTauriEnv()) {
-        try {
-          const { invoke } = await import("@tauri-apps/api/core");
-          await invoke("set_allow_exit", { allow: true }).catch(() => {});
-          await invoke("stop_local_engine").catch(() => {});
-        } catch {
-          // ignore
-        }
-      }
-      await updateInfo.nativeUpdate.downloadAndInstall((event) => {
+      // Phase 1: Download FIRST while local sidecar remains alive (safe if network fails mid-download)
+      await updateInfo.nativeUpdate.download((event) => {
         if (event.event === "Started") {
           totalBytes = event.data?.contentLength || 0;
           setUpdateProgress(3);
@@ -1886,20 +1956,47 @@ export default function App() {
           );
         } else if (event.event === "Finished") {
           setUpdateProgress(100);
-          setUpdateProgressText("Đã tải xong! Đang cài đặt và khởi động lại...");
+          setUpdateProgressText("Đã tải xong! Đang dừng dịch vụ nền để cài đặt...");
         }
       });
+
+      // Phase 2: Right before install(), hide overlay and cleanly release sidecar file locks
+      if (isTauriEnv()) {
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          await invoke("hide_overlay").catch(() => {});
+          await invoke("set_allow_exit", { allow: true }).catch(() => {});
+          await invoke("stop_local_engine").catch(() => {});
+          sidecarStopped = true;
+        } catch {
+          // ignore
+        }
+      }
+
+      setUpdateProgressText("Đang cài đặt bản cập nhật và khởi động lại...");
+      await updateInfo.nativeUpdate.install();
       const { relaunch } = await import("@tauri-apps/plugin-process");
       await relaunch();
     } catch (e) {
       if (isTauriEnv()) {
-        import("@tauri-apps/api/core")
-          .then(({ invoke }) => invoke("set_allow_exit", { allow: false }).catch(() => {}))
-          .catch(() => {});
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          await invoke("set_allow_exit", { allow: false }).catch(() => {});
+          if (sidecarStopped) {
+            await invoke("start_local_engine").catch(() => {});
+          }
+        } catch {
+          // ignore
+        }
       }
       setUpdateInstalling(false);
       setUpdateProgressText("");
-      setErrorMsg(`Lỗi cập nhật tự động: ${String(e)}`);
+      const detail = e instanceof Error ? e.message : String(e);
+      setErrorMsg(
+        /cancel|abort|denied|user/i.test(detail)
+          ? "Quá trình cài đặt bản cập nhật đã bị hủy. Dịch vụ AI cục bộ đang tự khởi động lại."
+          : `Không thể hoàn tất cập nhật tự động: ${detail}`
+      );
     }
   };
 
@@ -2677,6 +2774,24 @@ export default function App() {
     { value: "gemini-3.8-flash", label: "gemini-3.8-flash", badge: "Mới nhất", description: "Flash thế hệ 3.8 mới nhất", icon: <Sparkles size={13} /> },
   ];
 
+  const mtModeDisplayLabel = useMemo(() => {
+    if (mtMode === "auto-offline") {
+      return isViEnPair ? "Siêu nhẹ Offline (EnViT5)" : "Siêu nhẹ Offline (NLLB-200)";
+    }
+    if (mtMode === "light-offline") return "Siêu nhẹ Offline (EnViT5 / NLLB)";
+    if (mtMode === "hy-mt2") return "Chuyên sâu 38 NN (Hy-MT2)";
+    if (mtMode === "nllb") return "Đa ngôn ngữ Offline (NLLB-600M)";
+    if (mtMode === "local-llm") return `Local LLM (${llmModel || "Ollama"})`;
+    if (mtMode === "cloud-api") {
+      const prov = status?.cloud_api?.provider;
+      if (prov === "azure") return "Cloud API (Azure Translator)";
+      if (prov === "gemini") return "Cloud API (Google Gemini)";
+      return "Cloud API (Google Translate)";
+    }
+    if (mtMode === "fast-online") return "Dịch nhanh trực tuyến";
+    return mtMode;
+  }, [mtMode, isViEnPair, llmModel, status?.cloud_api?.provider]);
+
   return (
     <div className="app-shell">
       {/* Single-Row Studio Top Bar */}
@@ -2743,11 +2858,11 @@ export default function App() {
 
         <div className="topbar-right">
           <button
-            className={`btn ${overlayOpen ? "active" : ""}`}
+            className={`btn topbar-btn ${overlayOpen ? "active" : ""}`}
             onClick={handleToggleOverlay}
             title="Mở cửa sổ Sân khấu LED / Phụ đề nổi (kéo sang màn hình LED hoặc máy chiếu phụ)"
           >
-            <Layers size={13.5} /> Màn LED
+            <Layers size={13.5} /> <span className="topbar-btn-label">Màn LED</span>
           </button>
 
           <button
@@ -2765,26 +2880,31 @@ export default function App() {
 
           {overlayOpen && isTauriEnv() && (
             <button
-              className={`btn ${clickThrough ? "active" : ""}`}
+              className={`btn topbar-btn ${clickThrough ? "active" : ""}`}
               onClick={handleToggleClickThrough}
-              title="Cho phép bấm chuột xuyên qua cửa sổ phụ đề để điều khiển slide PowerPoint bên dưới"
+              title={
+                clickThrough
+                  ? "Đang BẬT xuyên chuột — bấm để tắt và tương tác lại với cửa sổ phụ đề"
+                  : "Cho phép bấm chuột xuyên qua cửa sổ phụ đề để điều khiển slide PowerPoint bên dưới"
+              }
             >
-              <MousePointerClick size={13.5} /> {clickThrough ? "Xuyên chuột: Bật" : "Xuyên chuột"}
+              <MousePointerClick size={13.5} /> <span className="topbar-btn-label">Xuyên chuột</span>
+              {clickThrough && <span className="btn-badge">Bật</span>}
             </button>
           )}
 
           <button
-            className={`btn ${qrOpen || audienceCount > 0 ? "active" : ""}`}
+            className={`btn topbar-btn ${qrOpen || audienceCount > 0 ? "active" : ""}`}
             onClick={handleOpenQrModal}
             disabled={!connected}
             title="Phát mã QR Wi-Fi nội bộ để khán giả quét xem phụ đề đa ngôn ngữ trên điện thoại + link OBS"
           >
-            <QrCode size={13.5} /> QR
+            <QrCode size={13.5} /> <span className="topbar-btn-label">QR</span>
             {audienceCount > 0 && <span className="btn-badge">{audienceCount}</span>}
           </button>
 
           <button
-            className={`btn ${
+            className={`btn topbar-btn ${
               slideModalOpen ||
               (status?.slide_context?.enabled &&
                 ((status?.slide_context?.slide_count ?? 0) > 0 ||
@@ -2796,7 +2916,7 @@ export default function App() {
             disabled={!connected}
             title="Nạp Slide / Tài liệu hội nghị (.PPTX, .PDF, .DOCX) để nhận dạng & dịch chuẩn tên riêng 100% Offline"
           >
-            <Presentation size={13.5} /> Slide
+            <Presentation size={13.5} /> <span className="topbar-btn-label">Slide</span>
             {status?.slide_context &&
               (status.slide_context.slide_count > 0 || status.slide_context.term_count > 0) && (
                 <span className={`btn-badge ${status.slide_context.enabled ? "" : "muted"}`}>
@@ -2810,16 +2930,16 @@ export default function App() {
           </button>
 
           <button
-            className={`btn ${fileModalOpen ? "active" : ""}`}
+            className={`btn topbar-btn ${fileModalOpen ? "active" : ""}`}
             onClick={() => setFileModalOpen(true)}
             disabled={!connected}
             title="Kéo thả file ghi âm / video (.mp3, .wav, .mp4) dịch & tạo phụ đề .SRT song ngữ offline"
           >
-            <FileAudio size={13.5} /> Dịch File
+            <FileAudio size={13.5} /> <span className="topbar-btn-label">Dịch File</span>
           </button>
 
           <button
-            className={`btn ${glossaryOpen ? "active" : ""}`}
+            className={`btn topbar-btn ${glossaryOpen ? "active" : ""}`}
             onClick={handleOpenGlossary}
             disabled={!connected}
             title={
@@ -2828,7 +2948,7 @@ export default function App() {
                 : "Khóa tên riêng, thuật ngữ chuyên ngành và tự đồng bộ Hotwords vào ASR"
             }
           >
-            <BookOpen size={13.5} /> Từ điển
+            <BookOpen size={13.5} /> <span className="topbar-btn-label">Từ điển</span>
             {typeof status?.glossary_count === "number" && (
               <span className={`btn-badge ${status?.glossary_enabled === false ? "muted" : ""}`}>
                 {status?.glossary_enabled === false ? "Tắt" : status.glossary_count}
@@ -4260,6 +4380,9 @@ export default function App() {
                   className="btn sm icon-only"
                   onClick={() => {
                     setHistory([]);
+                    partialRef.current = null;
+                    setPartial(null);
+                    setInflightPartial(null);
                     setItemEvals({});
                     setItemEvalGloss({});
                     setEvalReport(null);
@@ -4339,6 +4462,7 @@ export default function App() {
                           </button>
                           <button
                             className="btn sm icon-only"
+                            disabled={!connected}
                             onClick={() => {
                               setEditingHistoryId(item.id);
                               setEditingHistoryDraft(item.translated_text || "");
@@ -4698,7 +4822,13 @@ export default function App() {
                   </div>
                   {audienceInfo.active_languages.length > 0 && (
                     <div className="qr-active-langs">
-                      Đang xem: {audienceInfo.active_languages.join(", ")}
+                      Đang xem:{" "}
+                      {audienceInfo.active_languages
+                        .map((code) => {
+                          const found = languages.find((l) => l.code === code);
+                          return found ? found.name_vi : shortLangName(code);
+                        })
+                        .join(", ")}
                     </div>
                   )}
                 </div>
@@ -4801,7 +4931,7 @@ export default function App() {
                 <div>
                   <div className="modal-title">Dịch File Ghi Âm &amp; Video Offline (.MP3 / .WAV / .M4A / .MP4)</div>
                   <div className="modal-sub">
-                    Hướng dịch hiện tại: <b>{currentSrcObj?.name_vi || sourceLang} → {currentTgtObj?.name_vi || targetLang}</b> • Engine: <b>{mtMode}</b>
+                    Hướng dịch hiện tại: <b>{currentSrcObj?.name_vi || sourceLang} → {currentTgtObj?.name_vi || targetLang}</b> • Engine: <b>{mtModeDisplayLabel}</b>
                   </div>
                 </div>
               </div>
@@ -5025,7 +5155,7 @@ export default function App() {
                         <FileText size={12} /> Tải .TXT
                       </button>
                       <button
-                        className="btn sm eval-btn"
+                        className="btn sm eval-trigger-btn"
                         disabled={fileResult.segments.length === 0}
                         onClick={handleEvaluateFileResult}
                         title="Rà soát lỗi dấu thanh, tên riêng & độ sát nghĩa của file bằng Google AI (Gemini)"

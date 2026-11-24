@@ -91,10 +91,15 @@ DEFAULT_DATA: dict[str, Any] = {
 }
 
 
-def _word_boundary_pattern(term: str) -> re.Pattern[str]:
-    escaped = re.escape(term.strip())
+def _word_boundary_pattern(term: str, case_sensitive: bool = False) -> re.Pattern[str]:
+    clean_t = term.strip()
+    escaped = re.escape(clean_t)
+    flags = re.UNICODE if case_sensitive else (re.IGNORECASE | re.UNICODE)
+    # Non-spaced scripts (CJK/Thai/Khmer) match directly without `\w` boundary collision
+    if any("\u3040" <= ch <= "\u9fff" or "\u0e00" <= ch <= "\u0e7f" or "\u1780" <= ch <= "\u17ff" for ch in clean_t):
+        return re.compile(escaped, flags)
     # Unicode-aware boundary check (works cleanly with Vietnamese diacritics!)
-    return re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE | re.UNICODE)
+    return re.compile(rf"(?<!\w){escaped}(?!\w)", flags)
 
 
 # Canonical Vietnamese family surnames (~65 covering >99% of Vietnamese full names)
@@ -581,31 +586,45 @@ class GlossaryManager:
             )
             session_snap = dict(self._session_persons)
 
-        # Merge manual Glossary locks (highest priority) + Slide-RAG matched locks, longest-match first
-        combined_rules: list[dict[str, str]] = list(manual_rules)
+        # Filter manual Glossary rules by target_lang FIRST so an EN-only lock (e.g. "Hiệu trưởng" -> "Principal")
+        # NEVER shadows a JA/KO Slide-RAG lock ("Hiệu trưởng" -> "学長") when building `seen_src`!
+        combined_rules: list[dict[str, Any]] = [
+            r for r in manual_rules
+            if not r.get("target_lang") or r.get("target_lang") == target_lang
+        ]
         seen_src = {str(r.get("source", "")).lower() for r in combined_rules if r.get("source")}
         for item in extra_locks or []:
             src_s = str(item.get("source", "")).strip()
             tgt_s = str(item.get("target", "")).strip()
+            item_tl = str(item.get("target_lang", "")).strip()
+            if item_tl and item_tl != target_lang:
+                continue
             if src_s and tgt_s and src_s.lower() not in seen_src:
                 seen_src.add(src_s.lower())
-                combined_rules.append({"source": src_s, "target": tgt_s, "target_lang": str(item.get("target_lang", ""))})
-        rules = sorted(combined_rules, key=lambda r: len(r["source"]), reverse=True)
+                combined_rules.append(
+                    {
+                        "source": src_s,
+                        "target": tgt_s,
+                        "target_lang": item_tl,
+                        "case_sensitive": bool(item.get("case_sensitive", False)),
+                    }
+                )
+        rules = sorted(combined_rules, key=lambda r: len(str(r["source"])), reverse=True)
 
         masked = text
         restore_pairs: list[tuple[str, str]] = []
         idx = 0
 
-        # 1) User-configured Glossary term locks first (highest precedence)
+        # 1) User-configured Glossary & Slide-RAG term locks first (highest precedence)
         for rule in rules:
             rule_tgt = rule.get("target_lang")
             if rule_tgt and rule_tgt != target_lang:
                 continue
-            pat = _word_boundary_pattern(rule["source"])
+            pat = _word_boundary_pattern(str(rule["source"]), case_sensitive=bool(rule.get("case_sensitive", False)))
             if pat.search(masked):
                 token = f"XTerm{chr(65 + (idx % 26))}{idx}X"
                 masked = pat.sub(lambda _m, tok=token: tok, masked)
-                restore_pairs.append((token, rule["target"]))
+                restore_pairs.append((token, str(rule["target"])))
                 idx += 1
 
         # 2) Automatic Vietnamese Proper-Name & Landmark Shield (prevents Chinese Pinyin & literal errors)

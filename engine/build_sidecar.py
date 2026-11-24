@@ -154,6 +154,8 @@ def build() -> Path:
         "sentencepiece",
         "segno",
         "multipart",
+        "python_multipart",
+        "pypdf",
     ]
     if _has_module("certifi"):
         collect_pkgs.append("certifi")
@@ -182,8 +184,6 @@ def build() -> Path:
         "certifi",
         "huggingface_hub",
         "numpy",
-        "pypdf",
-        "python_multipart",
         "asr_engine",
         "audience_web",
         "audio_capture",

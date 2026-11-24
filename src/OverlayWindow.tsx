@@ -94,6 +94,7 @@ function renderLiveTarget(partial: PartialEvent) {
 }
 
 export default function OverlayWindow() {
+  const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState<EngineStatus | null>(null);
   const [entries, setEntries] = useState<TranscriptEntry[]>([]);
   const [partial, setPartial] = useState<PartialEvent | null>(null);
@@ -120,11 +121,21 @@ export default function OverlayWindow() {
   const [audienceInfo, setAudienceInfo] = useState<AudienceInfo | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const partialRef = useRef<PartialEvent | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedToBottomRef = useRef(true);
   const scrollAnimRef = useRef<number | null>(null);
   const hideBarTimerRef = useRef<number | null>(null);
   const ytDwellTimerRef = useRef<number | null>(null);
+
+  const fetchAudienceInfo = useCallback(() => {
+    fetch(`${ENGINE_HTTP}/api/audience/info`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((info) => {
+        if (info?.qr_svg) setAudienceInfo(info);
+      })
+      .catch(() => {});
+  }, []);
 
   // Persist overlay layout preference
   useEffect(() => {
@@ -204,6 +215,7 @@ export default function OverlayWindow() {
       wsRef.current = ws;
 
       ws.onopen = () => {
+        setConnected(true);
         fetch(`${ENGINE_HTTP}/api/health`)
           .then((r) => (r.ok ? r.json() : null))
           .then((d) => {
@@ -214,12 +226,7 @@ export default function OverlayWindow() {
             }
           })
           .catch(() => {});
-        fetch(`${ENGINE_HTTP}/api/audience/info`)
-          .then((r) => (r.ok ? r.json() : null))
-          .then((info) => {
-            if (info?.qr_svg) setAudienceInfo(info);
-          })
-          .catch(() => {});
+        fetchAudienceInfo();
       };
 
       ws.onmessage = (ev) => {
@@ -227,7 +234,11 @@ export default function OverlayWindow() {
           const msg = JSON.parse(ev.data);
           if (msg.type === "status") {
             setStatus(msg.data);
-            if (!msg.data?.listening) setInflightPartial(null);
+            if (!msg.data?.listening) {
+              partialRef.current = null;
+              setPartial(null);
+              setInflightPartial(null);
+            }
             if (typeof msg.data?.display_frozen === "boolean") {
               setDisplayFrozen(msg.data.display_frozen);
             }
@@ -237,49 +248,69 @@ export default function OverlayWindow() {
           } else if (msg.type === "display_freeze") {
             setDisplayFrozen(Boolean(msg.data?.frozen));
             if (msg.data?.message) setFreezeMessage(msg.data.message);
-          } else if (msg.type === "partial") {
-            const d = msg.data;
-            setPartial((prev) => {
-              const same = Boolean(prev && prev.id === d.id && prev.target_lang === d.target_lang);
-              if (
-                !same &&
-                prev &&
-                prev.id !== d.id &&
-                (prev.translated_text || prev.stable_text || prev.unstable_text)
-              ) {
-                setInflightPartial(prev);
-              }
-              return {
-                id: d.id,
-                speaker: d.speaker,
-                source_text: d.source_text,
-                translated_text: same && prev ? prev.translated_text : "",
-                stable_text: same && prev ? prev.stable_text : "",
-                unstable_text: same && prev ? prev.unstable_text : "",
-                source_lang: d.source_lang || "vie_Latn",
-                target_lang: d.target_lang,
-                asr_ms: d.asr_ms ?? 0,
-                mt_ms: same && prev ? prev.mt_ms : 0,
-              };
-            });
-          } else if (msg.type === "partial_mt") {
-            const d = msg.data;
-            setInflightPartial((cur) => (cur && cur.id !== d.id ? null : cur));
-            setPartial((prev) =>
-              prev && prev.id === d.id
+          } else if (msg.type === "slide_match") {
+            const idx = Number(msg.data?.slide_index || 0);
+            const title = String(msg.data?.slide_title || "");
+            setStatus((prev) =>
+              prev && prev.slide_context
                 ? {
                     ...prev,
-                    translated_text: d.translated_text,
-                    stable_text: d.stable_text ?? "",
-                    unstable_text: d.unstable_text ?? "",
-                    mt_ms: d.mt_ms ?? 0,
-                    mt_engine: d.mt_engine,
+                    slide_context: {
+                      ...prev.slide_context,
+                      active_slide_index: idx,
+                      active_slide_title: title,
+                    },
                   }
                 : prev
             );
+          } else if (msg.type === "partial") {
+            const d = msg.data;
+            const prev = partialRef.current;
+            const same = Boolean(prev && prev.id === d.id && prev.target_lang === d.target_lang);
+            if (
+              !same &&
+              prev &&
+              prev.id !== d.id &&
+              (prev.translated_text || prev.stable_text || prev.unstable_text)
+            ) {
+              setInflightPartial(prev);
+            }
+            const nextPartial: PartialEvent = {
+              id: d.id,
+              speaker: d.speaker,
+              source_text: d.source_text,
+              translated_text: same && prev ? prev.translated_text : "",
+              stable_text: same && prev ? prev.stable_text : "",
+              unstable_text: same && prev ? prev.unstable_text : "",
+              source_lang: d.source_lang || "vie_Latn",
+              target_lang: d.target_lang,
+              asr_ms: d.asr_ms ?? 0,
+              mt_ms: same && prev ? prev.mt_ms : 0,
+            };
+            partialRef.current = nextPartial;
+            setPartial(nextPartial);
+          } else if (msg.type === "partial_mt") {
+            const d = msg.data;
+            setInflightPartial((cur) => (cur && cur.id !== d.id ? null : cur));
+            const prev = partialRef.current;
+            if (prev && prev.id === d.id) {
+              const updated: PartialEvent = {
+                ...prev,
+                translated_text: d.translated_text,
+                stable_text: d.stable_text ?? "",
+                unstable_text: d.unstable_text ?? "",
+                mt_ms: d.mt_ms ?? 0,
+                mt_engine: d.mt_engine,
+              };
+              partialRef.current = updated;
+              setPartial(updated);
+            }
           } else if (msg.type === "final") {
             const entry: TranscriptEntry = msg.data;
-            setPartial((prev) => (prev && prev.id === entry.id ? null : prev));
+            if (partialRef.current && partialRef.current.id === entry.id) {
+              partialRef.current = null;
+              setPartial(null);
+            }
             setInflightPartial((prev) => (prev && prev.id === entry.id ? null : prev));
             setEntries((prev) => {
               if (prev.some((x) => x.id === entry.id)) return prev;
@@ -299,6 +330,7 @@ export default function OverlayWindow() {
           } else if (msg.type === "history" && Array.isArray(msg.data)) {
             setEntries(msg.data.slice(-200));
             if (msg.data.length === 0) {
+              partialRef.current = null;
               setPartial(null);
               setInflightPartial(null);
             }
@@ -309,6 +341,10 @@ export default function OverlayWindow() {
       };
 
       ws.onclose = () => {
+        setConnected(false);
+        partialRef.current = null;
+        setPartial(null);
+        setInflightPartial(null);
         if (!closed) {
           timer = window.setTimeout(connect, 1200);
         }
@@ -326,7 +362,7 @@ export default function OverlayWindow() {
       wsRef.current?.close();
       document.body.classList.remove("overlay-body");
     };
-  }, []);
+  }, [fetchAudienceInfo]);
 
   // Silky-smooth eased auto-scroll (prevents harsh instant jumps on conference LED screens)
   useEffect(() => {
@@ -463,14 +499,22 @@ export default function OverlayWindow() {
   const srcLabel = status?.source_lang_meta?.name_vi || "Tiếng Việt";
   const tgtLabel = status?.target_lang_meta?.name_vi || status?.config?.target_lang || "Tiếng Anh";
 
-  const toggleDisplayFreeze = () => {
-    const next = !displayFrozen;
+  const toggleDisplayFreeze = async () => {
+    const prev = displayFrozen;
+    const next = !prev;
     setDisplayFrozen(next);
-    fetch(`${ENGINE_HTTP}/api/display/freeze`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ frozen: next }),
-    }).catch(() => {});
+    try {
+      const res = await fetch(`${ENGINE_HTTP}/api/display/freeze`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ frozen: next }),
+      });
+      if (!res.ok) {
+        setDisplayFrozen(prev);
+      }
+    } catch {
+      setDisplayFrozen(prev);
+    }
   };
 
   const cardBg =
@@ -527,9 +571,9 @@ export default function OverlayWindow() {
               <span className="overlay-modal-sub" data-tauri-drag-region>
                 Phụ đề nổi
               </span>
-              <span className={`pill overlay-status-pill ${status?.listening ? "live" : "ok"}`}>
-                <span className={`dot ${status?.listening ? "pulse" : ""}`} />
-                {status?.listening ? "Đang phát" : "Sẵn sàng"}
+              <span className={`pill overlay-status-pill ${!connected ? "warn" : status?.listening ? "live" : "ok"}`}>
+                <span className={`dot ${connected && status?.listening ? "pulse" : ""}`} />
+                {!connected ? "Đang kết nối..." : status?.listening ? "Đang phát" : "Sẵn sàng"}
               </span>
             </div>
 
@@ -649,7 +693,13 @@ export default function OverlayWindow() {
               <button
                 className={`btn sm ${showCornerQr ? "info-active" : "overlay-ctrl-btn"}`}
                 title="Hiện/ẩn mã QR nhỏ góc màn LED cho đại biểu quét xem trên điện thoại"
-                onClick={() => setShowCornerQr((v) => !v)}
+                onClick={() => {
+                  const next = !showCornerQr;
+                  setShowCornerQr(next);
+                  if (next && !audienceInfo?.qr_svg) {
+                    fetchAudienceInfo();
+                  }
+                }}
               >
                 <QrCode size={12.5} /> QR góc
               </button>
@@ -657,7 +707,7 @@ export default function OverlayWindow() {
               <button
                 className={`btn sm ${displayFrozen ? "active" : "overlay-ctrl-btn"}`}
                 title={displayFrozen ? "Đang tạm ẩn màn LED & QR — bấm để phát lại" : "Tạm ẩn màn LED & QR sang màn chờ DAU (khi nghỉ giải lao / sự cố mic)"}
-                onClick={toggleDisplayFreeze}
+                onClick={() => void toggleDisplayFreeze()}
               >
                 {displayFrozen ? <Eye size={12.5} /> : <EyeOff size={12.5} />}
                 {displayFrozen ? "Phát lại LED" : "Tạm ẩn"}
@@ -688,7 +738,9 @@ export default function OverlayWindow() {
                 title="Xóa chữ trên màn hình phụ đề"
                 onClick={() => {
                   setEntries([]);
+                  partialRef.current = null;
                   setPartial(null);
+                  setInflightPartial(null);
                 }}
               >
                 <Trash2 size={13} />
@@ -768,15 +820,21 @@ export default function OverlayWindow() {
               </div>
 
               {/* Fixed Bottom Live Source Bar — proves mic pickup live WITHOUT ever jittering translations above */}
-              <div className={`overlay-led-livebar ${partial?.source_text || status?.listening ? "active" : ""}`}>
-                <span className={`overlay-led-dot ${status?.listening ? "live" : ""}`} aria-hidden="true" />
+              <div className={`overlay-led-livebar ${connected && (partial?.source_text || status?.listening) ? "active" : ""}`}>
+                <span className={`overlay-led-dot ${connected && status?.listening ? "live" : ""}`} aria-hidden="true" />
                 <span className="overlay-led-live-label">
-                  {partial?.source_text ? "Đang nghe:" : status?.listening ? "Đang lắng nghe diễn giả..." : "Sẵn sàng hội trường"}
+                  {!connected
+                    ? "Đang kết nối lại dịch vụ AI..."
+                    : partial?.source_text
+                    ? "Đang nghe:"
+                    : status?.listening
+                    ? "Đang lắng nghe diễn giả..."
+                    : "Sẵn sàng hội trường"}
                 </span>
-                {partial?.source_text && (
+                {connected && partial?.source_text && (
                   <span className="overlay-led-live-src">{partial.source_text}</span>
                 )}
-                {status?.slide_context?.active_slide_index ? (
+                {status?.slide_context?.enabled && status?.slide_context?.active_slide_index ? (
                   <span className="overlay-led-slide-tag">
                     Slide #{status.slide_context.active_slide_index}
                   </span>
@@ -1049,11 +1107,13 @@ export default function OverlayWindow() {
               DAU Voice <span className="brand-pro-tag">PRO</span>
             </div>
             <div className="overlay-freeze-msg">{freezeMessage}</div>
-            {!stageMode && (
-              <button className="btn primary sm" onClick={toggleDisplayFreeze} style={{ marginTop: 8 }}>
-                <Eye size={13.5} /> Tiếp tục phát lên màn LED
-              </button>
-            )}
+            <button
+              className="btn primary sm overlay-unfreeze-btn"
+              onClick={() => void toggleDisplayFreeze()}
+              style={{ marginTop: 10 }}
+            >
+              <Eye size={13.5} /> Tiếp tục phát lên màn LED
+            </button>
           </div>
         )}
       </div>

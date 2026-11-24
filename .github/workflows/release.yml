@@ -14,6 +14,61 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Preflight — verify version parity, tag match & release immutability
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          pkg_ver = json.loads(Path("package.json").read_text(encoding="utf-8"))["version"]
+          tauri_ver = json.loads(Path("src-tauri/tauri.conf.json").read_text(encoding="utf-8"))["version"]
+          cargo_ver = tomllib.loads(Path("src-tauri/Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+          cargo_lock = tomllib.loads(Path("src-tauri/Cargo.lock").read_text(encoding="utf-8"))
+          lock_pkgs = [p["version"] for p in cargo_lock.get("package", []) if p.get("name") == "voicerecore"]
+          if len(lock_pkgs) != 1:
+              raise SystemExit(f"FATAL: Expected exactly 1 'voicerecore' entry in src-tauri/Cargo.lock, found {lock_pkgs}")
+          lock_ver = lock_pkgs[0]
+
+          versions = {
+              "package.json": pkg_ver,
+              "src-tauri/tauri.conf.json": tauri_ver,
+              "src-tauri/Cargo.toml": cargo_ver,
+              "src-tauri/Cargo.lock (voicerecore)": lock_ver,
+          }
+          if len(set(versions.values())) != 1:
+              details = "\n".join(f"  - {k}: {v}" for k, v in versions.items())
+              raise SystemExit(f"FATAL: Version mismatch across manifests:\n{details}")
+
+          ref_type = os.environ.get("GITHUB_REF_TYPE", "")
+          ref_name = os.environ.get("GITHUB_REF_NAME", "")
+          expected_tag = f"v{tauri_ver}"
+          if ref_type == "tag" and ref_name != expected_tag:
+              raise SystemExit(
+                  f"FATAL: Git tag '{ref_name}' does not match manifest version '{expected_tag}'."
+              )
+
+          proc = subprocess.run(
+              ["gh", "release", "view", expected_tag, "--json", "isDraft,url"],
+              capture_output=True,
+              text=True,
+          )
+          if proc.returncode == 0:
+              rel = json.loads(proc.stdout)
+              if not rel.get("isDraft", False):
+                  raise SystemExit(
+                      f"FATAL: Release {expected_tag} is already published ({rel.get('url', '')}). "
+                      "Refusing to overwrite a published release! Bump version before tagging."
+                  )
+              print(f"Preflight OK: reusing existing Draft release {expected_tag}")
+          else:
+              print(f"Preflight OK: {expected_tag} verified across all 4 manifests and ready to create.")
+          PY
+
       - name: Ensure single Draft Release exists before parallel matrix builds
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -85,7 +140,7 @@ jobs:
         shell: pwsh
         run: |
           cd engine
-          uv sync
+          uv sync --frozen
           uv pip install --python .venv/Scripts/python.exe pyinstaller pyaudiowpatch
           uv run --no-sync python ../scripts/fetch_llama_server.py
           uv run --no-sync python build_sidecar.py
@@ -95,8 +150,68 @@ jobs:
         shell: pwsh
         run: |
           @'
-          import json, os, subprocess, tempfile, time, urllib.request
+          import io, json, os, subprocess, tempfile, time, urllib.request, zipfile
           from pathlib import Path
+          from pypdf import PdfWriter
+          from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+          def build_smoke_pdf() -> bytes:
+              writer = PdfWriter()
+              page = writer.add_blank_page(width=612, height=792)
+              font = DictionaryObject({
+                  NameObject("/Type"): NameObject("/Font"),
+                  NameObject("/Subtype"): NameObject("/Type1"),
+                  NameObject("/BaseFont"): NameObject("/Helvetica"),
+              })
+              page[NameObject("/Resources")] = DictionaryObject({
+                  NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)})
+              })
+              stream = DecodedStreamObject()
+              stream.set_data(b"BT /F1 18 Tf 72 720 Td (DAU Voice Pro Smoke Test PDF Slide) Tj ET")
+              page[NameObject("/Contents")] = writer._add_object(stream)
+              buf = io.BytesIO()
+              writer.write(buf)
+              return buf.getvalue()
+
+          def build_smoke_pptx() -> bytes:
+              buf = io.BytesIO()
+              with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                  zf.writestr(
+                      "ppt/slides/slide1.xml",
+                      '<?xml version="1.0" encoding="UTF-8"?>'
+                      '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+                      'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+                      '<p:cSld><p:spTree><p:sp><p:txBody>'
+                      '<a:p><a:r><a:t>Da Nang Architecture University</a:t></a:r></a:p>'
+                      '<a:p><a:r><a:t>Sustainable Urban Design Keynote</a:t></a:r></a:p>'
+                      '</p:txBody></p:sp></p:spTree></p:cSld></p:sld>',
+                  )
+              return buf.getvalue()
+
+          def request_json(url: str, method: str = "GET", body: dict | None = None) -> dict:
+              data = json.dumps(body).encode("utf-8") if body is not None else None
+              headers = {"Content-Type": "application/json"} if body is not None else {}
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              with urllib.request.urlopen(req, timeout=15.0) as r:
+                  assert r.status == 200, f"{method} {url} -> HTTP {r.status}"
+                  return json.loads(r.read().decode("utf-8"))
+
+          def upload_multipart(url: str, filename: str, payload: bytes, content_type: str) -> dict:
+              boundary = "----DAUVoiceSmokeBoundary7e9a"
+              body = (
+                  f"--{boundary}\r\n"
+                  f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                  f"Content-Type: {content_type}\r\n\r\n"
+              ).encode("utf-8") + payload + f"\r\n--{boundary}--\r\n".encode("utf-8")
+              req = urllib.request.Request(
+                  url,
+                  data=body,
+                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=15.0) as r:
+                  assert r.status == 200, f"Upload {filename} -> HTTP {r.status}"
+                  return json.loads(r.read().decode("utf-8"))
 
           bin_path = Path("src-tauri/resources/engine-bin/voicerecore-engine/voicerecore-engine.exe").resolve()
           assert bin_path.exists(), f"Missing sidecar: {bin_path}"
@@ -125,12 +240,13 @@ jobs:
                   env=env,
               )
               try:
+                  base = "http://127.0.0.1:18799"
                   health = None
                   deadline = time.time() + 45.0
                   while time.time() < deadline:
                       assert proc.poll() is None, f"Windows sidecar exited early: rc={proc.returncode}"
                       try:
-                          with urllib.request.urlopen("http://127.0.0.1:18799/api/health", timeout=2.0) as r:
+                          with urllib.request.urlopen(f"{base}/api/health", timeout=2.0) as r:
                               data = json.loads(r.read().decode("utf-8"))
                               if data.get("ok") and data.get("asr_loaded"):
                                   health = data
@@ -142,8 +258,30 @@ jobs:
                   assert not health.get("boot_error"), f"boot_error: {health.get('boot_error')}"
                   assert health.get("system_audio_ready"), "Expected Windows WASAPI loopback ready"
                   assert health.get("llama_server_ready"), "Expected bundled portable llama_server_ready=True"
-                  print("Windows sidecar smoke OK:", health["platform"], "asr_loaded=", health["asr_loaded"], "llama_ready=", health["llama_server_ready"])
-                  req = urllib.request.Request("http://127.0.0.1:18799/api/shutdown", method="POST")
+
+                  # Verify v1.1.0+ Slide RAG, frozen pypdf/python-multipart uploads, & Display Freeze
+                  ctx0 = request_json(f"{base}/api/context")
+                  assert "pages" in ctx0 and "terms" in ctx0, f"Unexpected /api/context: {ctx0}"
+                  dau = request_json(f"{base}/api/context/text", "POST", {"apply_dau_preset": True})
+                  assert dau.get("ok") and len(dau.get("terms", [])) >= 15, f"DAU preset failed: {dau}"
+                  pdf_res = upload_multipart(f"{base}/api/context/upload", "smoke.pdf", build_smoke_pdf(), "application/pdf")
+                  assert pdf_res.get("ok") and pdf_res.get("slide_count", 0) >= 1, f"PDF upload failed: {pdf_res}"
+                  pptx_res = upload_multipart(
+                      f"{base}/api/context/upload",
+                      "smoke.pptx",
+                      build_smoke_pptx(),
+                      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                  )
+                  assert pptx_res.get("ok") and pptx_res.get("slide_count", 0) >= 1, f"PPTX upload failed: {pptx_res}"
+                  frz_on = request_json(f"{base}/api/display/freeze", "POST", {"frozen": True, "message": "Smoke pause"})
+                  assert frz_on.get("ok") and frz_on.get("frozen") is True, f"Freeze ON failed: {frz_on}"
+                  frz_off = request_json(f"{base}/api/display/freeze", "POST", {"frozen": False})
+                  assert frz_off.get("ok") and frz_off.get("frozen") is False, f"Freeze OFF failed: {frz_off}"
+                  clr = request_json(f"{base}/api/context", "DELETE")
+                  assert clr.get("ok") and clr.get("slide_count", -1) == 0, f"Context clear failed: {clr}"
+
+                  print("Windows sidecar smoke OK:", health["platform"], "asr_loaded=", health["asr_loaded"], "llama_ready=", health["llama_server_ready"], "v1.1_endpoints=OK")
+                  req = urllib.request.Request(f"{base}/api/shutdown", method="POST")
                   with urllib.request.urlopen(req, timeout=5.0) as r:
                       assert r.status == 200
                   proc.wait(timeout=10.0)
@@ -157,7 +295,7 @@ jobs:
         if: matrix.platform == 'macos-latest'
         run: |
           cd engine
-          uv sync
+          uv sync --frozen
           uv pip install --python .venv/bin/python pyinstaller
           uv run --no-sync python ../scripts/fetch_llama_server.py
           uv run --no-sync python build_sidecar.py
@@ -166,8 +304,68 @@ jobs:
         if: matrix.platform == 'macos-latest'
         run: |
           uv run --project engine --no-sync python - <<'PY'
-          import json, os, subprocess, tempfile, time, urllib.request
+          import io, json, os, subprocess, tempfile, time, urllib.request, zipfile
           from pathlib import Path
+          from pypdf import PdfWriter
+          from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+          def build_smoke_pdf() -> bytes:
+              writer = PdfWriter()
+              page = writer.add_blank_page(width=612, height=792)
+              font = DictionaryObject({
+                  NameObject("/Type"): NameObject("/Font"),
+                  NameObject("/Subtype"): NameObject("/Type1"),
+                  NameObject("/BaseFont"): NameObject("/Helvetica"),
+              })
+              page[NameObject("/Resources")] = DictionaryObject({
+                  NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)})
+              })
+              stream = DecodedStreamObject()
+              stream.set_data(b"BT /F1 18 Tf 72 720 Td (DAU Voice Pro Smoke Test PDF Slide) Tj ET")
+              page[NameObject("/Contents")] = writer._add_object(stream)
+              buf = io.BytesIO()
+              writer.write(buf)
+              return buf.getvalue()
+
+          def build_smoke_pptx() -> bytes:
+              buf = io.BytesIO()
+              with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                  zf.writestr(
+                      "ppt/slides/slide1.xml",
+                      '<?xml version="1.0" encoding="UTF-8"?>'
+                      '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+                      'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+                      '<p:cSld><p:spTree><p:sp><p:txBody>'
+                      '<a:p><a:r><a:t>Da Nang Architecture University</a:t></a:r></a:p>'
+                      '<a:p><a:r><a:t>Sustainable Urban Design Keynote</a:t></a:r></a:p>'
+                      '</p:txBody></p:sp></p:spTree></p:cSld></p:sld>',
+                  )
+              return buf.getvalue()
+
+          def request_json(url: str, method: str = "GET", body: dict | None = None) -> dict:
+              data = json.dumps(body).encode("utf-8") if body is not None else None
+              headers = {"Content-Type": "application/json"} if body is not None else {}
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              with urllib.request.urlopen(req, timeout=15.0) as r:
+                  assert r.status == 200, f"{method} {url} -> HTTP {r.status}"
+                  return json.loads(r.read().decode("utf-8"))
+
+          def upload_multipart(url: str, filename: str, payload: bytes, content_type: str) -> dict:
+              boundary = "----DAUVoiceSmokeBoundary7e9a"
+              body = (
+                  f"--{boundary}\r\n"
+                  f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                  f"Content-Type: {content_type}\r\n\r\n"
+              ).encode("utf-8") + payload + f"\r\n--{boundary}--\r\n".encode("utf-8")
+              req = urllib.request.Request(
+                  url,
+                  data=body,
+                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=15.0) as r:
+                  assert r.status == 200, f"Upload {filename} -> HTTP {r.status}"
+                  return json.loads(r.read().decode("utf-8"))
 
           bin_path = Path("src-tauri/resources/engine-bin/voicerecore-engine/voicerecore-engine").resolve()
           assert bin_path.exists(), f"Missing sidecar: {bin_path}"
@@ -187,12 +385,13 @@ jobs:
                   env=env,
               )
               try:
+                  base = "http://127.0.0.1:18799"
                   health = None
                   deadline = time.time() + 45.0
                   while time.time() < deadline:
                       assert proc.poll() is None, f"macOS sidecar exited early: rc={proc.returncode}"
                       try:
-                          with urllib.request.urlopen("http://127.0.0.1:18799/api/health", timeout=2.0) as r:
+                          with urllib.request.urlopen(f"{base}/api/health", timeout=2.0) as r:
                               data = json.loads(r.read().decode("utf-8"))
                               if data.get("ok") and data.get("asr_loaded"):
                                   health = data
@@ -205,8 +404,30 @@ jobs:
                   assert health.get("mac_helper_ready"), "Expected mac_helper_ready=True"
                   assert health.get("system_audio_ready"), "Expected system_audio_ready=True"
                   assert health.get("llama_server_ready"), "Expected bundled portable llama_server_ready=True"
-                  print("macOS sidecar smoke OK:", health["platform"], "asr_loaded=", health["asr_loaded"], "llama_ready=", health["llama_server_ready"])
-                  req = urllib.request.Request("http://127.0.0.1:18799/api/shutdown", method="POST")
+
+                  # Verify v1.1.0+ Slide RAG, frozen pypdf/python-multipart uploads, & Display Freeze
+                  ctx0 = request_json(f"{base}/api/context")
+                  assert "pages" in ctx0 and "terms" in ctx0, f"Unexpected /api/context: {ctx0}"
+                  dau = request_json(f"{base}/api/context/text", "POST", {"apply_dau_preset": True})
+                  assert dau.get("ok") and len(dau.get("terms", [])) >= 15, f"DAU preset failed: {dau}"
+                  pdf_res = upload_multipart(f"{base}/api/context/upload", "smoke.pdf", build_smoke_pdf(), "application/pdf")
+                  assert pdf_res.get("ok") and pdf_res.get("slide_count", 0) >= 1, f"PDF upload failed: {pdf_res}"
+                  pptx_res = upload_multipart(
+                      f"{base}/api/context/upload",
+                      "smoke.pptx",
+                      build_smoke_pptx(),
+                      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                  )
+                  assert pptx_res.get("ok") and pptx_res.get("slide_count", 0) >= 1, f"PPTX upload failed: {pptx_res}"
+                  frz_on = request_json(f"{base}/api/display/freeze", "POST", {"frozen": True, "message": "Smoke pause"})
+                  assert frz_on.get("ok") and frz_on.get("frozen") is True, f"Freeze ON failed: {frz_on}"
+                  frz_off = request_json(f"{base}/api/display/freeze", "POST", {"frozen": False})
+                  assert frz_off.get("ok") and frz_off.get("frozen") is False, f"Freeze OFF failed: {frz_off}"
+                  clr = request_json(f"{base}/api/context", "DELETE")
+                  assert clr.get("ok") and clr.get("slide_count", -1) == 0, f"Context clear failed: {clr}"
+
+                  print("macOS sidecar smoke OK:", health["platform"], "asr_loaded=", health["asr_loaded"], "llama_ready=", health["llama_server_ready"], "v1.1_endpoints=OK")
+                  req = urllib.request.Request(f"{base}/api/shutdown", method="POST")
                   with urllib.request.urlopen(req, timeout=5.0) as r:
                       assert r.status == 200
                   proc.wait(timeout=10.0)
@@ -217,7 +438,7 @@ jobs:
           PY
 
       - name: Install frontend dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Configure optional Apple Developer signing (only when secret is set)
         if: matrix.platform == 'macos-latest'

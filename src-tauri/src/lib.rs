@@ -221,6 +221,38 @@ fn wait_child_exit(child: &mut Child, timeout: Duration) -> bool {
     matches!(child.try_wait(), Ok(Some(_)))
 }
 
+#[cfg(not(target_os = "windows"))]
+fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
+    let mut visited = Vec::new();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back((root_pid, 0u8));
+    while let Some((pid, depth)) = queue.pop_front() {
+        if depth >= 8 {
+            continue;
+        }
+        let Ok(out) = Command::new("pgrep")
+            .args(["-P", &pid.to_string()])
+            .stderr(Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            if let Ok(child_pid) = line.trim().parse::<u32>() {
+                if child_pid != root_pid && !visited.contains(&child_pid) {
+                    visited.push(child_pid);
+                    queue.push_back((child_pid, depth + 1));
+                }
+            }
+        }
+    }
+    visited
+}
+
 fn force_kill_tree(child: &mut Child) {
     let pid = child.id();
 
@@ -237,13 +269,49 @@ fn force_kill_tree(child: &mut Child) {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
+        let pid_str = pid.to_string();
+        let descendants = collect_descendant_pids(pid);
+
+        // Terminate child processes (e.g., llama-server, voicerecore-macos-helper, python)
+        // alongside parent so no grandchild is left orphaned.
+        let _ = Command::new("pkill")
+            .args(["-TERM", "-P", &pid_str])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        if wait_child_exit(child, Duration::from_millis(400)) {
+        for &dpid in descendants.iter().rev() {
+            let _ = Command::new("kill")
+                .args(["-TERM", &dpid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid_str])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        if wait_child_exit(child, Duration::from_millis(500)) {
+            let _ = Command::new("pkill")
+                .args(["-KILL", "-P", &pid_str])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
             return;
+        }
+
+        let _ = Command::new("pkill")
+            .args(["-KILL", "-P", &pid_str])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        for &dpid in descendants.iter().rev() {
+            let _ = Command::new("kill")
+                .args(["-KILL", &dpid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
         }
     }
 
@@ -272,15 +340,75 @@ fn stop_engine_internal(state: &EngineProcess) {
     }
 }
 
+const ERR_OVERLAY_NOT_FOUND: &str = "Không tìm thấy cửa sổ phụ đề nổi";
+
+fn bounds_visible_on_monitors(
+    pos: tauri::PhysicalPosition<i32>,
+    size: tauri::PhysicalSize<u32>,
+    monitors: &[tauri::Monitor],
+) -> bool {
+    let left = pos.x as i64;
+    let top = pos.y as i64;
+    let right = left + size.width as i64;
+    let bottom = top + size.height as i64;
+    monitors.iter().any(|m| {
+        let mp = m.position();
+        let ms = m.size();
+        let ml = mp.x as i64;
+        let mt = mp.y as i64;
+        let mr = ml + ms.width as i64;
+        let mb = mt + ms.height as i64;
+        let overlap_w = right.min(mr) - left.max(ml);
+        let overlap_h = bottom.min(mb) - top.max(mt);
+        overlap_w >= 120 && overlap_h >= 80
+    })
+}
+
 #[tauri::command]
 fn get_engine_url() -> String {
     format!("http://127.0.0.1:{}", ENGINE_PORT)
 }
 
 #[tauri::command]
-fn stop_local_engine(state: tauri::State<'_, EngineProcess>) -> Result<(), String> {
-    stop_engine_internal(&state);
+async fn stop_local_engine(app: tauri::AppHandle) -> Result<(), String> {
+    let app_for_stop = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(state) = app_for_stop.try_state::<EngineProcess>() {
+            stop_engine_internal(&state);
+        }
+    })
+    .await
+    .map_err(|e| format!("Không thể dừng dịch vụ nền: {e}"))?;
     Ok(())
+}
+
+#[tauri::command]
+async fn start_local_engine(app: tauri::AppHandle) -> Result<bool, String> {
+    let app_for_start = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if is_engine_running() {
+            return true;
+        }
+        let res_dir = app_for_start.path().resource_dir().ok();
+        if let Some(state) = app_for_start.try_state::<EngineProcess>() {
+            if let Ok(mut guard) = state.0.lock() {
+                if let Some(prev) = guard.as_mut() {
+                    if matches!(prev.try_wait(), Ok(None)) {
+                        // Already spawned and still booting
+                        return true;
+                    }
+                    *guard = None;
+                }
+                let child = spawn_local_engine(res_dir.as_deref());
+                let started = child.is_some() || is_engine_running();
+                *guard = child;
+                return started;
+            }
+        }
+        spawn_local_engine(res_dir.as_deref()).is_some() || is_engine_running()
+    })
+    .await
+    .map_err(|e| format!("Không thể khởi động lại dịch vụ nền: {e}"))
 }
 
 #[tauri::command]
@@ -313,12 +441,23 @@ async fn confirm_exit_app(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn hide_overlay(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("overlay") {
+        let _ = win.set_ignore_cursor_events(false);
+        let _ = win.hide();
+        let _ = app.emit("overlay-visibility", false);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn toggle_overlay(app: tauri::AppHandle) -> Result<bool, String> {
     let win = app
         .get_webview_window("overlay")
-        .ok_or_else(|| "Overlay window not found".to_string())?;
+        .ok_or_else(|| ERR_OVERLAY_NOT_FOUND.to_string())?;
     let visible = win.is_visible().map_err(|e| e.to_string())?;
     if visible {
+        let _ = win.set_ignore_cursor_events(false);
         win.hide().map_err(|e| e.to_string())?;
         let _ = app.emit("overlay-visibility", false);
         Ok(false)
@@ -333,7 +472,7 @@ fn toggle_overlay(app: tauri::AppHandle) -> Result<bool, String> {
 fn set_overlay_clickthrough(app: tauri::AppHandle, ignore: bool) -> Result<(), String> {
     let win = app
         .get_webview_window("overlay")
-        .ok_or_else(|| "Overlay window not found".to_string())?;
+        .ok_or_else(|| ERR_OVERLAY_NOT_FOUND.to_string())?;
     win.set_ignore_cursor_events(ignore)
         .map_err(|e| e.to_string())
 }
@@ -342,7 +481,7 @@ fn set_overlay_clickthrough(app: tauri::AppHandle, ignore: bool) -> Result<(), S
 fn set_overlay_always_on_top(app: tauri::AppHandle, on_top: bool) -> Result<bool, String> {
     let win = app
         .get_webview_window("overlay")
-        .ok_or_else(|| "Overlay window not found".to_string())?;
+        .ok_or_else(|| ERR_OVERLAY_NOT_FOUND.to_string())?;
     win.set_always_on_top(on_top).map_err(|e| e.to_string())?;
     Ok(on_top)
 }
@@ -354,32 +493,72 @@ fn toggle_overlay_fill_monitor(
 ) -> Result<bool, String> {
     let win = app
         .get_webview_window("overlay")
-        .ok_or_else(|| "Overlay window not found".to_string())?;
+        .ok_or_else(|| ERR_OVERLAY_NOT_FOUND.to_string())?;
 
     let mut guard = saved.0.lock().map_err(|e| e.to_string())?;
-    if let Some((pos, size)) = guard.take() {
-        win.set_position(tauri::Position::Physical(pos))
+    if let Some((pos, size)) = *guard {
+        if matches!(win.is_maximized(), Ok(true)) {
+            let _ = win.unmaximize();
+        }
+        let monitors = win.available_monitors().unwrap_or_default();
+        let can_restore_directly =
+            monitors.is_empty() || bounds_visible_on_monitors(pos, size, &monitors);
+        if can_restore_directly {
+            win.set_position(tauri::Position::Physical(pos))
+                .map_err(|e| e.to_string())?;
+            win.set_size(tauri::Size::Physical(size))
+                .map_err(|e| e.to_string())?;
+        } else if let Some(mon) = win
+            .current_monitor()
+            .ok()
+            .flatten()
+            .or_else(|| monitors.into_iter().next())
+        {
+            let mpos = *mon.position();
+            let msize = *mon.size();
+            let w = size.width.min(msize.width).max(560.min(msize.width));
+            let h = size.height.min(msize.height).max(260.min(msize.height));
+            let cx = mpos.x + ((msize.width.saturating_sub(w)) / 2) as i32;
+            let cy = mpos.y + ((msize.height.saturating_sub(h)) / 2) as i32;
+            win.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(w, h)))
+                .map_err(|e| e.to_string())?;
+            win.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
+                cx, cy,
+            )))
             .map_err(|e| e.to_string())?;
-        win.set_size(tauri::Size::Physical(size))
-            .map_err(|e| e.to_string())?;
+        } else {
+            win.set_size(tauri::Size::Physical(size))
+                .map_err(|e| e.to_string())?;
+            win.center().map_err(|e| e.to_string())?;
+        }
+        *guard = None;
         return Ok(false);
     }
 
-    if let (Ok(cur_pos), Ok(cur_size)) = (win.outer_position(), win.outer_size()) {
-        *guard = Some((cur_pos, cur_size));
-    }
+    let prev_bounds = match (win.outer_position(), win.outer_size()) {
+        (Ok(cur_pos), Ok(cur_size)) => Some((cur_pos, cur_size)),
+        _ => None,
+    };
 
     if let Ok(Some(mon)) = win.current_monitor() {
-        let mpos = *mon.position();
-        let msize = *mon.size();
+        #[cfg(target_os = "macos")]
+        let (mpos, msize) = {
+            let area = mon.work_area();
+            (area.position, area.size)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (mpos, msize) = (*mon.position(), *mon.size());
+
         win.set_position(tauri::Position::Physical(mpos))
             .map_err(|e| e.to_string())?;
         win.set_size(tauri::Size::Physical(msize))
             .map_err(|e| e.to_string())?;
+        *guard = prev_bounds;
         return Ok(true);
     }
 
     win.maximize().map_err(|e| e.to_string())?;
+    *guard = prev_bounds;
     Ok(true)
 }
 
@@ -415,6 +594,15 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() == "overlay" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.set_ignore_cursor_events(false);
+                    let _ = window.hide();
+                    let _ = window.app_handle().emit("overlay-visibility", false);
+                }
+                return;
+            }
             if window.label() == "main" {
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     let app_handle = window.app_handle();
@@ -446,9 +634,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_engine_url,
             stop_local_engine,
+            start_local_engine,
             mark_frontend_ready,
             set_allow_exit,
             confirm_exit_app,
+            hide_overlay,
             toggle_overlay,
             set_overlay_clickthrough,
             set_overlay_always_on_top,
