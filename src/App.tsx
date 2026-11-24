@@ -5877,20 +5877,21 @@ export default function App() {
               <div className="modal-head">
                 <div className="row" style={{ gap: 10 }}>
                   <div className="exit-warn-icon" aria-hidden="true">
-                    <AlertTriangle size={18} />
+                    {isLive || fileBusy || anyModelDownloading ? (
+                      <AlertTriangle size={17} />
+                    ) : (
+                      <LogOut size={16} />
+                    )}
                   </div>
-                  <div>
-                    <div id="exit-confirm-title" className="modal-title">
-                      Bạn có chắc muốn thoát chương trình?
-                    </div>
-                    <div className="modal-sub">DAU Voice Pro v{APP_VERSION}</div>
+                  <div id="exit-confirm-title" className="modal-title">
+                    Thoát DAU Voice Pro?
                   </div>
                 </div>
                 <button
                   className="btn sm icon-only"
                   disabled={exitBusy}
                   onClick={() => setExitConfirmOpen(false)}
-                  title="Ở lại"
+                  title="Đóng"
                 >
                   <X size={14} />
                 </button>
@@ -5904,50 +5905,45 @@ export default function App() {
                       {isLive
                         ? "Đang phiên dịch trực tiếp"
                         : fileBusy
-                        ? "Đang dịch file ghi âm / video"
-                        : "Đang tải mô hình offline"}
+                        ? "Đang dịch file"
+                        : "Đang tải mô hình"}
                     </span>
                   </div>
                 )}
 
                 <p className="exit-confirm-desc">
                   {isLive
-                    ? "Phiên dịch trực tiếp đang hoạt động. Nếu thoát ngay bây giờ, quá trình thu âm, cửa sổ Phụ đề nổi và kết nối QR khán giả sẽ dừng lại. Biên bản hội thoại đã được tự động lưu an toàn."
+                    ? "Phiên dịch trực tiếp, màn LED và kết nối QR sẽ dừng lại."
                     : fileBusy || anyModelDownloading
-                    ? "Hiện đang có tác vụ xử lý chạy ngầm. Nếu đóng chương trình lúc này, tác vụ đang chạy sẽ bị dừng lại."
-                    : "Toàn bộ biên bản đã tự lưu, Từ điển họp, API Key và các mô hình offline trên máy vẫn sẽ được giữ nguyên cho lần mở tiếp theo."}
+                    ? "Tác vụ đang xử lý sẽ bị dừng nếu thoát lúc này."
+                    : "Dữ liệu phiên họp đã được lưu tự động."}
                 </p>
               </div>
 
-              <div className="modal-foot">
-                <span style={{ fontSize: 11.5, color: "var(--text-2)" }}>
-                  Nhấn <b>Esc</b> để hủy và tiếp tục sử dụng
-                </span>
-                <div className="row" style={{ gap: 8 }}>
-                  <button
-                    className="btn sm"
-                    disabled={exitBusy}
-                    autoFocus
-                    onClick={() => setExitConfirmOpen(false)}
-                  >
-                    Ở lại
-                  </button>
-                  <button
-                    className="btn primary sm"
-                    disabled={exitBusy}
-                    onClick={handleConfirmExitApp}
-                  >
-                    {exitBusy ? (
-                      <>
-                        <Loader2 size={13} className="spin" /> Đang thoát...
-                      </>
-                    ) : (
-                      <>
-                        <LogOut size={13} /> Thoát ứng dụng
-                      </>
-                    )}
-                  </button>
-                </div>
+              <div className="modal-foot exit-confirm-foot">
+                <button
+                  className="btn sm"
+                  disabled={exitBusy}
+                  autoFocus
+                  onClick={() => setExitConfirmOpen(false)}
+                >
+                  Hủy
+                </button>
+                <button
+                  className="btn primary sm"
+                  disabled={exitBusy}
+                  onClick={handleConfirmExitApp}
+                >
+                  {exitBusy ? (
+                    <>
+                      <Loader2 size={13} className="spin" /> Đang thoát...
+                    </>
+                  ) : (
+                    <>
+                      <LogOut size={13} /> Thoát
+                    </>
+                  )}
+                </button>
               </div>
             </div>
           </div>

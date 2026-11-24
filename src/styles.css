@@ -3720,7 +3720,12 @@ kbd {
 }
 
 .exit-confirm-card {
-  width: min(460px, 100%);
+  width: min(390px, 100%);
+}
+
+.exit-confirm-foot {
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .exit-warn-icon {
