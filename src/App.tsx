@@ -99,7 +99,7 @@ import {
   speakOfflineTTS,
 } from "./types";
 
-const APP_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "1.1.0";
+const APP_VERSION = typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "1.1.1";
 const GITHUB_REPO = "niitbeo/PolyVoice-Pro";
 const VU_BARS = 18;
 

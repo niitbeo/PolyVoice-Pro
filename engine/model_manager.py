@@ -731,7 +731,7 @@ class ModelManager:
             follow_redirects=True,
             verify=_ssl_verify_context(),
             timeout=timeout,
-            headers={"User-Agent": "PolyVoicePro/0.8.1"},
+            headers={"User-Agent": "PolyVoicePro/1.1.1"},
         )
 
     def _download_file_resumable(
