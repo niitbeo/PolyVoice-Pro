@@ -20,7 +20,8 @@
 [Công nghệ & Mô hình AI](#-công-nghệ--mô-hình-ai-sử-dụng) •
 [Hiệu năng thực đo](#-hiệu-năng-thực-đo) •
 [Cài đặt](#-tải-về--cài-đặt) •
-[Phát triển](#-chạy-chế-độ-phát-triển--phát-hành)
+[Phát triển](#-chạy-chế-độ-phát-triển--phát-hành) •
+[Changelog](CHANGELOG.md)
 
 <br />
 
@@ -48,9 +49,10 @@ Thay vì phụ thuộc vào các thư viện AI nặng nề (như PyTorch hàng 
   - **Đa ngôn ngữ (20 ngôn ngữ nói):** Tự động định tuyến sang `Whisper` / `SenseVoice` (Thái, Lào, Trung, Nhật, Hàn, Pháp, Đức, Nga...).
 - **Dịch máy 2 tầng (Việt ⇄ Anh & 202 Ngôn ngữ):** `VietAI EnViT5` chuyên biệt cho cặp Việt ⇄ Anh (`~134–212 ms`), `Meta NLLB-200 600M INT8` cho **202 ngôn ngữ**, và tùy chọn mở rộng `Hy-MT2-1.8B` (`llama.cpp` GGUF) cho máy cấu hình cao.
 
-### 2. Sân khấu LED Hội trường & Slide-Aware RAG 100% Offline *(Mới ở v1.1)*
-- **Chế độ Sân khấu LED (`led-stage`):** Hiển thị 3–4 câu chốt hoàn chỉnh đứng yên cỡ chữ lớn cho hàng ghế cuối (0% nhảy sửa chữ), kèm thanh nghe sống mờ ở đáy màn hình, **QR góc màn LED** không che chữ, **Sửa nhanh bản dịch trực tiếp lên LED & QR**, và nút **Tạm ẩn màn chờ DAU** tức thì khi nghỉ giải lao.
-- **Nạp Slide & Bối cảnh Hội nghị (`engine/slide_context.py`):** Kéo thả `.PPTX`, `.PDF`, `.DOCX` hoặc dán chương trình hội nghị trước giờ G — tự động rút tên riêng/thuật ngữ (gồm bộ chuẩn **DAU Preset**) vào **ASR Hotwords** và đối chiếu vị trí trang Slide theo thời gian thực (`<1ms`, 100% offline).
+### 2. Sân khấu LED Hội trường, Slide-Aware RAG & Bảo mật LAN *(Mới ở v1.1.1)*
+- **Chế độ Sân khấu LED (`led-stage`):** Hiển thị 3–4 câu chốt hoàn chỉnh đứng yên cỡ chữ lớn cho hàng ghế cuối (0% nhảy sửa chữ), kèm thanh nghe sống mờ ở đáy màn hình, **QR góc màn LED** không che chữ (hỗ trợ đủ cả 5 chế độ hiển thị), **Sửa nhanh bản dịch trực tiếp lên LED, điện thoại QR & OBS**, và nút **Tạm ẩn màn chờ DAU** tức thì khi nghỉ giải lao.
+- **Nạp Slide & Bối cảnh Hội nghị (`engine/slide_context.py`):** Kéo thả `.PPTX`, `.PDF` (`pypdf` pure-Python), `.DOCX`, `.TXT` hoặc dán chương trình hội nghị trước giờ G — tự động rút tên riêng/thuật ngữ (gồm bộ chuẩn **DAU Preset 22 thuật ngữ**) vào **ASR Hotwords** và đối chiếu vị trí trang Slide theo thời gian thực (`< 1 ms`, 100% offline, hỗ trợ nhảy Q&A).
+- **Bảo mật Wi-Fi Hội trường (`LoopbackGuardMiddleware`):** Điện thoại đại biểu quét mã QR qua mạng LAN chỉ truy cập được trang xem phụ đề (`/audience`, `/obs`, `/ws/audience`); toàn bộ API điều khiển & quản trị (`/api/*`, `/ws`) chỉ nhận lệnh từ máy chủ trình chiếu (`localhost`).
 
 ### 3. Kiểm định Chất lượng Dịch & Chính xác Ngữ nghĩa bằng Google AI
 - **2 điểm chạm trực tiếp trong Lịch sử:** Nút **`Đánh giá`** trên thanh công cụ để chấm toàn bộ phiên họp, và icon chiếc khiên (`ShieldCheck`) trên từng thẻ hội thoại để kiểm định tức thì riêng từng câu.
@@ -127,10 +129,10 @@ flowchart TB
     end
 
     subgraph Clients["5. Đa màn hình Hiển thị & Xuất bản"]
-        E1["Tauri 2 Desktop App (React 19 • Spotlight 2 tầng • Lịch sử • Đánh giá AI)"]
-        E2["Cửa sổ Phụ đề Nổi (50/50 • YouTube • Xuyên chuột • Fullscreen)"]
-        E3["Điện thoại Khán giả (/audience qua QR Wi-Fi LAN)"]
-        E4["OBS Studio Browser Source (/obs) & Biên bản (.TXT / .SRT)"]
+        E1["Tauri 2 Desktop App (React 19 • Spotlight 2 tầng • Slide RAG • Đánh giá AI)"]
+        E2["Cửa sổ Sân khấu LED & Phụ đề Nổi (LED • YouTube • 50/50 • QR góc • Tạm ẩn)"]
+        E3["Điện thoại Khán giả (/audience qua QR Wi-Fi LAN — chỉ đọc, bảo mật LAN)"]
+        E4["OBS Studio Browser Source (/obs — hỗ trợ Freeze/Sửa nhanh) & Biên bản (.TXT / .SRT)"]
     end
 
     Audio --> ASR --> MT --> Hub
@@ -163,7 +165,7 @@ flowchart TB
 | **ASR Tiếng Việt (Live)** | **Zipformer-30M** (`sherpa-onnx`) | ONNX Runtime INT8 | ~49 MB | Nhận dạng giọng Việt theo thời gian thực độ trễ cực thấp, hỗ trợ **BPE Hotwords** từ Từ điển Họp. |
 | **Tinh chỉnh Việt Pass-2** | **VietASR** (`viet-asr`) | ONNX Runtime | Tích hợp | Hậu xử lý ITN: tự động chuẩn hóa số đếm, phần trăm, ngày tháng, viết hoa và dấu câu chuẩn văn bản. |
 | **ASR Tiếng Anh (Lai)** | **Silero VAD v5** + **Moonshine-v2** / **Zipformer-20M** | ONNX Runtime INT8 | ~265 MB | Kiến trúc cắt câu Zero-Overlap giúp tỷ lệ lặp chữ **0%**, chống ảo giác tiếng nhạc/tiếng ồn phòng họp. |
-| **ASR 20 Ngôn ngữ** | **Whisper** / **SenseVoice** (`sherpa-onnx`) | ONNX Runtime INT8 | Tải theo nhu cầu | Nhận dạng giọng nói Thái, Lào, Trung, Nhật, Hàn, Pháp, Đức, Tây Ban Nha, Nga... |
+| **ASR 20 Ngôn ngữ** | **Parakeet-TDT-0.6B-Ultra** / **Zipformer-Multi** / **Moonshine JA/KO** / **Whisper** (`sherpa-onnx`) | ONNX Runtime INT8 | Tải theo nhu cầu | Fast-Lane cho 25 NN Châu Âu (nhanh hơn `7×–10×` Whisper), Nhật, Hàn, Thái, Trung, Lào, Khmer… |
 | **Dịch Việt ⇄ Anh** | **VietAI EnViT5** | **CTranslate2 INT8** (CPU) | ~266 MB | Chuyên biệt cho cặp Anh ⇄ Việt: dịch mượt, giữ đủ ý/con số, đạt **`68–212 ms`** với **0% GPU**. |
 | **Dịch 202 Ngôn ngữ** | **Meta NLLB-200 Distilled 600M** | **CTranslate2 INT8** (CPU) | ~604 MB | Bao phủ 202 ngôn ngữ (gồm Lào, Khmer, Thái, Trung, Nhật, Hàn, Ả Rập, Âu-Mỹ...) chạy 100% offline. |
 | **LLM Offline (Tùy chọn)** | **Tencent Hy-MT2-1.8B** | **`llama.cpp` GGUF** (Metal / Vulkan) | ~1.05 GB | Tắt mặc định để tiết kiệm RAM/GPU; bật khi cần văn phong tự nhiên cho 38 ngôn ngữ trên máy cấu hình mạnh. |
@@ -184,6 +186,7 @@ flowchart TB
 
 | Kịch bản kiểm thử | Engine thực chạy | Độ trễ thực đo | Tài nguyên hệ thống |
 | :--- | :--- | :---: | :--- |
+| **Slide-Aware RAG (80 trang `.pptx`)** | `engine/slide_context.py` (IDF + Regex Cache) | **`~0.17 – 0.63 ms`** | 0% GPU • Parse 80 slide chỉ ~20 ms, 100% offline |
 | **Việt ⇄ Anh (Nháp Live đang nói)** | `VietAI EnViT5` (CTranslate2 INT8) | **`68.9 – 161.7 ms`** | 0% GPU • Không có tiến trình `llama-server` |
 | **Việt ⇄ Anh (Câu chốt hoàn chỉnh)** | `VietAI EnViT5` (`repetition_penalty=1.05`) | **`134.5 – 212.2 ms`** | 0% GPU • Giữ đủ 100% số liệu & ý phụ |
 | **Thái / Lào / 202 NN (Câu chốt)** | `NLLB-200 600M` (CTranslate2 INT8) | **`767 – 850 ms`** | 0% GPU • Tự xả RAM khi đổi về Việt ⇄ Anh |
@@ -259,6 +262,7 @@ VOICERECORE/
 ├── native-macos/                # Helper Swift native dùng ScreenCaptureKit (macOS 13+)
 ├── scripts/                     # Script tự động hóa phát hành (release.sh, fetch_llama_server.py)
 ├── docs/images/                 # Hình ảnh minh họa giao diện chính thức
+├── CHANGELOG.md                 # Nhật ký thay đổi các phiên bản phát hành
 └── .github/workflows/           # CI/CD tự động build Windows/macOS & ký số Ed25519
 ```
 
