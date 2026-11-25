@@ -4518,7 +4518,7 @@ class LoopbackGuardMiddleware:
         )
 
 
-app = FastAPI(title="VOICERECORE Local Engine", version="1.1.3", lifespan=lifespan)
+app = FastAPI(title="VOICERECORE Local Engine", version="1.1.4", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

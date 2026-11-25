@@ -4,7 +4,21 @@ Tất cả thay đổi đáng chú ý của **DAU Voice Pro** được ghi nhậ
 
 ---
 
-## [1.1.3] — 2026-11-25 *(Bản phát hành chính thức mới nhất)*
+## [1.1.4] — 2026-11-25 *(Bản phát hành chính thức mới nhất)*
+
+### 🍎 Khắc phục triệt để quyền `Âm thanh máy` (ScreenCaptureKit) trên macOS
+- **Niêm phong chữ ký gói `.app` chuẩn Apple Silicon (`APPLE_SIGNING_IDENTITY="-"` + `Entitlements.plist`):** Khắc phục lỗi macOS TCC từ chối `Âm thanh máy` ngay cả khi người dùng đã cấp quyền trong *Ghi màn hình & Âm thanh hệ thống* (do bản build CI trước đó thiếu niêm phong `CodeResources` & `Info.plist=not bound`).
+- **Ký chuẩn `voicerecore-macos-helper`:** Bổ sung `codesign --force --sign -` gắn chặt `Info.plist` vào helper Swift thu âm thanh hệ thống.
+
+### 🎯 Nâng cấp Tự nhận diện 99 ngôn ngữ (`auto`), Tiếng Nhật & Dịch File song ngữ
+- **Hỗ trợ đầy đủ `Tự nhận diện (99 NN)` trong Dịch File Offline (`file_translator.py`):** Tự động nhận ngôn ngữ từng phân đoạn trong file hội nghị song ngữ (`Nhật + Anh + Việt`), tự xả ngữ cảnh khi đổi ngôn ngữ (vá lỗi HTTP 500 khi chọn `auto`), bổ sung chế độ siêu tốc `Moonshine-JA` / `Moonshine-KO` khi dịch file Nhật/Hàn.
+- **Tối ưu tốc độ & chống nuốt câu `Whisper-Turbo (auto)`:** Bỏ qua bước gọi SLID thừa với các hệ chữ không nhập nhằng (Nhật/Hàn/Thái/Lào/Khmer/Việt — tiết kiệm ~1.5–2s/câu), trả từng câu VAD độc lập để không bao giờ xóa hàng đợi câu kế tiếp hay trộn 2 ngôn ngữ, bỏ Pass-2 `Moonshine-EN` và carry-over khi đang chạy `Whisper-Turbo`, lọc lặp dấu `... ... ...` và phân biệt chuẩn tiếng Pháp/Bồ Đào Nha với tiếng Việt (`â/ê/ô/ã/õ`).
+- **Làm sạch đầu ra `Moonshine-JA`:** Chuẩn hóa số & thương hiệu tách rời (`i P h o n e 6` → `iPhone 6`, `2 0 1 2 年` → `2012年`, `５Ｇ` → `5G`, `１，０００` → `1,000`), chặn chuỗi phiên âm Katakana-chấm rác khi có người nói tiếng Anh vào mode Nhật, nối mượt cụm CJK không chèn dấu cách ASCII.
+- **Chuẩn hóa thuật ngữ DAU đa ngữ & Màn LED gọn hơn:** Thêm quy tắc 1 chiều `ダナン建築大学` / `Danang University of Architecture` → `Đại học Kiến trúc Đà Nẵng` (chống dịch lệch thành `Dannan`/`Danan`), và tự động ẩn dòng câu gốc trùng lặp trên Màn LED khi diễn giả nói trùng ngôn ngữ đích (`passthrough`).
+
+---
+
+## [1.1.3] — 2026-11-25
 
 ### ✨ Tính năng mới
 - **Tự động nhận diện ngôn ngữ nói (99 NN — `Nói: Tự nhận diện (99 NN)`):**
