@@ -438,8 +438,10 @@ export function groupEntriesByParagraph(chronological: TranscriptEntry[]): Trans
   return out;
 }
 
-export const ENGINE_HTTP = "http://127.0.0.1:18765";
-export const ENGINE_WS = "ws://127.0.0.1:18765/ws";
+const _ENGINE_PORT =
+  (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_ENGINE_PORT || "18765";
+export const ENGINE_HTTP = `http://127.0.0.1:${_ENGINE_PORT}`;
+export const ENGINE_WS = `ws://127.0.0.1:${_ENGINE_PORT}/ws`;
 
 export type ThemeMode = "dark" | "light";
 export const THEME_STORAGE_KEY = "voicerecore-theme";

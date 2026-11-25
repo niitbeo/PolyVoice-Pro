@@ -888,9 +888,13 @@ export default function OverlayWindow() {
                       const tgtSize =
                         distFromLatest === 0 ? fontSize : Math.max(18, Math.round(fontSize * 0.82));
                       const srcSize = Math.max(14, Math.round(tgtSize * 0.52));
+                      const showRowSource =
+                        showLedSource &&
+                        Boolean(item.source_text) &&
+                        item.source_text.trim() !== (item.translated_text || "").trim();
                       return (
                         <div className={`overlay-led-item ${tierClass}`} key={item.id}>
-                          {showLedSource && item.source_text && (
+                          {showRowSource && (
                             <div className="overlay-led-src" style={{ fontSize: srcSize }}>
                               {item.source_text}
                             </div>

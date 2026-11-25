@@ -22,7 +22,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from languages import PARAKEET_EU_LANGS
+from languages import PARAKEET_EU_LANGS, infer_text_nllb_lang
 from session_logger import _fmt_srt_time
 
 SAMPLE_RATE = 16000
@@ -519,6 +519,22 @@ def translate_media_file(
         if (not force_whisper) and source_lang == "eng_Latn"
         else None
     )
+    ja_moonshine = (
+        runtime.ensure_onnx_asr_loaded("moonshine-ja", lang_code=source_lang)
+        if (not force_whisper)
+        and source_lang == "jpn_Jpan"
+        and runtime.model_manager.is_moonshine_ja_ready()
+        and runtime.model_manager.is_silero_vad_ready()
+        else None
+    )
+    ko_moonshine = (
+        runtime.ensure_onnx_asr_loaded("moonshine-ko", lang_code=source_lang)
+        if (not force_whisper)
+        and source_lang == "kor_Hang"
+        and runtime.model_manager.is_moonshine_ko_ready()
+        and runtime.model_manager.is_silero_vad_ready()
+        else None
+    )
     parakeet_eu = (
         runtime.ensure_onnx_asr_loaded("parakeet-eu", lang_code=source_lang)
         if (not force_whisper)
@@ -527,7 +543,13 @@ def translate_media_file(
         else None
     )
     whisper_asr = None
-    if force_whisper or (not use_vi_batch and en_moonshine is None and parakeet_eu is None):
+    if force_whisper or (
+        not use_vi_batch
+        and en_moonshine is None
+        and ja_moonshine is None
+        and ko_moonshine is None
+        and parakeet_eu is None
+    ):
         if runtime.model_manager.is_whisper_turbo_ready():
             whisper_asr = runtime.ensure_onnx_asr_loaded("whisper-turbo", lang_code=source_lang)
         else:
@@ -549,13 +571,22 @@ def translate_media_file(
         else (
             "Parakeet-Ultra 25 NN Châu Âu"
             if parakeet_eu is not None
-            else ("VietASR + Zipformer" if use_vi_batch else "Moonshine-v2")
+            else (
+                "Moonshine-v2 Tiếng Nhật"
+                if ja_moonshine is not None
+                else (
+                    "Moonshine-v2 Tiếng Hàn"
+                    if ko_moonshine is not None
+                    else ("VietASR + Zipformer" if use_vi_batch else "Moonshine-v2")
+                )
+            )
         )
     )
 
     protected_terms = runtime._get_glossary_hotwords()
     segments_out: list[dict[str, Any]] = []
     recent_ctx: list[tuple[str, str]] = []
+    last_seg_lang = ""
     processed_audio_s = 0.0
     t_loop = time.perf_counter()
 
@@ -575,10 +606,18 @@ def translate_media_file(
         if cancel_event is not None and cancel_event.is_set():
             raise FileTranslateCancelled("Đã hủy dịch file.")
 
+        det_lang = ""
         if whisper_asr is not None:
-            text = whisper_asr.transcribe_pcm_isolated(seg_pcm, language=source_lang)
+            if source_lang == "auto":
+                text, det_lang = whisper_asr.transcribe_pcm_isolated_with_lang(seg_pcm, language="auto")
+            else:
+                text = whisper_asr.transcribe_pcm_isolated(seg_pcm, language=source_lang)
         elif parakeet_eu is not None:
             text = parakeet_eu.transcribe_pcm_isolated(seg_pcm, language=source_lang)
+        elif ja_moonshine is not None:
+            text = ja_moonshine.transcribe_pcm_isolated(seg_pcm, language=source_lang)
+        elif ko_moonshine is not None:
+            text = ko_moonshine.transcribe_pcm_isolated(seg_pcm, language=source_lang)
         elif use_vi_batch and refiner is not None:
             p1_fallback = ""
             if zf_vi is not None:
@@ -592,9 +631,13 @@ def translate_media_file(
 
         text = runtime.glossary.apply_asr_fixes(text.strip())
         if text:
+            eff_src_lang = (det_lang or infer_text_nllb_lang(text)) if source_lang == "auto" else source_lang
+            if last_seg_lang and eff_src_lang != last_seg_lang:
+                recent_ctx.clear()
+            last_seg_lang = eff_src_lang
             tr = runtime.translate_text(
                 text,
-                source_lang,
+                eff_src_lang,
                 target_lang,
                 mt_mode=mt_mode,
                 beam_size=runtime.config.beam_size,
@@ -603,7 +646,8 @@ def translate_media_file(
                 llm_api_key=runtime.config.llm_api_key,
                 context=recent_ctx[-2:],
             )
-            recent_ctx.append((text, tr.translated_text))
+            if eff_src_lang != target_lang:
+                recent_ctx.append((text, tr.translated_text))
             segments_out.append(
                 {
                     "index": len(segments_out) + 1,
@@ -611,6 +655,7 @@ def translate_media_file(
                     "end_s": round(end_s, 2),
                     "start_srt": _fmt_srt_time(start_s),
                     "end_srt": _fmt_srt_time(end_s),
+                    "source_lang": eff_src_lang,
                     "source_text": text,
                     "translated_text": tr.translated_text,
                     "mt_engine": tr.engine,

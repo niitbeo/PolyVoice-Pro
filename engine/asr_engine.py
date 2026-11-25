@@ -1923,6 +1923,8 @@ def _clean_whisper_text(raw: str, rms: float = 1.0) -> str:
                 tail_echo = txt[idx_end + len(unit_clean) :].strip()
                 if len(tail_echo) >= 4 and unit_clean.startswith(tail_echo):
                     txt = txt[: idx_end + len(unit_clean)].strip()
+    # Collapse repeated trailing ellipsis loops ("... ... ...") emitted by Whisper on audio cuts
+    txt = re.sub(r"(?:\s*(?:\.{3,}|…)){2,}", "…", txt).strip()
     # Collapse pathological repeated-character loops (Whisper noise artifact)
     if _RE_WHISPER_CHAR_LOOP.search(txt):
         txt = _RE_WHISPER_CHAR_LOOP.sub(r"\1\1\1", txt).strip()
@@ -2095,7 +2097,7 @@ class WhisperTurboStreamingEngine:
         # per char; keep 30 tok/s for high-accuracy scripts, but cap low-resource scripts (lo/km/my)
         # at 18 tok/s so greedy repetition loops never burn 10-20s on CPU.
         if hasattr(stream, "set_option"):
-            tps = "18" if self._language in ("lo", "km", "my") else "30"
+            tps = "18" if self._language in ("lo", "km", "my") else "32"
             stream.set_option("max_tokens_per_second", tps)
         stream.accept_waveform(self.sample_rate, padded)
         self._recognizer.decode_stream(stream)
@@ -2104,9 +2106,10 @@ class WhisperTurboStreamingEngine:
 
         detected_nllb = ""
         if not self._language:
-            from languages import infer_text_nllb_lang
+            from languages import infer_script_nllb_lang, infer_text_nllb_lang
 
-            if not raw_iso and raw_txt.strip():
+            script_guess = infer_script_nllb_lang(raw_txt) if raw_txt.strip() else ""
+            if not raw_iso and raw_txt.strip() and not script_guess:
                 slid = self._ensure_slid_locked()
                 if slid is not None:
                     try:
@@ -2115,7 +2118,7 @@ class WhisperTurboStreamingEngine:
                         raw_iso = str(slid.compute(st_lid) or "").strip()
                     except Exception:
                         pass
-            detected_nllb = infer_text_nllb_lang(raw_txt, raw_iso)
+            detected_nllb = script_guess or infer_text_nllb_lang(raw_txt, raw_iso)
             self._last_detected_nllb = detected_nllb
         else:
             from languages import whisper_lang_to_nllb
@@ -2127,6 +2130,7 @@ class WhisperTurboStreamingEngine:
             return "", detected_nllb
         if detected_nllb == "jpn_Jpan":
             cleaned = _RE_JA_INTERCHAR_SPACE.sub("", cleaned)
+            cleaned = _RE_JA_SHORT_LOOP_3X.sub(r"\1", cleaned)
         elif detected_nllb == "kor_Hang":
             cleaned = _apply_ko_itn(cleaned)
         return cleaned, detected_nllb
@@ -2180,18 +2184,23 @@ class WhisperTurboStreamingEngine:
                     finals.append(txt)
                     if lang_code:
                         det_lang = lang_code
-                # Guard against CPU backlog hangs on slow/low-resource decodes: if one segment already
-                # took >=2.5s, drain stale queued VAD segments instead of freezing stop/switch for 20s!
-                if (time.perf_counter() - t0) >= 2.5:
+                    # Emit one clean VAD utterance per call so:
+                    # 1) Live stop/switch stays instant without destroying queued speech segments!
+                    # 2) Bilingual auto-LID utterances (e.g. JA followed by EN) are NEVER glued under one wrong lang!
+                    break
+                # Guard against CPU backlog hangs ONLY on slow low-resource scripts (lo/km/my)
+                if self._language in ("lo", "km", "my") and (time.perf_counter() - t0) >= 3.5:
                     while not self._vad.empty():
                         self._vad.pop()
                     break
 
             if finals:
-                self._active_chunks.clear()
-                self._active_samples = 0
-                self._preroll.clear()
-                self._was_speaking = False
+                # Only clear active live-preview buffer when no more completed VAD segments remain
+                if self._vad.empty():
+                    self._active_chunks.clear()
+                    self._active_samples = 0
+                    self._preroll.clear()
+                    self._was_speaking = False
                 self._last_partial = ""
                 self._last_partial_ts = 0.0
                 ms = round((time.perf_counter() - t0) * 1000.0, 1)
@@ -2257,15 +2266,22 @@ class WhisperTurboStreamingEngine:
                 )
             return ASROutput("none", "", ms, self.active_provider)
 
-    def transcribe_pcm_isolated(self, pcm_s16: np.ndarray, language: Optional[str] = None) -> str:
-        """Transcribe a standalone PCM segment cleanly for offline file translation."""
+    def transcribe_pcm_isolated_with_lang(
+        self, pcm_s16: np.ndarray, language: Optional[str] = None
+    ) -> tuple[str, str]:
+        """Transcribe a standalone PCM segment and return `(text, detected_nllb_lang)` for offline file translation."""
         if pcm_s16 is None or len(pcm_s16) == 0:
-            return ""
+            return "", ""
         if language is not None:
             self.set_language(language)
         audio_f32 = pcm_s16.astype(np.float32) / 32768.0
         with self._lock:
-            return self._decode_f32_locked(audio_f32)
+            return self._decode_f32_with_lang_locked(audio_f32)
+
+    def transcribe_pcm_isolated(self, pcm_s16: np.ndarray, language: Optional[str] = None) -> str:
+        """Transcribe a standalone PCM segment cleanly for offline file translation."""
+        txt, _ = self.transcribe_pcm_isolated_with_lang(pcm_s16, language=language)
+        return txt
 
     def close(self) -> None:
         self.reset()
@@ -2463,6 +2479,16 @@ _JA_MOONSHINE_HALLUCINATION_SUBSTRS: tuple[str, ...] = (
     "チャンネル登録お願い",
 )
 _RE_JA_FULLWIDTH_GARBLE = re.compile(r"[Ａ-Ｚａ-ｚ][Ａ-Ｚａ-ｚ０-９．,，・\s]{5,}")
+_RE_JA_SPACED_LETTERS = re.compile(r"(?<![A-Za-z])[A-Za-z](?: [A-Za-z]){1,18}(?![A-Za-z])")
+_RE_JA_SPACED_DIGITS = re.compile(r"(?<=\d)\s+(?=\d)")
+_RE_JA_DIGIT_UNIT_SPACE = re.compile(r"(?<=\d)\s+(?=[A-Za-z]\b)")
+_RE_JA_ASCII_CJK_SPACE = re.compile(
+    r"(?<=[\u3040-\u30ff\u4e00-\u9fff])\s+(?=[A-Za-z0-9])|(?<=[A-Za-z0-9])\s+(?=[\u3040-\u30ff\u4e00-\u9fff])"
+)
+_FW_ALNUM_TRANS = str.maketrans(
+    "０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ，",
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz,",
+)
 _RE_JA_CLAUSE_LOOP_2X = re.compile(r"(.{5,40}?)(?:[、。\s]*\1){1,}")
 _RE_JA_SHORT_LOOP_3X = re.compile(r"(.{2,6}?)(?:[、。\s]*\1){2,}")
 
@@ -2473,6 +2499,9 @@ def _clean_ja_moonshine_text(raw: str, rms: float = 1.0) -> str:
     - Remove stray CJK inter-char spaces & run Whisper hallucination/energy filters with real RMS
     - Filter Aozora Bunko / YouTube memorization hallucinations emitted on noisy or non-JA hall audio
     - Strip fullwidth Latin garble (e.g. `Ｔｗａｂｔｆｒｅｅ...`, `Ｍｎｙｈｂｔｇｖ`)
+    - Suppress wrong-language English->Katakana phonetic dot gibberish (`イントニティ・ジェスト・ザ・...`)
+    - Normalize fullwidth alphanumerics (`５Ｇ`->`5G`, `１，０００`->`1,000`) and collapse Moonshine-JA's
+      spaced single ASCII chars/digits (`i P h o n e 6 で 2 0 倍` -> `iPhone 6で20倍`, `2 0 1 2 年` -> `2012年`)
     - Collapse 2x clause loops (`このようなことをしています。このようなことをしています。`)
       and 3x short-word loops (`私たちは、私たちは、私たちは`, `筆の筆の筆の筆`) + truncated tail echoes
     """
@@ -2502,6 +2531,25 @@ def _clean_ja_moonshine_text(raw: str, rms: float = 1.0) -> str:
     # Reject pure fullwidth/ASCII short nonsense like "Ｆｆｊ", "Ｍｎｙｈｂｔｇｖ"
     non_punct = re.sub(r"[\s「」『』()（）.,、。！？!?・\-]+", "", txt)
     if non_punct and all("\uff21" <= ch <= "\uff5a" or "\uff10" <= ch <= "\uff19" for ch in non_punct):
+        return ""
+
+    # 2b) Suppress pure Katakana middle-dot phonetic gibberish when English is spoken into Moonshine-JA
+    #     (e.g. "イントニティ・ジェスト・ザ・リミントン・アブド・フレイズ・エイジアイ・...")
+    dot_count = txt.count("・")
+    if dot_count >= 4:
+        compact = re.sub(r"\s+", "", txt)
+        kata_dot_chars = sum(1 for ch in compact if ("\u30a0" <= ch <= "\u30ff") or ch == "・")
+        if compact and (kata_dot_chars / len(compact)) >= 0.72:
+            return ""
+
+    # 2c) Normalize fullwidth digits/ASCII/comma & collapse Moonshine-JA's spaced-out ASCII brands/years
+    txt = txt.translate(_FW_ALNUM_TRANS)
+    txt = _RE_JA_SPACED_LETTERS.sub(lambda m: m.group(0).replace(" ", ""), txt)
+    txt = _RE_JA_SPACED_DIGITS.sub("", txt)
+    txt = _RE_JA_DIGIT_UNIT_SPACE.sub("", txt)
+    txt = _RE_JA_ASCII_CJK_SPACE.sub("", txt)
+    txt = " ".join(txt.split()).strip()
+    if not txt:
         return ""
 
     # 3) Collapse Japanese 2x clause loops and 3x short-token loops

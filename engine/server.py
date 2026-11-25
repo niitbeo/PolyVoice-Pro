@@ -1420,6 +1420,8 @@ class EngineRuntime:
         clean = self.glossary.apply_asr_fixes(text.strip())
         if not clean:
             return TranslationResult("", "", source_lang, target_lang, 0.0, mt_mode)
+        if source_lang == "auto":
+            source_lang = infer_text_nllb_lang(clean)
         if source_lang == "vie_Latn":
             clean = self.glossary.normalize_session_entities(clean, source_lang)
 
@@ -2298,6 +2300,7 @@ class EngineRuntime:
             self._active_group_speaker = ""
         self._recent_context.clear()
         self._post_pass2_carry.clear()
+        self._detected_source_lang = ""
         self.glossary.clear_session_entities()
 
         self._current_segment_id = uuid.uuid4().hex[:10]
@@ -2700,6 +2703,7 @@ class EngineRuntime:
             self._active_group_langs = ("", "")
         self._recent_context.clear()
         self._post_pass2_carry.clear()
+        self._detected_source_lang = ""
         self.glossary.clear_session_entities()
         self.broadcast_threadsafe({"type": "history", "data": []})
 
@@ -2885,6 +2889,17 @@ class EngineRuntime:
             return ""
         merged = clean_parts[0]
         for nxt in clean_parts[1:]:
+            # Non-spaced CJK / Kana / Thai / Lao / Khmer boundaries join without inserting ASCII spaces or commas
+            if (
+                merged
+                and nxt
+                and any(
+                    ("\u3000" <= ch <= "\u9fff") or ("\u0e00" <= ch <= "\u0eff") or ("\u1780" <= ch <= "\u17ff")
+                    for ch in (merged[-1], nxt[0])
+                )
+            ):
+                merged = f"{merged}{nxt}"
+                continue
             if merged.endswith((".", "!", "?", "…")):
                 if nxt and nxt[0].islower():
                     nxt = nxt[0].upper() + nxt[1:]
@@ -3485,6 +3500,7 @@ class EngineRuntime:
                         self._flush_paragraph_locked(allow_carry_over=False, is_stop_flush=False)
                     self._detected_source_lang = det
                     self._recent_context.clear()
+                    self._post_pass2_carry.clear()
                     det_meta = get_source_language(det) or get_language(det)
                     self.broadcast_threadsafe(
                         {
@@ -4063,7 +4079,7 @@ class EngineRuntime:
                                     source_text = refined
                             except Exception:
                                 pass
-                        elif item["source_lang"] == "eng_Latn" and asr_label not in ("moonshine-en", "hybrid-en"):
+                        elif item["source_lang"] == "eng_Latn" and asr_label not in ("moonshine-en", "hybrid-en", "whisper-turbo"):
                             try:
                                 en_refiner = self.ensure_en_pass2_refiner()
                                 if en_refiner is not None:
@@ -4074,7 +4090,9 @@ class EngineRuntime:
                                 pass
 
                     # Post-Pass-2 Text-Only Dangling-Tail Carry-Over for English (zero audio overlap, 0% duplicates!)
-                    if item["source_lang"] == "eng_Latn" and asr_label != "moonshine-en":
+                    # Skip for Moonshine-EN & Whisper-Turbo which already emit complete VAD-aligned sentences
+                    # (and in auto-LID mode prevents English tail words leaking across Japanese/Vietnamese turns!)
+                    if item["source_lang"] == "eng_Latn" and asr_label not in ("moonshine-en", "whisper-turbo"):
                         ckey = (speaker, item["source_lang"])
                         prev_c = self._post_pass2_carry.pop(ckey, "")
                         source_text, next_c = self._apply_post_pass2_carry(

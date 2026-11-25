@@ -468,9 +468,10 @@ WHISPER_LANG_TO_NLLB: dict[str, str] = {
     "kk": "kaz_Cyrl",
 }
 
+# Strictly unique Vietnamese letters/tones (exclude bare â/ê/ô/ã/õ shared with French/Portuguese!)
 _VI_UNIQUE_DIACRITICS = frozenset(
-    "ăắằẳẵặâấầẩẫậđêếềểễệôốồổỗộơớờởỡợưứừửữựảãạẻẽẹỉĩịỏõọủũụỷỹỵ"
-    "ĂẮẰẲẴẶÂẤẦẨẪẬĐÊẾỀỂỄỆÔỐỒỔỖỘƠỚỜỞỠỢƯỨỪỬỮỰẢÃẠẺẼẸỈĨỊỎÕỌỦŨỤỶỸỴ"
+    "ăắằẳẵặấầẩẫậđếềểễệốồổỗộơớờởỡợưứừửữựảạẻẽẹỉĩịỏọủũụỷỹỵ"
+    "ĂẮẰẲẴẶẤẦẨẪẬĐẾỀỂỄỆỐỒỔỖỘƠỚỜỞỠỢƯỨỪỬỮỰẢẠẺẼẸỈĨỊỎỌỦŨỤỶỸỴ"
 )
 
 
@@ -479,6 +480,56 @@ def whisper_lang_to_nllb(iso: str, fallback: str = "") -> str:
     if "-" in clean:
         clean = clean.split("-", 1)[0]
     return WHISPER_LANG_TO_NLLB.get(clean, fallback)
+
+
+def infer_script_nllb_lang(text: str) -> str:
+    """
+    Fast (<0.05ms) unambiguous Unicode-script language detector.
+    Returns an NLLB code ONLY when the script unambiguously identifies the language
+    (Japanese Kana, Hangul, Thai, Lao, Khmer, Devanagari, CJK Han, or unique Vietnamese diacritics).
+    Returns '' for Latin/Cyrillic/Arabic scripts that require acoustic Spoken Language ID.
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+    ja_kana = cjk = hangul = thai = lao = khmer = devanagari = vi_unique = latin = 0
+    for ch in s:
+        cp = ord(ch)
+        if 0x3040 <= cp <= 0x30FF:
+            ja_kana += 1
+        elif 0x4E00 <= cp <= 0x9FFF:
+            cjk += 1
+        elif 0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF:
+            hangul += 1
+        elif 0x0E00 <= cp <= 0x0E7F:
+            thai += 1
+        elif 0x0E80 <= cp <= 0x0EFF:
+            lao += 1
+        elif 0x1780 <= cp <= 0x17FF:
+            khmer += 1
+        elif 0x0900 <= cp <= 0x097F:
+            devanagari += 1
+        elif ch in _VI_UNIQUE_DIACRITICS:
+            vi_unique += 1
+            latin += 1
+        elif ("A" <= ch <= "Z") or ("a" <= ch <= "z") or (0x00C0 <= cp <= 0x024F):
+            latin += 1
+
+    if ja_kana >= 2 or (ja_kana >= 1 and (ja_kana + cjk) > latin):
+        return "jpn_Jpan"
+    if hangul >= 2 and hangul >= cjk:
+        return "kor_Hang"
+    if thai >= 3:
+        return "tha_Thai"
+    if lao >= 3:
+        return "lao_Laoo"
+    if khmer >= 3:
+        return "khm_Khmr"
+    if devanagari >= 3:
+        return "hin_Deva"
+    if vi_unique >= 2 or (vi_unique >= 1 and len(s) <= 24):
+        return "vie_Latn"
+    return ""
 
 
 def infer_text_nllb_lang(text: str, whisper_iso: str = "") -> str:

@@ -65,6 +65,8 @@ DAU_CONFERENCE_TOPIC = "Hội thảo Khoa học Quốc tế — Trường Đại
 DAU_CONFERENCE_TERMS: list[tuple[str, str]] = [
     ("Đại học Kiến trúc Đà Nẵng", "Da Nang Architecture University (DAU)"),
     ("Trường Đại học Kiến trúc Đà Nẵng", "Da Nang Architecture University (DAU)"),
+    ("ダナン建築大学", "Đại học Kiến trúc Đà Nẵng"),
+    ("Danang University of Architecture", "Đại học Kiến trúc Đà Nẵng"),
     ("DAU", "DAU"),
     ("Ban Giám hiệu", "Board of Rectors"),
     ("Hiệu trưởng", "Rector"),
@@ -1342,7 +1344,7 @@ class SlideContextManager:
                     continue
 
                 src_inferred = _infer_term_lang(t.source)
-                tgt_inferred = "eng_Latn" if t.origin == "dau_preset" else _infer_term_lang(eff_target)
+                tgt_inferred = _infer_term_lang(eff_target) or ("eng_Latn" if t.origin == "dau_preset" else "")
 
                 # Forward: e.g. VI -> EN ("Ban Giám hiệu" -> "Board of Rectors") or VI -> JA ("Hiệu trưởng" -> "学長")
                 fwd_lang_ok = _term_lang_matches(tgt_inferred, tgt_lang)
@@ -1363,7 +1365,8 @@ class SlideContextManager:
                         continue
 
                 # Reverse: e.g. EN -> VI ("Smart City" -> "Đô thị thông minh")
-                rev_lang_ok = _term_lang_matches(src_inferred, tgt_lang)
+                # Never reverse a Foreign->VI alias back into VI->Foreign (prevents extra XTerm sentinels in VI->JA/KO NLLB)
+                rev_lang_ok = (tgt_inferred != "vie_Latn") and _term_lang_matches(src_inferred, tgt_lang)
                 if rev_lang_ok:
                     span = _find_term_match_span(
                         eff_target,
