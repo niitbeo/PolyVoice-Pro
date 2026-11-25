@@ -6,4 +6,5 @@ swiftc -O -parse-as-library \
   "$DIR/helper.swift" \
   -o "$DIR/voicerecore-macos-helper" \
   -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$DIR/Info.plist"
-echo "Built $DIR/voicerecore-macos-helper (target arm64-apple-macos13.0)"
+codesign --force --sign - "$DIR/voicerecore-macos-helper"
+echo "Built & ad-hoc signed $DIR/voicerecore-macos-helper (target arm64-apple-macos13.0)"

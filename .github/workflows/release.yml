@@ -459,7 +459,8 @@ jobs:
             [ -n "$_APPLE_TEAM" ] && echo "APPLE_TEAM_ID=$_APPLE_TEAM" >> "$GITHUB_ENV"
             echo "Apple Developer signing enabled."
           else
-            echo "No APPLE_CERTIFICATE secret configured; building ad-hoc signed macOS bundle."
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+            echo "No APPLE_CERTIFICATE secret configured; enabling explicit ad-hoc macOS bundle signing (APPLE_SIGNING_IDENTITY=-) so Info.plist & CodeResources seal cleanly for ScreenCaptureKit TCC."
           fi
 
       - name: Build & Upload Signed Installer to Draft Release
