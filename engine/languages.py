@@ -241,6 +241,7 @@ class SourceLanguageEntry:
 
 
 SOURCE_LANGUAGES: list[SourceLanguageEntry] = [
+    SourceLanguageEntry("auto", "", "Tự nhận diện (99 NN)", "Auto-detect (99 langs)", "Auto", True),
     SourceLanguageEntry("vie_Latn", "vi-VN", "Tiếng Việt", "Vietnamese", "Tiếng Việt", True),
     SourceLanguageEntry("eng_Latn", "en-US", "Tiếng Anh", "English", "English", True),
     SourceLanguageEntry("tha_Thai", "th-TH", "Tiếng Thái", "Thai", "ไทย", True),
@@ -313,6 +314,14 @@ PARAKEET_EU_LANGS: frozenset[str] = frozenset(
 )
 
 SOURCE_LANG_ASR_PROFILE: dict[str, SourceAsrProfile] = {
+    "auto": SourceAsrProfile(
+        "whisper-turbo",
+        540,
+        "whisper-turbo",
+        "global",
+        "universal",
+        "Tự động phát hiện ngôn ngữ diễn giả đang nói (Anh, Việt, Nhật, Hàn, Trung, Thái, Pháp, Đức...) 100% Offline.",
+    ),
     "vie_Latn": SourceAsrProfile("zipformer-30m-streaming", 49, "whisper-turbo", "core", "fast"),
     "eng_Latn": SourceAsrProfile("moonshine-en", 106, "whisper-turbo", "core", "fast"),
     "jpn_Jpan": SourceAsrProfile("moonshine-ja", 99, "whisper-turbo", "asia", "fast"),
@@ -405,7 +414,151 @@ NLLB_TO_WHISPER_LANG: dict[str, str] = {
 
 
 def get_whisper_lang_code(code: str) -> str:
+    if code == "auto":
+        return ""
     return NLLB_TO_WHISPER_LANG.get(code, "")
+
+
+# Reverse lookup: Whisper ISO-639-1 code -> canonical NLLB-200 FLORES code
+WHISPER_LANG_TO_NLLB: dict[str, str] = {
+    "vi": "vie_Latn",
+    "en": "eng_Latn",
+    "th": "tha_Thai",
+    "lo": "lao_Laoo",
+    "ja": "jpn_Jpan",
+    "zh": "zho_Hans",
+    "yue": "yue_Hant",
+    "ko": "kor_Hang",
+    "km": "khm_Khmr",
+    "my": "mya_Mymr",
+    "fr": "fra_Latn",
+    "de": "deu_Latn",
+    "es": "spa_Latn",
+    "ru": "rus_Cyrl",
+    "it": "ita_Latn",
+    "pt": "por_Latn",
+    "id": "ind_Latn",
+    "ms": "zsm_Latn",
+    "tl": "tgl_Latn",
+    "ar": "arb_Arab",
+    "hi": "hin_Deva",
+    "nl": "nld_Latn",
+    "pl": "pol_Latn",
+    "tr": "tur_Latn",
+    "uk": "ukr_Cyrl",
+    "cs": "ces_Latn",
+    "sv": "swe_Latn",
+    "fi": "fin_Latn",
+    "da": "dan_Latn",
+    "no": "nob_Latn",
+    "nn": "nob_Latn",
+    "el": "ell_Grek",
+    "he": "heb_Hebr",
+    "hu": "hun_Latn",
+    "ro": "ron_Latn",
+    "sk": "slk_Latn",
+    "bg": "bul_Cyrl",
+    "hr": "hrv_Latn",
+    "bn": "ben_Beng",
+    "ta": "tam_Taml",
+    "ur": "urd_Arab",
+    "fa": "pes_Arab",
+    "sw": "swh_Latn",
+    "mn": "khk_Cyrl",
+    "kk": "kaz_Cyrl",
+}
+
+_VI_UNIQUE_DIACRITICS = frozenset(
+    "ăắằẳẵặâấầẩẫậđêếềểễệôốồổỗộơớờởỡợưứừửữựảãạẻẽẹỉĩịỏõọủũụỷỹỵ"
+    "ĂẮẰẲẴẶÂẤẦẨẪẬĐÊẾỀỂỄỆÔỐỒỔỖỘƠỚỜỞỠỢƯỨỪỬỮỰẢÃẠẺẼẸỈĨỊỎÕỌỦŨỤỶỸỴ"
+)
+
+
+def whisper_lang_to_nllb(iso: str, fallback: str = "") -> str:
+    clean = (iso or "").strip().lower().replace("_", "-")
+    if "-" in clean:
+        clean = clean.split("-", 1)[0]
+    return WHISPER_LANG_TO_NLLB.get(clean, fallback)
+
+
+def infer_text_nllb_lang(text: str, whisper_iso: str = "") -> str:
+    """
+    Combine Whisper spoken language ID with Unicode script verification so auto-detected
+    language codes stay 100% accurate even on short conference utterances or mixed speech.
+    """
+    s = (text or "").strip()
+    mapped = whisper_lang_to_nllb(whisper_iso, "")
+    if not s:
+        return mapped or "eng_Latn"
+
+    ja_kana = 0
+    cjk = 0
+    hangul = 0
+    thai = 0
+    lao = 0
+    khmer = 0
+    cyrillic = 0
+    arabic = 0
+    devanagari = 0
+    vi_unique = 0
+    latin = 0
+
+    for ch in s:
+        cp = ord(ch)
+        if 0x3040 <= cp <= 0x30FF:
+            ja_kana += 1
+        elif 0x4E00 <= cp <= 0x9FFF:
+            cjk += 1
+        elif 0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF:
+            hangul += 1
+        elif 0x0E00 <= cp <= 0x0E7F:
+            thai += 1
+        elif 0x0E80 <= cp <= 0x0EFF:
+            lao += 1
+        elif 0x1780 <= cp <= 0x17FF:
+            khmer += 1
+        elif 0x0400 <= cp <= 0x04FF:
+            cyrillic += 1
+        elif 0x0600 <= cp <= 0x06FF:
+            arabic += 1
+        elif 0x0900 <= cp <= 0x097F:
+            devanagari += 1
+        elif ch in _VI_UNIQUE_DIACRITICS:
+            vi_unique += 1
+            latin += 1
+        elif ("A" <= ch <= "Z") or ("a" <= ch <= "z") or (0x00C0 <= cp <= 0x024F):
+            latin += 1
+
+    # Unambiguous non-Latin scripts always win over noisy LID tags
+    if ja_kana >= 2 or (ja_kana >= 1 and (ja_kana + cjk) > latin):
+        return "jpn_Jpan"
+    if hangul >= 2 and hangul >= cjk:
+        return "kor_Hang"
+    if thai >= 3:
+        return "tha_Thai"
+    if lao >= 3:
+        return "lao_Laoo"
+    if khmer >= 3:
+        return "khm_Khmr"
+    if devanagari >= 3:
+        return "hin_Deva"
+    if arabic >= 3:
+        return mapped if mapped in ("arb_Arab", "urd_Arab", "pes_Arab") else "arb_Arab"
+    if cyrillic >= 3:
+        return mapped if mapped in ("rus_Cyrl", "ukr_Cyrl", "bul_Cyrl", "khk_Cyrl", "kaz_Cyrl") else "rus_Cyrl"
+    if cjk >= 2 and cjk >= latin:
+        if mapped in ("jpn_Jpan", "zho_Hans", "zho_Hant", "yue_Hant"):
+            return mapped
+        return "zho_Hans"
+    if vi_unique >= 2 or (vi_unique >= 1 and len(s) <= 24):
+        return "vie_Latn"
+
+    # Latin-script speech: trust Whisper's acoustic language ID (distinguishes EN/FR/DE/ES/ID/MS/VI)
+    if mapped and mapped.endswith("_Latn"):
+        return mapped
+    if latin >= 3:
+        return "eng_Latn"
+    return mapped or "eng_Latn"
 
 
 def get_language(code: str) -> LanguageEntry | None:

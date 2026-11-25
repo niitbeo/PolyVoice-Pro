@@ -4,7 +4,26 @@ Tất cả thay đổi đáng chú ý của **DAU Voice Pro** được ghi nhậ
 
 ---
 
-## [1.1.2] — 2026-11-24 *(Bản phát hành chính thức mới nhất)*
+## [1.1.3] — 2026-11-25 *(Bản phát hành chính thức mới nhất)*
+
+### ✨ Tính năng mới
+- **Tự động nhận diện ngôn ngữ nói (99 NN — `Nói: Tự nhận diện (99 NN)`):**
+  - Chạy 100% Offline trên `Whisper Large-v3-Turbo` kết hợp xác thực chữ viết đa ngữ (`infer_text_nllb_lang`) cho Anh, Việt, Nhật, Hàn, Trung, Thái, Lào, Khmer, Pháp, Đức, Nga…
+  - Tự động chốt đoạn cũ, xả ngữ cảnh MT cũ và hiển thị nhãn sống **`Tự nhận: Tiếng Anh / Tiếng Nhật / ...`** trên cả Giao diện chính lẫn Màn LED ngay khi diễn giả quốc tế đổi ngôn ngữ trên sân khấu.
+  - Hỗ trợ cả hộp dịch nhanh văn bản khi đang ở chế độ `Tự nhận diện`.
+
+### 🖥️ Khắc phục triệt để Màn hình LED (`led-stage`) không còn nuốt chữ nói
+- **Thanh `Đang nghe:` ở đáy màn LED:** Bỏ cắt cụt 1 dòng `text-overflow: ellipsis`, nâng cấp hiển thị mượt tối đa 2 dòng và tự cuộn theo đuôi câu mới nhất (`tailClipLiveText`), đảm bảo chữ diễn giả vừa nói luôn hiện rõ 100%.
+- **Hiển thị câu gốc ngay trên bản dịch LED (`Gốc: Bật / Tắt`):** Mặc định bật dòng lời nói gốc gọn phía trên mỗi câu chốt LED (có nút bật/tắt 1 chạm ngay trên thanh công cụ Overlay).
+- **Sửa lỗi Flexbox cắt đầu câu & tự cuộn:** Thay `justify-content: flex-end` bằng `margin-top: auto` chuẩn W3C kèm `ledScrollRef` tự cuộn xuống câu mới nhất ở mọi cỡ chữ LED (`16–56px`).
+
+### 🛡️ Cải thiện độ chính xác ASR Tiếng Nhật & Dịch Việt ⇄ Anh (`EnViT5`)
+- **Nâng cấp `Moonshine-JA` & `Whisper-Turbo`:** Thêm bộ đệm tiền âm `320ms preroll` chống nuốt âm đầu câu, nới giới hạn câu (`9.5s` / `8.5s`) tránh cắt cụt giữa từ, truyền `rms` thực vào bộ lọc, chặn 100% ảo giác sách nói Aozora Bunko / YouTube outro bị cắt đuôi / rác Latinh toàn chiều rộng và khử lặp cụm 2x–3x tiếng Nhật.
+- **Chốt chặn `EnViT5` chống nhả tiếng Việt & mất placeholder `XTerm`:** Tự động phát hiện khi `EnViT5` làm rơi `XTerm` (lỗi biến tên trường thành `"Max"`) hoặc nhả ngược tiếng Việt sang bản dịch tiếng Anh (`"Rector lên nói..."`), lập tức dịch lại bằng `beam=1` / dự phòng sạch sang `NLLB-200-600M`.
+
+---
+
+## [1.1.2] — 2026-11-24
 
 ### ✨ Tinh chỉnh giao diện & Tài liệu
 - **Hộp thoại thoát ứng dụng gọn, chuyên nghiệp:** Thu gọn hộp thoại (`390px`), tiêu đề `Thoát DAU Voice Pro?`, thông điệp 1 dòng rõ ràng theo ngữ cảnh (bình thường / đang dịch live / đang chạy tác vụ), bỏ các ghi chú thừa và căn phải 2 nút `Hủy` | `Thoát`.

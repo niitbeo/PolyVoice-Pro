@@ -3874,13 +3874,17 @@ kbd {
 .overlay-led-sentences {
   flex: 1;
   min-height: 0;
-  padding: 28px 46px 20px;
+  padding: 24px 46px 18px;
   display: flex;
   flex-direction: column;
-  justify-content: flex-end;
-  gap: 18px;
+  gap: 16px;
   overflow-y: auto;
   transition: padding-right 0.2s ease;
+}
+
+/* Safe bottom anchoring: keeps 1–3 items anchored low WITHOUT Flexbox upward overflow clipping! */
+.overlay-led-sentences > :first-child {
+  margin-top: auto;
 }
 
 /* Reserve a dedicated right-hand safe lane whenever Corner QR is displayed — zero text overlap! */
@@ -3933,6 +3937,18 @@ kbd {
   opacity: 0.24;
 }
 
+.overlay-led-src {
+  font-weight: 500;
+  line-height: 1.38;
+  color: rgba(203, 213, 225, 0.82);
+  margin-bottom: 5px;
+  word-break: break-word;
+}
+
+[data-theme="light"] .overlay-led-src {
+  color: #475569;
+}
+
 .overlay-led-tgt {
   font-weight: 800;
   line-height: 1.38;
@@ -3953,10 +3969,10 @@ kbd {
 
 .overlay-led-livebar {
   flex-shrink: 0;
-  height: 46px;
-  padding: 0 24px;
+  min-height: 50px;
+  padding: 9px 24px;
   border-top: 1px solid var(--border);
-  background: rgba(15, 18, 28, 0.85);
+  background: rgba(15, 18, 28, 0.9);
   display: flex;
   align-items: center;
   gap: 10px;
@@ -3964,7 +3980,7 @@ kbd {
 }
 
 [data-theme="light"] .overlay-led-livebar {
-  background: rgba(241, 245, 249, 0.92);
+  background: rgba(241, 245, 249, 0.95);
 }
 
 .overlay-led-dot {
@@ -3982,7 +3998,7 @@ kbd {
 }
 
 .overlay-led-live-label {
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 700;
   color: var(--text-2);
   white-space: nowrap;
@@ -3990,14 +4006,35 @@ kbd {
 }
 
 .overlay-led-live-src {
-  font-size: 13.5px;
-  color: var(--text-1);
+  font-size: 15px;
+  line-height: 1.38;
+  color: var(--text-0);
   font-style: italic;
-  white-space: nowrap;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
+  word-break: break-word;
   flex: 1;
   min-width: 0;
+}
+
+.overlay-led-lang-tag {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: rgba(14, 165, 233, 0.16);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  color: #38bdf8;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+[data-theme="light"] .overlay-led-lang-tag {
+  background: rgba(2, 132, 199, 0.1);
+  border-color: rgba(2, 132, 199, 0.3);
+  color: #0369a1;
 }
 
 .overlay-led-slide-tag {
@@ -4015,7 +4052,7 @@ kbd {
 .overlay-corner-qr {
   position: absolute;
   right: 22px;
-  bottom: 60px;
+  bottom: 72px;
   z-index: 30;
   background: #ffffff;
   color: #0f172a;

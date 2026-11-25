@@ -118,6 +118,7 @@ from languages import (
     get_source_asr_profile,
     get_source_language,
     get_whisper_lang_code,
+    infer_text_nllb_lang,
     list_languages,
     list_source_languages,
 )
@@ -567,6 +568,7 @@ class EngineRuntime:
         self._listening = False
         self._active_asr_label: str = ""
         self._remote_asr_label: str = ""
+        self._detected_source_lang: str = ""
 
         self._final_mt_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=32)
         self._partial_lock = threading.Lock()
@@ -1599,13 +1601,70 @@ class EngineRuntime:
         if eff_mt_mode in ("auto-offline", "light-offline", "cloud-api", "hy-mt2", "fast-online", "local-llm") and is_vi_en_pair:
             envit5 = self.ensure_envit5_loaded()
             if envit5 is not None:
-                return _finish(
-                    envit5.translate(masked, source_lang, target_lang, beam_size=eff_beam, is_draft=is_draft)
-                )
+                ev_res = envit5.translate(masked, source_lang, target_lang, beam_size=eff_beam, is_draft=is_draft)
+                if not is_draft and self._is_envit5_corrupted(ev_res.translated_text, source_lang, target_lang, restore_pairs):
+                    # Retry 1: greedy beam=1 avoids EnViT5 beam=2 length_penalty Vietnamese echo bug
+                    if eff_beam > 1:
+                        ev_b1 = envit5.translate(masked, source_lang, target_lang, beam_size=1, is_draft=False)
+                        if not self._is_envit5_corrupted(ev_b1.translated_text, source_lang, target_lang, restore_pairs):
+                            return _finish(ev_b1)
+                    # Retry 2: if XTerm placeholder caused EnViT5 confusion ("Congrats, Max." / "Rector lên nói..."),
+                    # fall back to NLLB-200-600M (if ready) or unmasked EnViT5!
+                    if self.model_manager.is_nllb_ready():
+                        try:
+                            nllb_fb = self.ensure_nllb_loaded()
+                            nb_res = nllb_fb.translate(masked, source_lang, target_lang, beam_size=1)
+                            if not self._is_envit5_corrupted(nb_res.translated_text, source_lang, target_lang, restore_pairs):
+                                return _finish(nb_res)
+                            nb_raw = nllb_fb.translate(clean, source_lang, target_lang, beam_size=1)
+                            return TranslationResult(clean, nb_raw.translated_text, source_lang, target_lang, nb_raw.latency_ms, nb_raw.engine)
+                        except Exception:
+                            pass
+                    if restore_pairs:
+                        ev_raw = envit5.translate(clean, source_lang, target_lang, beam_size=1, is_draft=False)
+                        if not self._is_envit5_corrupted(ev_raw.translated_text, source_lang, target_lang, []):
+                            return TranslationResult(clean, ev_raw.translated_text, source_lang, target_lang, ev_raw.latency_ms, ev_raw.engine)
+                return _finish(ev_res)
 
         # 4) Offline NLLB-200-600M INT8 (0% GPU, faithful beam=2 for finals across all 202 langs)
         nllb = self.ensure_nllb_loaded()
         return _finish(nllb.translate(masked, source_lang, target_lang, beam_size=eff_beam))
+
+    @staticmethod
+    def _is_envit5_corrupted(
+        raw_translated: str,
+        source_lang: str,
+        target_lang: str,
+        restore_pairs: list[tuple[str, str]],
+    ) -> bool:
+        """
+        Detect EnViT5 failure modes observed in real conference transcripts:
+        1. Dropped/mutated `XTerm...X` sentinel (e.g. `XTermA0X` -> `"Max"` in `"Congrats, Max."`).
+        2. Raw Vietnamese diacritic echo leaked into English output (e.g. `"Rector lên nói rằng..."`).
+        """
+        txt = (raw_translated or "").strip()
+        if not txt:
+            return True
+        low = txt.lower()
+        for tok, _ in restore_pairs or []:
+            if tok.startswith("XTerm") and tok.endswith("X") and tok.lower() not in low:
+                return True
+        if source_lang == "vie_Latn" and target_lang == "eng_Latn":
+            # Strip expected Vietnamese proper-noun targets before counting unexpected Vietnamese words
+            scrubbed = txt
+            for tok, tgt_val in restore_pairs or []:
+                scrubbed = scrubbed.replace(tok, " ")
+                if tgt_val:
+                    scrubbed = scrubbed.replace(tgt_val, " ")
+            vi_words = [
+                w
+                for w in re.findall(r"[A-Za-zÀ-ỹ]+", scrubbed)
+                if re.search(r"[ăắằẳẵặâấầẩẫậđêếềểễệôốồổỗộơớờởỡợưứừửữựàáảãạèéẻẽẹìíỉĩịòóỏõọùúủũụỳýỷỹỵ]", w.lower())
+            ]
+            total_words = max(1, len(re.findall(r"[A-Za-zÀ-ỹ]+", scrubbed)))
+            if len(vi_words) >= 3 or (total_words <= 6 and len(vi_words) >= 2):
+                return True
+        return False
 
     def _is_asr_model_ready(self, model_id: str) -> bool:
         if model_id == "zipformer-30m-streaming":
@@ -1627,6 +1686,8 @@ class EngineRuntime:
     @staticmethod
     def _is_asr_compatible_with_lang(engine_id: str, lang_code: str) -> bool:
         """Verify whether a manually pinned ASR engine actually supports `lang_code`."""
+        if lang_code == "auto":
+            return not engine_id or engine_id in ("auto", "whisper-turbo")
         if not engine_id or engine_id in ("auto", "whisper-turbo", "apple-native"):
             return True
         if engine_id in ("zipformer-30m-streaming", "viet-asr"):
@@ -1708,6 +1769,13 @@ class EngineRuntime:
         if forced_engine != "auto":
             return forced_engine
 
+        if lang_code == "auto":
+            if self.model_manager.is_whisper_turbo_ready():
+                return "whisper-turbo"
+            raise RuntimeError(
+                "Để bật Tự động nhận diện ngôn ngữ nói (99 NN) 100% Offline, hãy bấm tải 'Mở rộng 99 NN (Whisper-Turbo • 540 MB)'."
+            )
+
         prof = get_source_asr_profile(lang_code)
 
         # Tier 1: Fast-Lane dedicated streaming models (30-400ms, 0% GPU)
@@ -1759,6 +1827,7 @@ class EngineRuntime:
             "listening": self._listening,
             "active_asr_label": self._active_asr_label,
             "remote_asr_label": self._remote_asr_label,
+            "detected_source_lang": self._detected_source_lang,
             "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_multi is not None) or (self._asr_hybrid_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_moonshine_ja is not None) or (self._asr_moonshine_ko is not None) or (self._asr_parakeet_eu is not None) or (self._asr_whisper is not None),
             "pass2_loaded": self._pass2_refiner is not None,
             "hotwords_active": self._asr_zf_vi._hotwords_count if self._asr_zf_vi is not None else 0,
@@ -2101,13 +2170,15 @@ class EngineRuntime:
                 chosen_asr = "whisper-turbo"
         self._active_asr_label = chosen_asr
         self._remote_asr_label = ""
+        self._detected_source_lang = ""
 
         # Determine exact minimal model set for this session and unload everything else from RAM!
-        is_vi_en_pair = {self.config.source_lang, self.config.target_lang} == {"vie_Latn", "eng_Latn"}
+        is_auto_src = self.config.source_lang == "auto"
+        is_vi_en_pair = (not is_auto_src) and ({self.config.source_lang, self.config.target_lang} == {"vie_Latn", "eng_Latn"})
         can_hymt2 = (
             self._llama_server_ready
             and self.model_manager.is_hymt2_ready()
-            and bool(get_hymt2_lang_name(self.config.source_lang))
+            and (is_auto_src or bool(get_hymt2_lang_name(self.config.source_lang)))
             and bool(get_hymt2_lang_name(self.config.target_lang))
         )
         want_hymt2 = can_hymt2 and (self.config.mt_mode == "hy-mt2")
@@ -2118,16 +2189,26 @@ class EngineRuntime:
             except Exception:
                 pass
         keep_mt: set[str] = set()
-        if is_vi_en_pair and self.config.mt_mode != "nllb" and self.model_manager.is_envit5_ready():
+        if (
+            (is_vi_en_pair or (is_auto_src and self.config.target_lang in ("vie_Latn", "eng_Latn")))
+            and self.config.mt_mode != "nllb"
+            and self.model_manager.is_envit5_ready()
+        ):
             keep_mt.add("envit5")
         if want_hymt2:
             keep_mt.add("hy-mt2")
+            if is_auto_src:
+                # Keep NLLB-600M ready in auto-detect mode in case a speaker uses a language outside Hy-MT2's 38
+                keep_mt.add("nllb-600m")
         else:
             need_nllb = (
-                self.config.source_lang != self.config.target_lang
-                and (
-                    self.config.mt_mode == "nllb"
-                    or (not is_vi_en_pair and self.config.mt_mode in ("auto-offline", "light-offline", "hy-mt2", "cloud-api"))
+                is_auto_src
+                or (
+                    self.config.source_lang != self.config.target_lang
+                    and (
+                        self.config.mt_mode == "nllb"
+                        or (not is_vi_en_pair and self.config.mt_mode in ("auto-offline", "light-offline", "hy-mt2", "cloud-api"))
+                    )
                 )
             )
             if need_nllb:
@@ -2438,6 +2519,7 @@ class EngineRuntime:
                 th.join(timeout=2.0)
             setattr(self, th_attr, None)
         self._listening = False
+        self._detected_source_lang = ""
         self._schedule_hymt2_idle_sleep(delay_s=60.0)
         self.broadcast_threadsafe({"type": "level", "data": {"level": 0.0}})
         payload = self.get_status_payload()
@@ -3391,11 +3473,32 @@ class EngineRuntime:
             return
 
         cfg = self.config
-        src_lang = cfg.source_lang
         tgt_lang = cfg.target_lang
         now_mono = time.monotonic()
 
         with self._para_lock:
+            if cfg.source_lang == "auto":
+                det = (out.detected_lang or "").strip()
+                if det and det != self._detected_source_lang:
+                    # Flush any buffered speech from the previous language before switching
+                    if self._para_parts:
+                        self._flush_paragraph_locked(allow_carry_over=False, is_stop_flush=False)
+                    self._detected_source_lang = det
+                    self._recent_context.clear()
+                    det_meta = get_source_language(det) or get_language(det)
+                    self.broadcast_threadsafe(
+                        {
+                            "type": "detected_lang",
+                            "data": {
+                                "detected_source_lang": det,
+                                "name_vi": det_meta.name_vi if det_meta else det,
+                            },
+                        }
+                    )
+                src_lang = det or self._detected_source_lang or "eng_Latn"
+            else:
+                src_lang = cfg.source_lang
+
             self._para_last_speech_ts = now_mono
             self._para_last_asr_ms = out.latency_ms
             self._para_src_lang = src_lang
@@ -3673,7 +3776,11 @@ class EngineRuntime:
         if not self._remote_parts:
             return
         r_src = self.config.target_lang
-        r_tgt = self.config.source_lang
+        r_tgt = (
+            self._detected_source_lang or ("eng_Latn" if r_src == "vie_Latn" else "vie_Latn")
+            if self.config.source_lang == "auto"
+            else self.config.source_lang
+        )
         full_text = self._clean_verbatim(
             self.glossary.apply_asr_fixes(
                 self._join_fragments(self._remote_parts, preserve_case=self._get_capitalized_glossary_words())
@@ -3722,7 +3829,11 @@ class EngineRuntime:
         if out.kind == "none" or not out.text:
             return
         r_src = self.config.target_lang
-        r_tgt = self.config.source_lang
+        r_tgt = (
+            self._detected_source_lang or ("eng_Latn" if r_src == "vie_Latn" else "vie_Latn")
+            if self.config.source_lang == "auto"
+            else self.config.source_lang
+        )
         with self._remote_lock:
             self._remote_last_speech_ts = time.monotonic()
             self._remote_last_asr_ms = out.latency_ms
@@ -4017,7 +4128,11 @@ class EngineRuntime:
                 if (
                     source_text
                     and translated
-                    and item["source_lang"] == self.config.source_lang
+                    and item["source_lang"] != active_tgt
+                    and (
+                        item["source_lang"] == self.config.source_lang
+                        or (self.config.source_lang == "auto" and item["source_lang"] == self._detected_source_lang)
+                    )
                     and active_tgt == self.config.target_lang
                 ):
                     self._recent_context.append((source_text, translated))
@@ -4207,6 +4322,8 @@ class EngineRuntime:
     ) -> dict[str, Any]:
         src = source_lang or self.config.source_lang
         tgt = target_lang or self.config.target_lang
+        if src == "auto":
+            src = "eng_Latn" if tgt == "vie_Latn" else "vie_Latn"
         if custom_text and custom_text.strip():
             sample = custom_text.strip()
         elif src == "eng_Latn":
@@ -4477,9 +4594,10 @@ def api_delete_model(model_id: str):
 @app.post("/api/translate")
 def api_translate(req: TranslateTextRequest):
     try:
+        eff_src = infer_text_nllb_lang(req.text) if req.source_lang == "auto" else req.source_lang
         res = runtime.translate_text(
             req.text,
-            req.source_lang,
+            eff_src,
             req.target_lang,
             mt_mode=req.mt_mode,
             beam_size=req.beam_size,

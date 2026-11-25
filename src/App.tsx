@@ -225,6 +225,8 @@ export default function App() {
   const [clipping, setClipping] = useState<boolean>(false);
   const clipTimerRef = useRef<number | undefined>(undefined);
   const [sourceLang, setSourceLang] = useState("vie_Latn");
+  const [detectedSourceLang, setDetectedSourceLang] = useState("");
+  const [detectedSourceLabel, setDetectedSourceLabel] = useState("");
   const [targetLang, setTargetLang] = useState("eng_Latn");
   const [langQuery, setLangQuery] = useState("");
   const [asrEngine, setAsrEngine] = useState<AsrEngineId>("auto");
@@ -417,6 +419,10 @@ export default function App() {
     if (typeof h.logs?.saved_count === "number") setSavedLogCount(h.logs.saved_count);
     if (typeof h.audience?.connected_count === "number") setAudienceCount(h.audience.connected_count);
     if (typeof h.display_frozen === "boolean") setDisplayFrozen(h.display_frozen);
+    if (typeof h.detected_source_lang === "string") {
+      setDetectedSourceLang(h.detected_source_lang);
+      if (!h.detected_source_lang) setDetectedSourceLabel("");
+    }
     if (typeof h.cloud_fallback_notice === "string") setCloudNotice(h.cloud_fallback_notice);
   }, []);
 
@@ -640,6 +646,11 @@ export default function App() {
             }
           } else if (msg.type === "display_freeze") {
             setDisplayFrozen(Boolean(msg.data?.frozen));
+          } else if (msg.type === "detected_lang") {
+            const code = String(msg.data?.detected_source_lang || "");
+            const lbl = String(msg.data?.name_vi || code);
+            setDetectedSourceLang(code);
+            setDetectedSourceLabel(lbl);
           } else if (msg.type === "slide_match") {
             const idx = Number(msg.data?.slide_index || 0);
             const title = String(msg.data?.slide_title || "");
@@ -940,6 +951,7 @@ export default function App() {
 
   const isAsrCompatibleWithLang = useCallback(
     (engine: AsrEngineId, lang: string): boolean => {
+      if (lang === "auto") return engine === "auto" || engine === "whisper-turbo";
       if (engine === "auto" || engine === "whisper-turbo" || engine === "apple-native") return true;
       if (engine === "zipformer-30m-streaming" || engine === "viet-asr") return lang === "vie_Latn";
       if (engine === "hybrid-en" || engine === "moonshine-en") return lang === "eng_Latn";
@@ -982,6 +994,10 @@ export default function App() {
   };
 
   const handleSwapLanguages = () => {
+    if (sourceLang === "auto") {
+      setErrorMsg("Đang bật Tự nhận diện ngôn ngữ nói — chỉ cần chọn ngôn ngữ đích muốn dịch ra.");
+      return;
+    }
     const canSwapTargetAsSource = sourceLanguages.some((s) => s.code === targetLang);
     if (!canSwapTargetAsSource) {
       setErrorMsg("Ngôn ngữ đích hiện tại chưa hỗ trợ làm ngôn ngữ nói đầu vào.");
@@ -3391,13 +3407,19 @@ export default function App() {
                   );
                 }
 
-                // 4) Universal 99-language extension (Hindi, Khmer, Malay, Tagalog, Turkish...)
+                // 4) Universal 99-language extension & Auto-detect (99 NN Whisper-Turbo)
                 if (wtReady) {
                   return (
                     <div className="lang-readiness-banner ready">
                       <div className="lang-readiness-row">
                         <CheckCircle2 size={12} style={{ flexShrink: 0 }} />
-                        <span>Sẵn sàng Offline — Mở rộng 99 NN (Whisper-Turbo)</span>
+                        <span>
+                          {sourceLang === "auto"
+                            ? detectedSourceLabel
+                              ? `Tự nhận diện 99 NN đang chạy — vừa nghe: ${detectedSourceLabel}`
+                              : "Sẵn sàng Offline — Tự nhận diện 99 ngôn ngữ nói (Whisper-Turbo)"
+                            : "Sẵn sàng Offline — Mở rộng 99 NN (Whisper-Turbo)"}
+                        </span>
                       </div>
                     </div>
                   );
@@ -3411,6 +3433,8 @@ export default function App() {
                       <div style={{ flex: 1, minWidth: 0 }}>
                         {isDl
                           ? `Đang tải Mở rộng 99 NN (${pct}%)...`
+                          : sourceLang === "auto"
+                          ? "Cần tải Mở rộng 99 NN (Whisper-Turbo • 540 MB) để tự nhận diện 99 ngôn ngữ nói 100% Offline."
                           : `Cần tải Mở rộng 99 NN (Whisper-Turbo • 540 MB) cho ${srcName} offline.`}
                       </div>
                       <button
@@ -4197,7 +4221,11 @@ export default function App() {
                 {isLiveSession && <span className="dot pulse" style={{ color: "var(--accent)" }} />}
                 <span>
                   {isLiveSession
-                    ? `Đang nghe (${shortLangName(sourceLang, currentSrcObj?.name_vi)}) & dịch trực tiếp...`
+                    ? sourceLang === "auto"
+                      ? detectedSourceLabel || detectedSourceLang
+                        ? `Đang nghe (Tự nhận: ${detectedSourceLabel || shortLangName(detectedSourceLang)}) & dịch trực tiếp...`
+                        : "Đang tự nhận diện ngôn ngữ nói (99 NN) & dịch trực tiếp..."
+                      : `Đang nghe (${shortLangName(sourceLang, currentSrcObj?.name_vi)}) & dịch trực tiếp...`
                     : `${currentSrcObj?.name_vi || sourceLang} → ${currentTgtObj?.name_vi || targetLang}`}
                 </span>
               </span>

@@ -43,6 +43,7 @@ import {
   getInitialTheme,
   groupEntriesByParagraph,
   isTauriEnv,
+  shortLangName,
 } from "./types";
 
 function getInitialOverlayLayout(): OverlayLayoutMode {
@@ -93,6 +94,30 @@ function renderLiveTarget(partial: PartialEvent) {
   );
 }
 
+const OVERLAY_LED_SOURCE_KEY = "polyvoice_led_show_source";
+
+function getInitialLedShowSource(): boolean {
+  try {
+    const saved = localStorage.getItem(OVERLAY_LED_SOURCE_KEY);
+    if (saved === "0" || saved === "false") return false;
+  } catch {
+    // ignore
+  }
+  return true;
+}
+
+function tailClipLiveText(raw: string, maxChars = 160): string {
+  const s = (raw || "").trim();
+  if (s.length <= maxChars) return s;
+  const tail = s.slice(-maxChars);
+  // Trim cleanly at word boundary for spaced scripts so the leading word isn't sliced in half
+  const firstSpace = tail.indexOf(" ");
+  if (firstSpace > 0 && firstSpace < 24) {
+    return `… ${tail.slice(firstSpace + 1).trimStart()}`;
+  }
+  return `…${tail.trimStart()}`;
+}
+
 export default function OverlayWindow() {
   const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState<EngineStatus | null>(null);
@@ -118,11 +143,15 @@ export default function OverlayWindow() {
     "Tạm nghỉ — Phiên dịch hội nghị sẽ tiếp tục trong giây lát"
   );
   const [showCornerQr, setShowCornerQr] = useState(false);
+  const [showLedSource, setShowLedSource] = useState<boolean>(() => getInitialLedShowSource());
+  const [detectedSourceLang, setDetectedSourceLang] = useState<string>("");
+  const [detectedSourceLabel, setDetectedSourceLabel] = useState<string>("");
   const [audienceInfo, setAudienceInfo] = useState<AudienceInfo | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const partialRef = useRef<PartialEvent | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const ledScrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedToBottomRef = useRef(true);
   const scrollAnimRef = useRef<number | null>(null);
   const hideBarTimerRef = useRef<number | null>(null);
@@ -137,7 +166,7 @@ export default function OverlayWindow() {
       .catch(() => {});
   }, []);
 
-  // Persist overlay layout preference
+  // Persist overlay layout & LED source-line preferences
   useEffect(() => {
     try {
       localStorage.setItem(OVERLAY_LAYOUT_KEY, layoutMode);
@@ -145,6 +174,24 @@ export default function OverlayWindow() {
       // ignore
     }
   }, [layoutMode]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(OVERLAY_LED_SOURCE_KEY, showLedSource ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  }, [showLedSource]);
+
+  // Keep LED stage sentences scrolled cleanly to the newest finalized row when text wraps tall
+  useEffect(() => {
+    if (layoutMode !== "led-stage") return;
+    const node = ledScrollRef.current;
+    if (!node) return;
+    requestAnimationFrame(() => {
+      node.scrollTop = node.scrollHeight;
+    });
+  }, [entries, fontSize, showLedSource, layoutMode]);
 
   // Sync theme with main window & allow independent Light/Dark switch for projector rooms
   useEffect(() => {
@@ -221,6 +268,7 @@ export default function OverlayWindow() {
           .then((d) => {
             if (d) {
               setStatus(d);
+              if (typeof d.detected_source_lang === "string") setDetectedSourceLang(d.detected_source_lang);
               if (typeof d.display_frozen === "boolean") setDisplayFrozen(d.display_frozen);
               if (d.display_freeze_message) setFreezeMessage(d.display_freeze_message);
             }
@@ -234,6 +282,10 @@ export default function OverlayWindow() {
           const msg = JSON.parse(ev.data);
           if (msg.type === "status") {
             setStatus(msg.data);
+            if (typeof msg.data?.detected_source_lang === "string") {
+              setDetectedSourceLang(msg.data.detected_source_lang);
+              if (!msg.data.detected_source_lang) setDetectedSourceLabel("");
+            }
             if (!msg.data?.listening) {
               partialRef.current = null;
               setPartial(null);
@@ -245,6 +297,11 @@ export default function OverlayWindow() {
             if (msg.data?.display_freeze_message) {
               setFreezeMessage(msg.data.display_freeze_message);
             }
+          } else if (msg.type === "detected_lang") {
+            const code = String(msg.data?.detected_source_lang || "");
+            const lbl = String(msg.data?.name_vi || code);
+            setDetectedSourceLang(code);
+            setDetectedSourceLabel(lbl);
           } else if (msg.type === "display_freeze") {
             setDisplayFrozen(Boolean(msg.data?.frozen));
             if (msg.data?.message) setFreezeMessage(msg.data.message);
@@ -496,7 +553,13 @@ export default function OverlayWindow() {
 
   const groupedEntries = useMemo(() => groupEntriesByParagraph(entries), [entries]);
 
-  const srcLabel = status?.source_lang_meta?.name_vi || "Tiếng Việt";
+  const isAutoSrc = status?.config?.source_lang === "auto";
+  const detectedNice = detectedSourceLabel || (detectedSourceLang ? shortLangName(detectedSourceLang) : "");
+  const srcLabel = isAutoSrc
+    ? detectedNice
+      ? `Tự nhận (${detectedNice})`
+      : "Tự nhận diện"
+    : status?.source_lang_meta?.name_vi || "Tiếng Việt";
   const tgtLabel = status?.target_lang_meta?.name_vi || status?.config?.target_lang || "Tiếng Anh";
 
   const toggleDisplayFreeze = async () => {
@@ -690,6 +753,20 @@ export default function OverlayWindow() {
                 <Contrast size={12} /> {Math.round(opacity * 100)}%
               </button>
 
+              {layoutMode === "led-stage" && (
+                <button
+                  className={`btn sm ${showLedSource ? "info-active" : "overlay-ctrl-btn"}`}
+                  title={
+                    showLedSource
+                      ? "Đang hiển thị cả câu gốc nhỏ phía trên bản dịch LED — bấm để chỉ hiện bản dịch"
+                      : "Bật hiển thị dòng lời nói gốc nhỏ ngay trên bản dịch LED"
+                  }
+                  onClick={() => setShowLedSource((v) => !v)}
+                >
+                  <Mic size={12} /> {showLedSource ? "Gốc: Bật" : "Gốc: Tắt"}
+                </button>
+              )}
+
               <button
                 className={`btn sm ${showCornerQr ? "info-active" : "overlay-ctrl-btn"}`}
                 title="Hiện/ẩn mã QR nhỏ góc màn LED cho đại biểu quét xem trên điện thoại"
@@ -777,7 +854,7 @@ export default function OverlayWindow() {
         >
           {layoutMode === "led-stage" ? (
             <div className="overlay-led-container">
-              <div className="overlay-led-sentences">
+              <div className="overlay-led-sentences" ref={ledScrollRef}>
                 {entries.length === 0 ? (
                   <div className="overlay-empty-single">
                     <div className="overlay-empty-card wide">
@@ -789,13 +866,14 @@ export default function OverlayWindow() {
                         <span className="overlay-empty-pill info">{srcLabel} → {tgtLabel}</span>
                       </div>
                       <p className="overlay-empty-desc">
-                        Bản dịch chỉ hiện khi chốt tròn câu (đứng yên 100%, không nhảy sửa chữ), lưu 3–4 câu gần nhất cỡ chữ lớn dễ đọc từ hàng ghế cuối.
+                        Bản dịch đứng yên khi chốt trọn câu (không nhảy sửa chữ), kèm dòng lời nói gốc và thanh nghe sống mở rộng ở đáy màn hình.
                       </p>
                     </div>
                   </div>
                 ) : (
                   (() => {
-                    const visible = entries.slice(-4);
+                    const maxRows = showLedSource ? 3 : 4;
+                    const visible = entries.slice(-maxRows);
                     const total = visible.length;
                     return visible.map((item, idx) => {
                       const distFromLatest = total - 1 - idx;
@@ -807,9 +885,17 @@ export default function OverlayWindow() {
                           : distFromLatest === 2
                           ? "prev-2"
                           : "prev-3";
+                      const tgtSize =
+                        distFromLatest === 0 ? fontSize : Math.max(18, Math.round(fontSize * 0.82));
+                      const srcSize = Math.max(14, Math.round(tgtSize * 0.52));
                       return (
                         <div className={`overlay-led-item ${tierClass}`} key={item.id}>
-                          <div className="overlay-led-tgt" style={{ fontSize: distFromLatest === 0 ? fontSize : Math.max(18, Math.round(fontSize * 0.84)) }}>
+                          {showLedSource && item.source_text && (
+                            <div className="overlay-led-src" style={{ fontSize: srcSize }}>
+                              {item.source_text}
+                            </div>
+                          )}
+                          <div className="overlay-led-tgt" style={{ fontSize: tgtSize }}>
                             {item.translated_text || "—"}
                           </div>
                         </div>
@@ -819,7 +905,7 @@ export default function OverlayWindow() {
                 )}
               </div>
 
-              {/* Fixed Bottom Live Source Bar — proves mic pickup live WITHOUT ever jittering translations above */}
+              {/* Fixed Bottom Live Source Bar — wraps cleanly up to 2 lines & follows the latest spoken tail */}
               <div className={`overlay-led-livebar ${connected && (partial?.source_text || status?.listening) ? "active" : ""}`}>
                 <span className={`overlay-led-dot ${connected && status?.listening ? "live" : ""}`} aria-hidden="true" />
                 <span className="overlay-led-live-label">
@@ -832,8 +918,13 @@ export default function OverlayWindow() {
                     : "Sẵn sàng hội trường"}
                 </span>
                 {connected && partial?.source_text && (
-                  <span className="overlay-led-live-src">{partial.source_text}</span>
+                  <span className="overlay-led-live-src">{tailClipLiveText(partial.source_text, 160)}</span>
                 )}
+                {isAutoSrc && detectedNice ? (
+                  <span className="overlay-led-lang-tag">
+                    Tự nhận: {detectedNice}
+                  </span>
+                ) : null}
                 {status?.slide_context?.enabled && status?.slide_context?.active_slide_index ? (
                   <span className="overlay-led-slide-tag">
                     Slide #{status.slide_context.active_slide_index}

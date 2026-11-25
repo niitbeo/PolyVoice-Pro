@@ -37,6 +37,7 @@ class ASROutput:
     text: str
     latency_ms: float
     provider: str = "CPUExecutionProvider"
+    detected_lang: str = ""  # NLLB-200 code when ASR runs in auto-LID mode (e.g. "eng_Latn", "jpn_Jpan")
 
 
 def _format_sentence(raw: str) -> str:
@@ -1964,13 +1965,19 @@ class WhisperTurboStreamingEngine:
         self._language = self._normalize_lang(language)
         self.active_provider = f"whisper-turbo-{self._language or 'auto'}"
         self._recognizer = self._build_recognizer(self._language)
+        self._slid: Optional[sherpa_onnx.SpokenLanguageIdentification] = None
+        self._slid_failed: bool = False
         self._vad_window = 512
+        self._pad = np.zeros(int(self.sample_rate * 0.25), dtype=np.float32)
         self._vad = self._build_vad()
         self._vad_buf = np.zeros(0, dtype=np.float32)
+        self._preroll: deque[np.ndarray] = deque(maxlen=10)  # ~320ms pre-roll so onset syllables are never clipped
+        self._was_speaking: bool = False
         self._active_chunks: list[np.ndarray] = []
         self._active_samples: int = 0
         self._last_partial_ts: float = 0.0
         self._last_partial: str = ""
+        self._last_detected_nllb: str = ""
 
     @staticmethod
     def _pick_file(d: Path, preferred: str, pattern: str) -> Path:
@@ -1985,7 +1992,7 @@ class WhisperTurboStreamingEngine:
     @staticmethod
     def _normalize_lang(lang: str) -> str:
         code = (lang or "").strip()
-        if not code:
+        if not code or code.lower() == "auto":
             return ""
         if "_" in code:
             from languages import get_whisper_lang_code
@@ -2008,11 +2015,11 @@ class WhisperTurboStreamingEngine:
     def _build_vad(self) -> sherpa_onnx.VoiceActivityDetector:
         silero = sherpa_onnx.SileroVadModelConfig(
             model=str(self._vad_path),
-            threshold=0.45,
+            threshold=0.42,
             min_silence_duration=0.45,
-            min_speech_duration=0.25,
+            min_speech_duration=0.22,
             window_size=self._vad_window,
-            max_speech_duration=7.2,
+            max_speech_duration=8.5,
         )
         cfg = sherpa_onnx.VadModelConfig(
             silero_vad=silero,
@@ -2022,6 +2029,30 @@ class WhisperTurboStreamingEngine:
             debug=False,
         )
         return sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=60.0)
+
+    def _ensure_slid_locked(self) -> Optional[sherpa_onnx.SpokenLanguageIdentification]:
+        if self._slid is not None or self._slid_failed:
+            return self._slid
+        if not hasattr(sherpa_onnx, "SpokenLanguageIdentification"):
+            self._slid_failed = True
+            return None
+        try:
+            wcfg = sherpa_onnx.SpokenLanguageIdentificationWhisperConfig(
+                encoder=str(self._encoder),
+                decoder=str(self._decoder),
+                tail_paddings=-1,
+            )
+            scfg = sherpa_onnx.SpokenLanguageIdentificationConfig(
+                whisper=wcfg,
+                num_threads=self._num_threads,
+                debug=False,
+                provider="cpu",
+            )
+            self._slid = sherpa_onnx.SpokenLanguageIdentification(scfg)
+        except Exception:
+            self._slid_failed = True
+            self._slid = None
+        return self._slid
 
     def set_language(self, lang_code: str) -> None:
         iso = self._normalize_lang(lang_code)
@@ -2033,6 +2064,7 @@ class WhisperTurboStreamingEngine:
             self._language = iso
             self.active_provider = f"whisper-turbo-{iso or 'auto'}"
             self._last_partial = ""
+            self._last_detected_nllb = ""
 
     def is_speech_active(self) -> bool:
         with self._lock:
@@ -2042,18 +2074,22 @@ class WhisperTurboStreamingEngine:
         with self._lock:
             self._vad.reset()
             self._vad_buf = np.zeros(0, dtype=np.float32)
+            self._preroll.clear()
+            self._was_speaking = False
             self._active_chunks.clear()
             self._active_samples = 0
             self._last_partial_ts = 0.0
             self._last_partial = ""
             self._last_decode_ms = 0.0
+            self._last_detected_nllb = ""
 
-    def _decode_f32_locked(self, samples_f32: np.ndarray) -> str:
+    def _decode_f32_with_lang_locked(self, samples_f32: np.ndarray) -> tuple[str, str]:
         if samples_f32 is None or len(samples_f32) < int(self.sample_rate * 0.30):
-            return ""
+            return "", ""
         rms = float(np.sqrt(np.mean(np.square(samples_f32))))
         if rms < 0.006:
-            return ""
+            return "", ""
+        padded = np.concatenate((self._pad, samples_f32, self._pad))
         stream = self._recognizer.create_stream()
         # Non-Latin scripts (Japanese, Chinese, Thai, Hindi, Arabic) expand to 2-3 BPE byte tokens
         # per char; keep 30 tok/s for high-accuracy scripts, but cap low-resource scripts (lo/km/my)
@@ -2061,9 +2097,43 @@ class WhisperTurboStreamingEngine:
         if hasattr(stream, "set_option"):
             tps = "18" if self._language in ("lo", "km", "my") else "30"
             stream.set_option("max_tokens_per_second", tps)
-        stream.accept_waveform(self.sample_rate, samples_f32)
+        stream.accept_waveform(self.sample_rate, padded)
         self._recognizer.decode_stream(stream)
-        return _clean_whisper_text(stream.result.text or "", rms=rms)
+        raw_txt = stream.result.text or ""
+        raw_iso = str(getattr(stream.result, "lang", "") or "").strip()
+
+        detected_nllb = ""
+        if not self._language:
+            from languages import infer_text_nllb_lang
+
+            if not raw_iso and raw_txt.strip():
+                slid = self._ensure_slid_locked()
+                if slid is not None:
+                    try:
+                        st_lid = slid.create_stream()
+                        st_lid.accept_waveform(self.sample_rate, padded)
+                        raw_iso = str(slid.compute(st_lid) or "").strip()
+                    except Exception:
+                        pass
+            detected_nllb = infer_text_nllb_lang(raw_txt, raw_iso)
+            self._last_detected_nllb = detected_nllb
+        else:
+            from languages import whisper_lang_to_nllb
+
+            detected_nllb = whisper_lang_to_nllb(self._language, "")
+
+        cleaned = _clean_whisper_text(raw_txt, rms=rms)
+        if not cleaned:
+            return "", detected_nllb
+        if detected_nllb == "jpn_Jpan":
+            cleaned = _RE_JA_INTERCHAR_SPACE.sub("", cleaned)
+        elif detected_nllb == "kor_Hang":
+            cleaned = _apply_ko_itn(cleaned)
+        return cleaned, detected_nllb
+
+    def _decode_f32_locked(self, samples_f32: np.ndarray) -> str:
+        txt, _ = self._decode_f32_with_lang_locked(samples_f32)
+        return txt
 
     def accept_pcm(self, pcm_s16: np.ndarray) -> ASROutput:
         t0 = time.perf_counter()
@@ -2081,23 +2151,35 @@ class WhisperTurboStreamingEngine:
                 win = buf[pos : pos + self._vad_window]
                 self._vad.accept_waveform(win)
                 if self._vad.is_speech_detected():
+                    if not self._was_speaking:
+                        self._was_speaking = True
+                        while self._preroll:
+                            pre = self._preroll.popleft()
+                            self._active_chunks.append(pre)
+                            self._active_samples += len(pre)
                     self._active_chunks.append(win)
                     self._active_samples += self._vad_window
-                    # Cap flush-fallback buffer at 8s
-                    if self._active_samples > self.sample_rate * 8:
+                    # Cap flush-fallback buffer at 9s
+                    if self._active_samples > self.sample_rate * 9:
                         drop = self._active_chunks.pop(0)
                         self._active_samples -= len(drop)
+                else:
+                    self._was_speaking = False
+                    self._preroll.append(win)
                 pos += self._vad_window
             self._vad_buf = buf[pos:].copy() if pos < n else np.zeros(0, dtype=np.float32)
 
             finals: list[str] = []
+            det_lang = ""
             while not self._vad.empty():
                 seg = self._vad.front
                 seg_samples = np.array(seg.samples, dtype=np.float32, copy=True)
                 self._vad.pop()
-                txt = self._decode_f32_locked(seg_samples)
+                txt, lang_code = self._decode_f32_with_lang_locked(seg_samples)
                 if txt:
                     finals.append(txt)
+                    if lang_code:
+                        det_lang = lang_code
                 # Guard against CPU backlog hangs on slow/low-resource decodes: if one segment already
                 # took >=2.5s, drain stale queued VAD segments instead of freezing stop/switch for 20s!
                 if (time.perf_counter() - t0) >= 2.5:
@@ -2108,14 +2190,23 @@ class WhisperTurboStreamingEngine:
             if finals:
                 self._active_chunks.clear()
                 self._active_samples = 0
+                self._preroll.clear()
+                self._was_speaking = False
                 self._last_partial = ""
                 self._last_partial_ts = 0.0
                 ms = round((time.perf_counter() - t0) * 1000.0, 1)
-                return ASROutput("final", " ".join(finals).strip(), ms, self.active_provider)
+                joiner = "" if det_lang in ("jpn_Jpan", "zho_Hans", "zho_Hant", "yue_Hant") else " "
+                return ASROutput(
+                    "final",
+                    joiner.join(finals).strip(),
+                    ms,
+                    self.active_provider,
+                    detected_lang=det_lang if not self._language else "",
+                )
 
             # Never run synchronous blocking Whisper preview decodes inside `accept_pcm()` on CPU:
             # Whisper encoder always pads to 30s (~1.5-2.5s/call), so preview decodes starve the
-            # audio thread and cause real-time freezes. Crisp Silero VAD (0.45s silence / 7.2s cap)
+            # audio thread and cause real-time freezes. Crisp Silero VAD (0.45s silence / 8.5s cap)
             # already streams completed sentences smoothly at <0.5x real-time!
             ms = round((time.perf_counter() - t0) * 1000.0, 1)
             return ASROutput("none", "", ms, self.active_provider)
@@ -2125,6 +2216,7 @@ class WhisperTurboStreamingEngine:
         with self._lock:
             self._vad.flush()
             finals: list[str] = []
+            det_lang = ""
             if not self._vad.empty():
                 # Decode at most the latest buffered VAD segment on stop/switch so teardown stays snappy
                 seg_samples = None
@@ -2133,23 +2225,36 @@ class WhisperTurboStreamingEngine:
                     seg_samples = np.array(seg.samples, dtype=np.float32, copy=True)
                     self._vad.pop()
                 if seg_samples is not None and self._language not in ("lo", "km", "my"):
-                    txt = self._decode_f32_locked(seg_samples)
+                    txt, lang_code = self._decode_f32_with_lang_locked(seg_samples)
                     if txt:
                         finals.append(txt)
+                        if lang_code:
+                            det_lang = lang_code
             elif self._active_chunks and self._language not in ("lo", "km", "my"):
                 tail_pcm = np.concatenate(self._active_chunks)[-(self.sample_rate * 4) :]
-                txt = self._decode_f32_locked(tail_pcm)
+                txt, lang_code = self._decode_f32_with_lang_locked(tail_pcm)
                 if txt:
                     finals.append(txt)
+                    if lang_code:
+                        det_lang = lang_code
             self._vad.reset()
             self._vad_buf = np.zeros(0, dtype=np.float32)
+            self._preroll.clear()
+            self._was_speaking = False
             self._active_chunks.clear()
             self._active_samples = 0
             self._last_partial = ""
             self._last_partial_ts = 0.0
             ms = round((time.perf_counter() - t0) * 1000.0, 1)
             if finals:
-                return ASROutput("final", " ".join(finals).strip(), ms, self.active_provider)
+                joiner = "" if det_lang in ("jpn_Jpan", "zho_Hans", "zho_Hant", "yue_Hant") else " "
+                return ASROutput(
+                    "final",
+                    joiner.join(finals).strip(),
+                    ms,
+                    self.active_provider,
+                    detected_lang=det_lang if not self._language else "",
+                )
             return ASROutput("none", "", ms, self.active_provider)
 
     def transcribe_pcm_isolated(self, pcm_s16: np.ndarray, language: Optional[str] = None) -> str:
@@ -2345,14 +2450,89 @@ def _apply_ko_itn(text: str) -> str:
     return s
 
 
-def _clean_ja_moonshine_text(raw: str) -> str:
-    """Normalize Moonshine-v2 Japanese output: remove stray CJK inter-char spaces & loops."""
+_JA_MOONSHINE_HALLUCINATION_SUBSTRS: tuple[str, ...] = (
+    # Memorized Aozora Bunko audiobook sentences emitted by Moonshine-Base-JA on non-Japanese / noisy audio
+    "彼は彼の友に揶揄せられ",
+    "まず手初めに吾輩を写生",
+    "向うに小さな島が一つ見",
+    "王も人民も、数学と音楽のことのほかは",
+    "老人が死んで葬式が出るから",
+    # Truncated YouTube outro hallucinations
+    "ご視聴ありがとう",
+    "チャンネル登録よろしく",
+    "チャンネル登録お願い",
+)
+_RE_JA_FULLWIDTH_GARBLE = re.compile(r"[Ａ-Ｚａ-ｚ][Ａ-Ｚａ-ｚ０-９．,，・\s]{5,}")
+_RE_JA_CLAUSE_LOOP_2X = re.compile(r"(.{5,40}?)(?:[、。\s]*\1){1,}")
+_RE_JA_SHORT_LOOP_3X = re.compile(r"(.{2,6}?)(?:[、。\s]*\1){2,}")
+
+
+def _clean_ja_moonshine_text(raw: str, rms: float = 1.0) -> str:
+    """
+    Normalize & harden Moonshine-v2 Japanese output:
+    - Remove stray CJK inter-char spaces & run Whisper hallucination/energy filters with real RMS
+    - Filter Aozora Bunko / YouTube memorization hallucinations emitted on noisy or non-JA hall audio
+    - Strip fullwidth Latin garble (e.g. `Ｔｗａｂｔｆｒｅｅ...`, `Ｍｎｙｈｂｔｇｖ`)
+    - Collapse 2x clause loops (`このようなことをしています。このようなことをしています。`)
+      and 3x short-word loops (`私たちは、私たちは、私たちは`, `筆の筆の筆の筆`) + truncated tail echoes
+    """
     txt = (raw or "").strip()
     if not txt:
         return ""
     txt = _RE_JA_INTERCHAR_SPACE.sub("", txt)
-    txt = _clean_whisper_text(txt, rms=1.0)
-    return txt
+    txt = _clean_whisper_text(txt, rms=rms)
+    if not txt:
+        return ""
+
+    # 1) Strip known Moonshine-JA stock audiobook / YouTube hallucinations
+    for h in _JA_MOONSHINE_HALLUCINATION_SUBSTRS:
+        if h in txt:
+            # Remove the entire clause containing the hallucination
+            clauses = re.split(r"(?<=[。！？\n])|\s+", txt)
+            kept = [c for c in clauses if c and h not in c]
+            txt = " ".join(kept).strip()
+            if not txt:
+                return ""
+
+    # 2) Strip fullwidth Latin garble emitted when Moonshine-JA hears non-Japanese speech
+    txt = _RE_JA_FULLWIDTH_GARBLE.sub(" ", txt)
+    txt = " ".join(txt.split()).strip(" 、。・,.")
+    if not txt:
+        return ""
+    # Reject pure fullwidth/ASCII short nonsense like "Ｆｆｊ", "Ｍｎｙｈｂｔｇｖ"
+    non_punct = re.sub(r"[\s「」『』()（）.,、。！？!?・\-]+", "", txt)
+    if non_punct and all("\uff21" <= ch <= "\uff5a" or "\uff10" <= ch <= "\uff19" for ch in non_punct):
+        return ""
+
+    # 3) Collapse Japanese 2x clause loops and 3x short-token loops
+    for _ in range(3):
+        prev = txt
+        txt = _RE_JA_SHORT_LOOP_3X.sub(r"\1", txt)
+        m2 = _RE_JA_CLAUSE_LOOP_2X.search(txt)
+        if m2:
+            unit = m2.group(1).strip()
+            txt = _RE_JA_CLAUSE_LOOP_2X.sub(r"\1", txt)
+            if len(unit) >= 5:
+                idx_end = txt.rfind(unit)
+                if idx_end >= 0:
+                    tail = txt[idx_end + len(unit) :].lstrip(" 、。\t")
+                    if len(tail) >= 3 and unit.startswith(tail):
+                        txt = txt[: idx_end + len(unit)].strip()
+        if txt == prev:
+            break
+
+    # 4) Strip duplicate truncated tail echo even after single occurrence (e.g. "お疲れ様です。お疲れ")
+    for sep in ("。", "、", " "):
+        if sep in txt:
+            head, tail = txt.rsplit(sep, 1)
+            head_s, tail_s = head.strip(), tail.strip()
+            if len(tail_s) >= 2 and len(head_s) >= len(tail_s) + 2:
+                last_clause = re.split(r"[。！？\s]+", head_s)[-1].strip()
+                if last_clause.startswith(tail_s):
+                    txt = (head_s + ("。" if sep == "。" else "")).strip()
+                    break
+
+    return txt.strip()
 
 
 class MoonshineJaStreamingEngine:
@@ -2361,8 +2541,8 @@ class MoonshineJaStreamingEngine:
     + `Silero VAD v5` (2.2 MB, 0% GPU, Windows x64 & macOS arm64):
     - 25x-40x faster than Whisper-Large-v3-Turbo (~90-200 ms on CPU vs 3,500-5,700 ms!).
     - Streams live Japanese partials every 0.50s while the speaker talks (zero 12-15s dead screen!).
-    - Uses 0.35s silence pre/post padding so onset/offset Japanese syllables are never clipped.
-    - Native Japanese punctuation (、。？「」) with zero Whisper 30s-padding or repetition stalls.
+    - Uses 320ms pre-roll + 0.35s silence padding so onset/offset Japanese syllables are never clipped.
+    - Native Japanese punctuation (、。？「」) with hardened hallucination & repetition loop filtering.
     """
 
     def __init__(
@@ -2396,6 +2576,8 @@ class MoonshineJaStreamingEngine:
         self._pad = np.zeros(int(self.sample_rate * 0.35), dtype=np.float32)
         self._vad = self._build_vad()
         self._vad_buf = np.zeros(0, dtype=np.float32)
+        self._preroll: deque[np.ndarray] = deque(maxlen=10)  # ~320ms pre-roll so onset syllables are never clipped
+        self._was_speaking: bool = False
         self._active_chunks: list[np.ndarray] = []
         self._active_samples: int = 0
         self._last_partial_ts: float = 0.0
@@ -2404,11 +2586,11 @@ class MoonshineJaStreamingEngine:
     def _build_vad(self) -> sherpa_onnx.VoiceActivityDetector:
         silero = sherpa_onnx.SileroVadModelConfig(
             model=str(self._vad_path),
-            threshold=0.35,
-            min_silence_duration=0.40,
-            min_speech_duration=0.20,
+            threshold=0.45 if self._language == "ja" else 0.38,
+            min_silence_duration=0.42,
+            min_speech_duration=0.22,
             window_size=self._vad_window,
-            max_speech_duration=6.2,
+            max_speech_duration=9.5,
         )
         cfg = sherpa_onnx.VadModelConfig(
             silero_vad=silero,
@@ -2427,6 +2609,8 @@ class MoonshineJaStreamingEngine:
         with self._lock:
             self._vad.reset()
             self._vad_buf = np.zeros(0, dtype=np.float32)
+            self._preroll.clear()
+            self._was_speaking = False
             self._active_chunks.clear()
             self._active_samples = 0
             self._last_partial_ts = 0.0
@@ -2437,7 +2621,7 @@ class MoonshineJaStreamingEngine:
         if samples_f32 is None or len(samples_f32) < int(self.sample_rate * 0.30):
             return ""
         rms = float(np.sqrt(np.mean(np.square(samples_f32))))
-        if rms < 0.0055:
+        if rms < 0.0065:
             return ""
         padded = np.concatenate((self._pad, samples_f32, self._pad))
         stream = self._recognizer.create_stream()
@@ -2445,8 +2629,8 @@ class MoonshineJaStreamingEngine:
         self._recognizer.decode_stream(stream)
         raw_txt = stream.result.text or ""
         if self._language == "ja":
-            return _clean_ja_moonshine_text(raw_txt)
-        cleaned = _clean_whisper_text(raw_txt, rms=1.0)
+            return _clean_ja_moonshine_text(raw_txt, rms=rms)
+        cleaned = _clean_whisper_text(raw_txt, rms=rms)
         if self._language == "ko":
             return _apply_ko_itn(cleaned)
         return cleaned
@@ -2467,11 +2651,20 @@ class MoonshineJaStreamingEngine:
                 win = buf[pos : pos + self._vad_window]
                 self._vad.accept_waveform(win)
                 if self._vad.is_speech_detected():
+                    if not self._was_speaking:
+                        self._was_speaking = True
+                        while self._preroll:
+                            pre = self._preroll.popleft()
+                            self._active_chunks.append(pre)
+                            self._active_samples += len(pre)
                     self._active_chunks.append(win)
                     self._active_samples += self._vad_window
-                    if self._active_samples > self.sample_rate * 8:
+                    if self._active_samples > self.sample_rate * 10:
                         drop = self._active_chunks.pop(0)
                         self._active_samples -= len(drop)
+                else:
+                    self._was_speaking = False
+                    self._preroll.append(win)
                 pos += self._vad_window
             self._vad_buf = buf[pos:].copy() if pos < n else np.zeros(0, dtype=np.float32)
 
@@ -2487,6 +2680,8 @@ class MoonshineJaStreamingEngine:
             if finals:
                 self._active_chunks.clear()
                 self._active_samples = 0
+                self._preroll.clear()
+                self._was_speaking = False
                 self._last_partial = ""
                 self._last_partial_ts = 0.0
                 ms = round((time.perf_counter() - t0) * 1000.0, 1)
@@ -2530,6 +2725,8 @@ class MoonshineJaStreamingEngine:
                     finals.append(txt)
             self._vad.reset()
             self._vad_buf = np.zeros(0, dtype=np.float32)
+            self._preroll.clear()
+            self._was_speaking = False
             self._active_chunks.clear()
             self._active_samples = 0
             self._last_partial = ""

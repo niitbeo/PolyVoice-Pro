@@ -277,6 +277,7 @@ export interface EngineStatus {
   listening: boolean;
   active_asr_label: string;
   remote_asr_label?: string;
+  detected_source_lang?: string;
   asr_loaded: boolean;
   pass2_loaded?: boolean;
   hotwords_active?: number;
@@ -481,6 +482,7 @@ const SHORT_LANG_LABELS: Record<string, string> = {
   rus_Cyrl: "Nga",
   ind_Latn: "Indo",
   mya_Mymr: "Myanmar",
+  auto: "Tự nhận",
 };
 
 export function shortLangName(code: string, fallback?: string): string {
