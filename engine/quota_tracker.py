@@ -91,7 +91,7 @@ class CloudQuotaManager:
 
     def _default_config(self) -> dict[str, Any]:
         return {
-            "provider": "azure",
+            "provider": "soniox",
             "hard_cap_enabled": True,
             "draft_offline": True,
             "providers": {

@@ -310,15 +310,13 @@ export default function App() {
   const [appliedEvalIds, setAppliedEvalIds] = useState<Record<string, boolean>>({});
   const [savedGlossKeys, setSavedGlossKeys] = useState<Record<string, boolean>>({});
 
-  // Official Cloud API Modal (Google Cloud / Microsoft Azure F0 / Google Gemini + $0 Quota Cap)
+  // Official Cloud AI Modal (Soniox Real-Time & Google Gemini)
   const [cloudOpen, setCloudOpen] = useState(false);
   const [cloudStatus, setCloudStatus] = useState<CloudApiStatus | null>(null);
-  const [cloudTab, setCloudTab] = useState<CloudProviderId>("azure");
+  const [cloudTab, setCloudTab] = useState<CloudProviderId>("soniox");
   const [cloudKeyInput, setCloudKeyInput] = useState("");
-  const [cloudRegion, setCloudRegion] = useState("southeastasia");
-  const [cloudEndpoint, setCloudEndpoint] = useState("https://api.cognitive.microsofttranslator.com");
-  const [cloudModel, setCloudModel] = useState("gemini-2.5-flash");
-  const [cloudLimit, setCloudLimit] = useState(1950000);
+  const [cloudModel, setCloudModel] = useState("stt-rt-v6");
+  const [cloudLimit, setCloudLimit] = useState(10);
   const [cloudHardCap, setCloudHardCap] = useState(true);
   const [cloudDraftOffline, setCloudDraftOffline] = useState(true);
   const [cloudSaving, setCloudSaving] = useState(false);
@@ -1706,16 +1704,15 @@ export default function App() {
   };
 
   const syncCloudFormForTab = (data: CloudApiStatus, pid: CloudProviderId) => {
-    const p = data.providers[pid];
-    setCloudTab(pid);
+    const safePid: CloudProviderId = pid === "gemini" ? "gemini" : "soniox";
+    const p = data.providers[safePid];
+    setCloudTab(safePid);
     setCloudKeyInput("");
-    setCloudRegion(p?.region || "southeastasia");
-    setCloudEndpoint(p?.endpoint || "https://api.cognitive.microsofttranslator.com");
-    setCloudModel(p?.model || (pid === "soniox" ? "stt-rt-v6" : "gemini-2.5-flash"));
+    setCloudModel(p?.model || (safePid === "soniox" ? "stt-rt-v6" : "gemini-2.5-flash"));
     setCloudLimit(
-      pid === "soniox"
+      safePid === "soniox"
         ? Math.max(1, Math.round((p?.monthly_limit || 36000) / 3600))
-        : p?.monthly_limit || (pid === "azure" ? 1950000 : pid === "google" ? 480000 : 5000000)
+        : p?.monthly_limit || 5000000
     );
     setCloudHardCap(Boolean(data.hard_cap_enabled));
     setCloudDraftOffline(Boolean(data.draft_offline));
@@ -1745,7 +1742,13 @@ export default function App() {
       if (res.ok) {
         const data: CloudApiStatus = await res.json();
         setCloudStatus(data);
-        syncCloudFormForTab(data, preferredTab || data.provider || "azure");
+        const initTab: CloudProviderId =
+          preferredTab === "gemini" || preferredTab === "soniox"
+            ? preferredTab
+            : data.provider === "gemini"
+            ? "gemini"
+            : "soniox";
+        syncCloudFormForTab(data, initTab);
       }
     } catch (e) {
       setErrorMsg(`Không thể tải cấu hình Cloud API: ${String(e)}`);
@@ -1768,10 +1771,6 @@ export default function App() {
       };
       if (cloudKeyInput.trim()) {
         body.api_key = cloudKeyInput.trim();
-      }
-      if (cloudTab === "azure") {
-        body.region = cloudRegion.trim();
-        body.endpoint = cloudEndpoint.trim();
       }
       if (cloudTab === "gemini") {
         body.model = cloudModel.trim() || "gemini-2.5-flash";
@@ -1847,8 +1846,6 @@ export default function App() {
         body: JSON.stringify({
           provider: cloudTab,
           api_key: cloudKeyInput.trim() || undefined,
-          region: cloudTab === "azure" ? cloudRegion.trim() : undefined,
-          endpoint: cloudTab === "azure" ? cloudEndpoint.trim() : undefined,
           model: cloudTab === "gemini" || cloudTab === "soniox" ? cloudModel.trim() : undefined,
           target_lang: targetLang === "vie_Latn" ? "eng_Latn" : targetLang,
         }),
@@ -3628,8 +3625,8 @@ export default function App() {
                   disabled={!connected}
                   title={
                     status?.cloud_api?.active_ready
-                      ? "Bật dịch Cloud API chính thức (Soniox Real-Time / Azure / Google / Gemini)"
-                      : "Bấm để cấu hình API Key Soniox Real-Time / Azure / Google / Gemini"
+                      ? "Bật dịch Cloud API chính thức (Soniox Real-Time hoặc Google Gemini)"
+                      : "Bấm để cấu hình API Key Soniox Real-Time hoặc Google Gemini"
                   }
                 >
                   <Cloud size={12} /> Cloud
@@ -3639,7 +3636,7 @@ export default function App() {
                 className={`btn sm icon-only ${cloudOpen ? "active" : ""}`}
                 onClick={() => handleOpenCloudModal()}
                 disabled={!connected}
-                title="Cấu hình Cloud API Key (Soniox Real-Time 60 NN / Microsoft Azure 2M Free / Google Cloud / Gemini)"
+                title="Cấu hình Cloud API Key (Soniox Real-Time 60 NN / Google Gemini)"
               >
                 <Settings size={14} />
               </button>
@@ -5637,9 +5634,9 @@ export default function App() {
               <div className="row" style={{ gap: 8 }}>
                 <Cloud size={17} color="var(--accent)" />
                 <div>
-                  <div className="modal-title">Tích Hợp Cloud AI &amp; Translation API Chính Thức</div>
+                  <div className="modal-title">Tích Hợp Cloud AI Chính Thức (Soniox &amp; Google Gemini)</div>
                   <div className="modal-sub">
-                    Soniox Real-Time nghe &amp; dịch trực tiếp 60 NN (~0% CPU) hoặc Azure / Google / Gemini Hybrid • Tự rơi về Offline khi chạm ngưỡng
+                    Soniox Real-Time nghe &amp; dịch trực tiếp 60 NN (~0% CPU) hoặc Google Gemini Hybrid • Tự rơi về Offline khi chạm ngưỡng
                   </div>
                 </div>
               </div>
@@ -5655,9 +5652,7 @@ export default function App() {
                   {(
                     [
                       ["soniox", "Soniox Real-Time", "Nghe + Dịch 60 NN • ~0% CPU • ~$0.18/giờ"],
-                      ["azure", "Microsoft Azure", "2.000.000 ký tự/tháng Free F0"],
-                      ["google", "Google Cloud", "500.000 ký tự/tháng Free"],
-                      ["gemini", "Google Gemini", "Siêu rẻ • Hiểu ngữ cảnh & Từ điển"],
+                      ["gemini", "Google Gemini", "AI Studio • Hiểu ngữ cảnh, Từ điển & Đánh giá AI"],
                     ] as const
                   ).map(([pid, title, sub]) => {
                     const pState = cloudStatus.providers[pid];
@@ -5716,11 +5711,7 @@ export default function App() {
                           API Key{" "}
                           {isSonioxTab
                             ? "(Soniox Console API Key — console.soniox.com)"
-                            : cloudTab === "azure"
-                            ? "(Azure Translator Key 1 / Key 2)"
-                            : cloudTab === "google"
-                            ? "(Google Cloud Translation API Key)"
-                            : "(Google AI Studio / Gemini API Key)"}
+                            : "(Google AI Studio / Gemini API Key — aistudio.google.com)"}
                         </span>
                         <div className="row">
                           <input
@@ -5760,29 +5751,6 @@ export default function App() {
                         </div>
                       )}
 
-                      {cloudTab === "azure" && (
-                        <div className="row" style={{ gap: 10 }}>
-                          <label className="field-label" style={{ flex: 1 }}>
-                            <span>Azure Region (VD: southeastasia, eastasia, hoặc để trống nếu Global)</span>
-                            <input
-                              className="input"
-                              value={cloudRegion}
-                              onChange={(e) => setCloudRegion(e.target.value)}
-                              placeholder="southeastasia"
-                            />
-                          </label>
-                          <label className="field-label" style={{ flex: 1 }}>
-                            <span>Endpoint</span>
-                            <input
-                              className="input"
-                              value={cloudEndpoint}
-                              onChange={(e) => setCloudEndpoint(e.target.value)}
-                              placeholder="https://api.cognitive.microsofttranslator.com"
-                            />
-                          </label>
-                        </div>
-                      )}
-
                       {cloudTab === "gemini" && (
                         <div className="field-label">
                           <span>Model Gemini</span>
@@ -5799,13 +5767,7 @@ export default function App() {
                         <span>
                           {isSonioxTab
                             ? `Ngưỡng tự khóa mỗi tháng (giờ âm thanh) — ~$0.18/giờ Nghe + Dịch (VD: ${cloudLimit || 10} giờ ≈ $${((Number(cloudLimit) || 10) * 0.18).toFixed(2)})`
-                            : `Ngưỡng tự khóa mỗi tháng (ký tự) — ${
-                                cloudTab === "azure"
-                                  ? "Gói F0 miễn phí 2.000.000/tháng (~44 giờ họp)"
-                                  : cloudTab === "google"
-                                  ? "Gói Free miễn phí 500.000/tháng (~11 giờ họp)"
-                                  : "Tự đặt giới hạn chi tiêu an toàn"
-                              }`}
+                            : "Ngưỡng tự khóa mỗi tháng (ký tự) — Tự đặt giới hạn chi tiêu an toàn"}
                         </span>
                         <input
                           className="input"
