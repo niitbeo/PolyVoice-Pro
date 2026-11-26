@@ -180,6 +180,8 @@ def build() -> Path:
         "fastapi",
         "starlette",
         "websockets",
+        "websockets.asyncio",
+        "websockets.asyncio.client",
         "httpx",
         "certifi",
         "huggingface_hub",
@@ -194,6 +196,7 @@ def build() -> Path:
         "quota_tracker",
         "session_logger",
         "slide_context",
+        "soniox_client",
         "translator",
     ]
     if _has_module("imageio_ffmpeg"):

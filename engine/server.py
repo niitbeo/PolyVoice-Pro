@@ -126,6 +126,14 @@ from model_manager import ModelManager
 from quota_tracker import CloudQuotaManager
 from session_logger import SessionLogger
 from slide_context import SlideContextManager
+from soniox_client import (
+    DEFAULT_SONIOX_MODEL,
+    SONIOX_WS_URL,
+    SonioxRealtimeClient,
+    build_soniox_context,
+    nllb_to_soniox_iso,
+    test_soniox_connection,
+)
 from translator import (
     AzureTranslator,
     EnViT5Translator,
@@ -553,6 +561,9 @@ class EngineRuntime:
         self._google_cloud: Optional[GoogleCloudTranslator] = None
         self._azure_mt: Optional[AzureTranslator] = None
         self._gemini_mt: Optional[GeminiCloudTranslator] = None
+        self._soniox_client: Optional[SonioxRealtimeClient] = None
+        self._soniox_fallback_lock = threading.Lock()
+        self._soniox_ws_url: str = ""
         self._llm: Optional[LocalLLMTranslator] = None
         self._model_lock = threading.Lock()
 
@@ -1343,8 +1354,20 @@ class EngineRuntime:
     def _record_cloud_error(self, pid: str, exc: Exception) -> None:
         raw = str(exc or "").strip()
         low = raw.lower()
-        pname = {"gemini": "Gemini", "azure": "Azure Translator", "google": "Google Cloud"}.get(pid, "Cloud API")
-        if "429" in low or "quota" in low or "rate" in low or "resource_exhausted" in low:
+        pname = {
+            "soniox": "Soniox Cloud",
+            "gemini": "Gemini",
+            "azure": "Azure Translator",
+            "google": "Google Cloud",
+        }.get(pid, "Cloud API")
+        if "402" in low or "balance" in low or "số dư" in low or "exhausted" in low:
+            cooldown_s = 180
+            reason = (
+                raw
+                if "soniox" in low or "số dư" in low
+                else f"{pname} hết số dư tài khoản (HTTP 402) — đang tự chuyển sang Offline."
+            )
+        elif "429" in low or "quota" in low or "rate" in low or "resource_exhausted" in low:
             if "free_tier" in low or "per day" in low or "limit: 20" in low:
                 cooldown_s = 300
                 reason = f"{pname} đã hết 20 lượt miễn phí trong ngày (HTTP 429) — đang tự dịch bằng Offline."
@@ -1376,6 +1399,18 @@ class EngineRuntime:
         api_key = (req.api_key if req.api_key is not None and req.api_key.strip() else creds.get("api_key", "")).strip()
         if not api_key:
             return {"ok": False, "provider": pid, "error": "Chưa nhập API Key."}
+        if pid == "soniox":
+            model = req.model if req.model is not None else creds.get("model", DEFAULT_SONIOX_MODEL)
+            res = test_soniox_connection(
+                api_key=api_key,
+                model=model,
+                ws_url=self._soniox_ws_url or SONIOX_WS_URL,
+            )
+            if res.get("ok"):
+                self.clear_cloud_cooldown()
+            res["provider"] = "soniox"
+            res["cloud_api"] = self.cloud_quota.get_public_status()
+            return res
         sample = "Xin chào, hệ thống dịch giọng nói đã kết nối thành công."
         tgt = req.target_lang or "eng_Latn"
         try:
@@ -1473,7 +1508,10 @@ class EngineRuntime:
         if mt_mode == "cloud-api":
             creds = self.cloud_quota.get_credentials()
             pid = creds["id"]
-            should_call_cloud = (not is_draft) or (not creds.get("draft_offline", True))
+            # Soniox is an end-to-end live audio streaming STT+MT engine (handled in start_session),
+            # not a text-only MT API — fall through silently to local Offline SOTA for Quick Translate,
+            # Demo Simulation, and multi-language Audience fan-out without triggering error cooldown.
+            should_call_cloud = (pid != "soniox") and ((not is_draft) or (not creds.get("draft_offline", True)))
             in_cooldown = time.time() < self._cloud_cooldown_until
             if should_call_cloud and not in_cooldown:
                 if not str(creds.get("api_key", "")).strip():
@@ -1688,8 +1726,10 @@ class EngineRuntime:
     @staticmethod
     def _is_asr_compatible_with_lang(engine_id: str, lang_code: str) -> bool:
         """Verify whether a manually pinned ASR engine actually supports `lang_code`."""
+        if engine_id == "soniox-cloud":
+            return lang_code == "auto" or bool(nllb_to_soniox_iso(lang_code))
         if lang_code == "auto":
-            return not engine_id or engine_id in ("auto", "whisper-turbo")
+            return not engine_id or engine_id in ("auto", "whisper-turbo", "soniox-cloud")
         if not engine_id or engine_id in ("auto", "whisper-turbo", "apple-native"):
             return True
         if engine_id in ("zipformer-30m-streaming", "viet-asr"):
@@ -1813,6 +1853,230 @@ class EngineRuntime:
     def _resolve_asr_choice(self, cfg: SessionConfig) -> str:
         return self._resolve_asr_choice_for_lang(cfg.source_lang, cfg.asr_engine)
 
+    def _should_use_soniox_realtime(self, cfg: SessionConfig) -> bool:
+        """Return True when live session should stream directly through Soniox Real-Time WebSocket."""
+        if cfg.source_lang != "auto" and not nllb_to_soniox_iso(cfg.source_lang):
+            return False
+        want_soniox = cfg.asr_engine == "soniox-cloud"
+        if not want_soniox and cfg.mt_mode == "cloud-api":
+            creds = self.cloud_quota.get_credentials()
+            want_soniox = creds.get("id") == "soniox"
+        if not want_soniox:
+            return False
+        soniox_creds = self.cloud_quota.get_credentials("soniox")
+        if not str(soniox_creds.get("api_key", "")).strip():
+            return False
+        if not self.cloud_quota.can_spend("soniox", 1):
+            with self._cloud_notice_lock:
+                cap_msg = "Soniox Cloud đã chạm ngưỡng giới hạn giờ tháng này — đang tự chuyển sang Offline."
+                if self._cloud_fallback_reason != cap_msg:
+                    self._cloud_fallback_reason = cap_msg
+                    self._cloud_cooldown_until = time.time() + 120
+                    self.broadcast_threadsafe(
+                        {"type": "cloud_notice", "data": {"message": cap_msg, "cooldown_s": 120}}
+                    )
+            return False
+        if time.time() < self._cloud_cooldown_until:
+            return False
+        return True
+
+    def _build_soniox_session_context(self) -> Optional[dict[str, Any]]:
+        """Assemble compact Soniox v2 context (topic, hotwords, translation_terms) from Slide RAG & Glossary."""
+        slide_summary = self.slide_context.get_status_summary()
+        topic = str(slide_summary.get("topic") or "") if slide_summary.get("enabled") else ""
+        terms = self._get_glossary_hotwords()
+
+        translation_terms: list[dict[str, str]] = []
+        g = self.glossary.get()
+        if g.get("enabled", True):
+            for rule in g.get("term_locks", []):
+                src = str(rule.get("source") or "").strip()
+                tgt = str(rule.get("target") or "").strip()
+                if src and tgt:
+                    translation_terms.append({"source": src, "target": tgt})
+        slide_payload = self.slide_context.get_payload()
+        if slide_payload.get("enabled"):
+            for item in slide_payload.get("terms", []):
+                if not item.get("enabled", True):
+                    continue
+                src = str(item.get("source") or "").strip()
+                tgt = str(item.get("target") or "").strip()
+                if src and tgt:
+                    translation_terms.append({"source": src, "target": tgt})
+
+        return build_soniox_context(
+            topic=topic,
+            terms=terms,
+            translation_terms=translation_terms,
+        )
+
+    def _trigger_soniox_offline_fallback(self, reason: str, cooldown_s: int = 120) -> None:
+        """Record cooldown + broadcast friendly notice, then seamlessly switch live session to local Offline."""
+        with self._cloud_notice_lock:
+            self._cloud_cooldown_until = time.time() + cooldown_s
+            self._cloud_fallback_reason = reason
+        self.broadcast_threadsafe(
+            {"type": "cloud_notice", "data": {"message": reason, "cooldown_s": cooldown_s}}
+        )
+        if not self._listening or self._stop_event.is_set():
+            return
+
+        def _do_fallback() -> None:
+            if not self._soniox_fallback_lock.acquire(blocking=False):
+                return
+            try:
+                if not self._listening or self._stop_event.is_set():
+                    return
+                if self._active_asr_label != "soniox-cloud":
+                    return
+                cfg_snap = asdict(self.config)
+                if cfg_snap.get("asr_engine") == "soniox-cloud":
+                    cfg_snap["asr_engine"] = "auto"
+                try:
+                    self.start_session(StartSessionRequest(**cfg_snap))
+                except Exception as exc:
+                    self.stop_session()
+                    self.broadcast_threadsafe(
+                        {
+                            "type": "error",
+                            "data": {
+                                "message": f"{reason} Không thể tự chuyển Offline vì thiếu model: {exc}"
+                            },
+                        }
+                    )
+            finally:
+                self._soniox_fallback_lock.release()
+
+        threading.Thread(target=_do_fallback, daemon=True, name="soniox-offline-fallback").start()
+
+    def _commit_soniox_final(
+        self,
+        raw_source: str,
+        raw_translated: str,
+        src_lang: str,
+        latency_ms: float,
+        model: str,
+        speaker: str = "",
+    ) -> None:
+        """Commit one finalized Soniox utterance to History, SessionLogger, LED/OBS, and LAN Audience."""
+        prot_terms = set(self._get_glossary_hotwords())
+        source_text = self._capitalize_sentence_start(
+            self._clean_verbatim(
+                self.glossary.apply_asr_fixes(raw_source.strip()),
+                src_lang,
+                protected_terms=prot_terms,
+            )
+        )
+        source_text = self.glossary.normalize_session_entities(source_text, src_lang)
+        if not source_text:
+            return
+
+        seg_id = self._current_segment_id or uuid.uuid4().hex[:10]
+        self._current_segment_id = uuid.uuid4().hex[:10]
+        with self._partial_lock:
+            self._pending_partial = None
+            if seg_id not in self._committed_seg_ids:
+                self._committed_seg_ids.append(seg_id)
+        self._stable_prefix.clear_if(seg_id)
+        self._stable_prefix.reset()
+
+        tgt_lang = self.config.target_lang
+        trans_clean = (raw_translated or "").strip()
+
+        # If target language is outside Soniox's 60 languages (e.g. Lao / Khmer / Burmese),
+        # hand the finalized Soniox transcript to `_mt_worker_loop` for local Offline NLLB translation!
+        if src_lang != tgt_lang and not trans_clean:
+            self._enqueue_final_mt(
+                {
+                    "id": seg_id,
+                    "source_text": source_text,
+                    "source_lang": src_lang,
+                    "target_lang": tgt_lang,
+                    "asr_ms": round(latency_ms, 1),
+                    "pcm": None,
+                    "speaker": speaker,
+                    "is_stop_flush": False,
+                    "timestamp": time.strftime("%H:%M:%S"),
+                }
+            )
+            self._mt_wakeup.set()
+            return
+
+        if src_lang == tgt_lang:
+            translated = source_text
+            mt_engine = "passthrough"
+        else:
+            translated = trans_clean
+            mt_engine = f"soniox:{model}"
+
+        eff_wc = (
+            max(len(source_text.split()), len(source_text) // 4)
+            if src_lang.startswith(_NON_SPACED_SCRIPT_PREFIXES)
+            else len(source_text.split())
+        )
+        para_id = self._assign_paragraph_id(eff_wc, src_lang, tgt_lang, speaker=speaker)
+        if source_text and translated and src_lang != tgt_lang:
+            self._recent_context.append((source_text, translated))
+
+        entry = {
+            "id": seg_id,
+            "paragraph_id": para_id,
+            "speaker": speaker,
+            "source_text": source_text,
+            "translated_text": translated,
+            "source_lang": src_lang,
+            "target_lang": tgt_lang,
+            "asr_ms": round(latency_ms, 1),
+            "pass2_ms": 0.0,
+            "mt_ms": 0.0 if mt_engine == "passthrough" else round(latency_ms, 1),
+            "mt_engine": mt_engine,
+            "timestamp": time.strftime("%H:%M:%S"),
+        }
+        with self._history_lock:
+            self._history.append(entry)
+            if len(self._history) > 300:
+                self._history = self._history[-300:]
+        try:
+            self.logger.append_entry(entry)
+            entry["log_saved_count"] = self.logger.get_status()["saved_count"]
+        except Exception:
+            pass
+        self.broadcast_threadsafe({"type": "final", "data": entry})
+        try:
+            self._fanout_audience_final(entry)
+        except Exception as exc:
+            logger.warning("Soniox audience fan-out enqueue failed: %s", exc)
+
+    def _soniox_audio_loop(self, soniox: SonioxRealtimeClient) -> None:
+        """Stream 100ms 16kHz mono PCM chunks to Soniox WebSocket with gentle long-silence gating."""
+        silent_chunks = 0
+        gated = False
+        preroll: deque[np.ndarray] = deque(maxlen=3)
+        try:
+            while not self._stop_event.is_set() and self._audio_stream is not None:
+                chunk = self._audio_stream.read_chunk(timeout=0.15)
+                if chunk is None:
+                    continue
+                rms = float(np.sqrt(np.mean(np.square(chunk.astype(np.float32) / 32768.0))))
+                if rms < 0.0035:
+                    silent_chunks += 1
+                elif rms >= 0.0045:
+                    silent_chunks = 0
+                # Gate only after 5.0s continuous silence so endpointing (<end>) completes naturally
+                # while long conference breaks cost $0 and stay alive via keepalive frames!
+                if silent_chunks > 50:
+                    gated = True
+                    preroll.append(chunk)
+                    continue
+                if gated:
+                    gated = False
+                    while preroll:
+                        soniox.feed_pcm(preroll.popleft())
+                soniox.feed_pcm(chunk)
+        except Exception as exc:
+            if not self._stop_event.is_set():
+                self.broadcast_threadsafe({"type": "error", "data": {"message": f"Lỗi thu âm Soniox: {exc}"}})
+
     def get_status_payload(self) -> dict[str, Any]:
         src = get_source_language(self.config.source_lang)
         tgt = get_language(self.config.target_lang)
@@ -1830,7 +2094,8 @@ class EngineRuntime:
             "active_asr_label": self._active_asr_label,
             "remote_asr_label": self._remote_asr_label,
             "detected_source_lang": self._detected_source_lang,
-            "asr_loaded": (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_multi is not None) or (self._asr_hybrid_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_moonshine_ja is not None) or (self._asr_moonshine_ko is not None) or (self._asr_parakeet_eu is not None) or (self._asr_whisper is not None),
+            "asr_loaded": (self._soniox_client is not None) or (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_multi is not None) or (self._asr_hybrid_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_moonshine_ja is not None) or (self._asr_moonshine_ko is not None) or (self._asr_parakeet_eu is not None) or (self._asr_whisper is not None),
+            "soniox_active": bool(self._listening and self._active_asr_label == "soniox-cloud"),
             "pass2_loaded": self._pass2_refiner is not None,
             "hotwords_active": self._asr_zf_vi._hotwords_count if self._asr_zf_vi is not None else 0,
             "zipformer_ready": self.model_manager.is_zipformer_streaming_ready(),
@@ -2156,113 +2421,290 @@ class EngineRuntime:
             llm_api_key=req.llm_api_key,
         )
 
-        chosen_asr = self._resolve_asr_choice(self.config)
-        if self.config.audio_source == "mix" and chosen_asr == "apple-native":
-            if self.config.source_lang == "vie_Latn" and self.model_manager.is_zipformer_streaming_ready():
-                chosen_asr = "zipformer-30m-streaming"
-            elif (
-                self.config.source_lang == "eng_Latn"
-                and self.model_manager.is_moonshine_en_ready()
-                and self.model_manager.is_silero_vad_ready()
-            ):
-                chosen_asr = "hybrid-en"
-            elif self.config.source_lang == "eng_Latn" and self.model_manager.is_moonshine_en_ready():
-                chosen_asr = "moonshine-en"
-            elif self.model_manager.is_whisper_turbo_ready():
-                chosen_asr = "whisper-turbo"
-        self._active_asr_label = chosen_asr
-        self._remote_asr_label = ""
-        self._detected_source_lang = ""
+        use_soniox = self._should_use_soniox_realtime(self.config)
+        soniox_client: Optional[SonioxRealtimeClient] = None
+        soniox_model = DEFAULT_SONIOX_MODEL
 
-        # Determine exact minimal model set for this session and unload everything else from RAM!
-        is_auto_src = self.config.source_lang == "auto"
-        is_vi_en_pair = (not is_auto_src) and ({self.config.source_lang, self.config.target_lang} == {"vie_Latn", "eng_Latn"})
-        can_hymt2 = (
-            self._llama_server_ready
-            and self.model_manager.is_hymt2_ready()
-            and (is_auto_src or bool(get_hymt2_lang_name(self.config.source_lang)))
-            and bool(get_hymt2_lang_name(self.config.target_lang))
-        )
-        want_hymt2 = can_hymt2 and (self.config.mt_mode == "hy-mt2")
-        keep_asr: set[str] = {chosen_asr}
-        if self.config.audio_source == "dual":
-            try:
-                keep_asr.add(self._resolve_asr_choice_for_lang(self.config.target_lang, "auto"))
-            except Exception:
-                pass
-        keep_mt: set[str] = set()
-        if (
-            (is_vi_en_pair or (is_auto_src and self.config.target_lang in ("vie_Latn", "eng_Latn")))
-            and self.config.mt_mode != "nllb"
-            and self.model_manager.is_envit5_ready()
-        ):
-            keep_mt.add("envit5")
-        if want_hymt2:
-            keep_mt.add("hy-mt2")
-            if is_auto_src:
-                # Keep NLLB-600M ready in auto-detect mode in case a speaker uses a language outside Hy-MT2's 38
-                keep_mt.add("nllb-600m")
-        else:
-            need_nllb = (
-                is_auto_src
-                or (
-                    self.config.source_lang != self.config.target_lang
-                    and (
-                        self.config.mt_mode == "nllb"
-                        or (not is_vi_en_pair and self.config.mt_mode in ("auto-offline", "light-offline", "hy-mt2", "cloud-api"))
+        if use_soniox:
+            s_creds = self.cloud_quota.get_credentials("soniox")
+            s_key = str(s_creds.get("api_key", "")).strip()
+            soniox_model = str(s_creds.get("model", "")).strip() or DEFAULT_SONIOX_MODEL
+            speaker_tag_s = "self" if self.config.audio_source == "dual" else ""
+
+            def _on_soniox_detected_lang(det_nllb: str) -> None:
+                if self.config.source_lang != "auto":
+                    return
+                if det_nllb and det_nllb != self._detected_source_lang:
+                    self._detected_source_lang = det_nllb
+                    det_meta = get_source_language(det_nllb) or get_language(det_nllb)
+                    self.broadcast_threadsafe(
+                        {
+                            "type": "detected_lang",
+                            "data": {
+                                "detected_source_lang": det_nllb,
+                                "name_vi": det_meta.name_vi if det_meta else det_nllb,
+                            },
+                        }
                     )
+
+            def _on_soniox_partial(orig: str, trans: str, src_nllb: str, lat_ms: float) -> None:
+                if self._stop_event.is_set():
+                    return
+                if not self._current_segment_id:
+                    self._current_segment_id = uuid.uuid4().hex[:10]
+                seg_id = self._current_segment_id
+                tgt_lang = self.config.target_lang
+                clean_orig = self._clean_verbatim(
+                    self.glossary.apply_asr_fixes(orig),
+                    src_nllb,
+                    protected_terms=set(self._get_glossary_hotwords()),
                 )
+                if not clean_orig:
+                    return
+                self.broadcast_threadsafe(
+                    {
+                        "type": "partial",
+                        "data": {
+                            "id": seg_id,
+                            "source_text": clean_orig,
+                            "source_lang": src_nllb,
+                            "target_lang": tgt_lang,
+                            "asr_ms": round(lat_ms, 1),
+                            "speaker": speaker_tag_s,
+                        },
+                    }
+                )
+                if not self.config.translate_partials:
+                    return
+                if trans.strip():
+                    stable_text, unstable_text, stabilized = self._stable_prefix.update(
+                        seg_id, tgt_lang, trans.strip()
+                    )
+                    self.broadcast_threadsafe(
+                        {
+                            "type": "partial_mt",
+                            "data": {
+                                "id": seg_id,
+                                "translated_text": stabilized,
+                                "stable_text": stable_text,
+                                "unstable_text": unstable_text,
+                                "source_lang": src_nllb,
+                                "target_lang": tgt_lang,
+                                "mt_ms": round(lat_ms, 1),
+                                "mt_engine": f"soniox:{soniox_model}",
+                            },
+                        }
+                    )
+                elif src_nllb == tgt_lang:
+                    self.broadcast_threadsafe(
+                        {
+                            "type": "partial_mt",
+                            "data": {
+                                "id": seg_id,
+                                "translated_text": clean_orig,
+                                "stable_text": clean_orig,
+                                "unstable_text": "",
+                                "source_lang": src_nllb,
+                                "target_lang": tgt_lang,
+                                "mt_ms": 0.0,
+                                "mt_engine": "passthrough",
+                            },
+                        }
+                    )
+                elif not nllb_to_soniox_iso(tgt_lang):
+                    with self._partial_lock:
+                        self._pending_partial = {
+                            "id": seg_id,
+                            "source_text": clean_orig,
+                            "parts": [clean_orig],
+                            "source_lang": src_nllb,
+                            "target_lang": tgt_lang,
+                        }
+                    self._draft_wakeup.set()
+
+            def _on_soniox_final(orig: str, trans: str, src_nllb: str, lat_ms: float) -> None:
+                self._commit_soniox_final(
+                    orig,
+                    trans,
+                    src_nllb,
+                    lat_ms,
+                    model=soniox_model,
+                    speaker=speaker_tag_s,
+                )
+
+            def _on_soniox_usage(secs: int) -> None:
+                self.cloud_quota.record_usage("soniox", secs)
+                self.broadcast_threadsafe({"type": "status", "data": self.get_status_payload()})
+                if not self.cloud_quota.can_spend("soniox", 1):
+                    self._trigger_soniox_offline_fallback(
+                        "Soniox Cloud đã chạm ngưỡng giới hạn giờ tháng này — đang tự chuyển mượt sang Offline.",
+                        cooldown_s=180,
+                    )
+
+            def _on_soniox_error(code: int, msg: str) -> None:
+                # Only trigger live mid-session fallback once the session is actively running on this client
+                if self._listening and self._soniox_client is soniox_client:
+                    cd = 180 if code in (401, 402, 403) else 45
+                    self._trigger_soniox_offline_fallback(msg, cooldown_s=cd)
+
+            soniox_client = SonioxRealtimeClient(
+                api_key=s_key,
+                source_lang=self.config.source_lang,
+                target_lang=self.config.target_lang,
+                model=soniox_model,
+                context=self._build_soniox_session_context(),
+                sample_rate=SAMPLE_RATE,
+                ws_url=self._soniox_ws_url or SONIOX_WS_URL,
+                on_partial=_on_soniox_partial,
+                on_final=_on_soniox_final,
+                on_detected_lang=_on_soniox_detected_lang,
+                on_usage_seconds=_on_soniox_usage,
+                on_error=_on_soniox_error,
             )
-            if need_nllb:
-                keep_mt.add("nllb-600m")
+            soniox_client.start()
+            s_ok, s_code, s_err = soniox_client.wait_connected(timeout_s=4.5)
+            if not s_ok:
+                soniox_client.stop()
+                soniox_client = None
+                use_soniox = False
+                cd = 180 if s_code in (401, 402, 403) else 45
+                fallback_msg = (
+                    s_err or "Không kết nối được Soniox Cloud — đang tự chuyển mượt sang chế độ Offline."
+                )
+                with self._cloud_notice_lock:
+                    self._cloud_cooldown_until = time.time() + cd
+                    self._cloud_fallback_reason = fallback_msg
+                self.broadcast_threadsafe(
+                    {"type": "cloud_notice", "data": {"message": fallback_msg, "cooldown_s": cd}}
+                )
+                if self.config.asr_engine == "soniox-cloud":
+                    self.config.asr_engine = "auto"
 
-        keep_pass2: set[str] = set()
-        need_vi_pass2 = self.config.pass2_refine and (
-            (chosen_asr == "zipformer-30m-streaming" and self.config.source_lang == "vie_Latn")
-            or (
-                self.config.audio_source == "dual"
-                and self.config.target_lang == "vie_Latn"
-                and self.model_manager.is_zipformer_streaming_ready()
-            )
-        )
-        need_en_pass2 = (
-            self.config.pass2_refine
-            and chosen_asr not in ("moonshine-en", "hybrid-en")
-            and (self.config.source_lang == "eng_Latn" or (self.config.audio_source == "dual" and self.config.target_lang == "eng_Latn"))
-            and self.model_manager.is_moonshine_en_ready()
-        )
-        if need_vi_pass2:
-            keep_pass2.add("vi-pass2")
-        if need_en_pass2 or "hybrid-en" in keep_asr:
-            keep_pass2.add("en-pass2")
-
-        self._release_unused_models(keep_asr=keep_asr, keep_mt=keep_mt, keep_pass2=keep_pass2)
-
-        if "envit5" in keep_mt:
-            self.ensure_envit5_loaded()
-
-        if want_hymt2:
-            # Pre-warm Hy-MT2 llama-server in background ONLY when explicitly selected
-            def _warmup_hymt2() -> None:
+        if use_soniox and soniox_client is not None:
+            chosen_asr = "soniox-cloud"
+            self._active_asr_label = chosen_asr
+            self._remote_asr_label = ""
+            self._detected_source_lang = ""
+            keep_asr: set[str] = set()
+            if self.config.audio_source == "dual":
                 try:
-                    h = self.ensure_hymt2_loaded()
-                    if h is not None:
-                        h.ensure_started()
+                    keep_asr.add(self._resolve_asr_choice_for_lang(self.config.target_lang, "auto"))
                 except Exception:
                     pass
+            keep_mt: set[str] = set()
+            if not nllb_to_soniox_iso(self.config.target_lang) and self.model_manager.is_nllb_ready():
+                keep_mt.add("nllb-600m")
+            self._release_unused_models(keep_asr=keep_asr, keep_mt=keep_mt, keep_pass2=set())
+            if "nllb-600m" in keep_mt:
+                self.ensure_nllb_loaded()
+        else:
+            chosen_asr = self._resolve_asr_choice(self.config)
+            if self.config.audio_source == "mix" and chosen_asr == "apple-native":
+                if self.config.source_lang == "vie_Latn" and self.model_manager.is_zipformer_streaming_ready():
+                    chosen_asr = "zipformer-30m-streaming"
+                elif (
+                    self.config.source_lang == "eng_Latn"
+                    and self.model_manager.is_moonshine_en_ready()
+                    and self.model_manager.is_silero_vad_ready()
+                ):
+                    chosen_asr = "hybrid-en"
+                elif self.config.source_lang == "eng_Latn" and self.model_manager.is_moonshine_en_ready():
+                    chosen_asr = "moonshine-en"
+                elif self.model_manager.is_whisper_turbo_ready():
+                    chosen_asr = "whisper-turbo"
+            self._active_asr_label = chosen_asr
+            self._remote_asr_label = ""
+            self._detected_source_lang = ""
 
-            threading.Thread(
-                target=_warmup_hymt2,
-                daemon=True,
-                name="hymt2-warmup",
-            ).start()
-        elif "nllb-600m" in keep_mt and self.model_manager.is_nllb_ready():
-            self.ensure_nllb_loaded()
+            # Determine exact minimal model set for this session and unload everything else from RAM!
+            is_auto_src = self.config.source_lang == "auto"
+            is_vi_en_pair = (not is_auto_src) and ({self.config.source_lang, self.config.target_lang} == {"vie_Latn", "eng_Latn"})
+            can_hymt2 = (
+                self._llama_server_ready
+                and self.model_manager.is_hymt2_ready()
+                and (is_auto_src or bool(get_hymt2_lang_name(self.config.source_lang)))
+                and bool(get_hymt2_lang_name(self.config.target_lang))
+            )
+            want_hymt2 = can_hymt2 and (self.config.mt_mode == "hy-mt2")
+            keep_asr = {chosen_asr}
+            if self.config.audio_source == "dual":
+                try:
+                    keep_asr.add(self._resolve_asr_choice_for_lang(self.config.target_lang, "auto"))
+                except Exception:
+                    pass
+            keep_mt = set()
+            if (
+                (is_vi_en_pair or (is_auto_src and self.config.target_lang in ("vie_Latn", "eng_Latn")))
+                and self.config.mt_mode != "nllb"
+                and self.model_manager.is_envit5_ready()
+            ):
+                keep_mt.add("envit5")
+            if want_hymt2:
+                keep_mt.add("hy-mt2")
+                if is_auto_src:
+                    # Keep NLLB-600M ready in auto-detect mode in case a speaker uses a language outside Hy-MT2's 38
+                    keep_mt.add("nllb-600m")
+            else:
+                need_nllb = (
+                    is_auto_src
+                    or (
+                        self.config.source_lang != self.config.target_lang
+                        and (
+                            self.config.mt_mode == "nllb"
+                            or (not is_vi_en_pair and self.config.mt_mode in ("auto-offline", "light-offline", "hy-mt2", "cloud-api"))
+                        )
+                    )
+                )
+                if need_nllb:
+                    keep_mt.add("nllb-600m")
 
-        if need_vi_pass2:
-            self.ensure_pass2_refiner()
-        if need_en_pass2:
-            self.ensure_en_pass2_refiner()
+            keep_pass2: set[str] = set()
+            need_vi_pass2 = self.config.pass2_refine and (
+                (chosen_asr == "zipformer-30m-streaming" and self.config.source_lang == "vie_Latn")
+                or (
+                    self.config.audio_source == "dual"
+                    and self.config.target_lang == "vie_Latn"
+                    and self.model_manager.is_zipformer_streaming_ready()
+                )
+            )
+            need_en_pass2 = (
+                self.config.pass2_refine
+                and chosen_asr not in ("moonshine-en", "hybrid-en")
+                and (self.config.source_lang == "eng_Latn" or (self.config.audio_source == "dual" and self.config.target_lang == "eng_Latn"))
+                and self.model_manager.is_moonshine_en_ready()
+            )
+            if need_vi_pass2:
+                keep_pass2.add("vi-pass2")
+            if need_en_pass2 or "hybrid-en" in keep_asr:
+                keep_pass2.add("en-pass2")
+
+            self._release_unused_models(keep_asr=keep_asr, keep_mt=keep_mt, keep_pass2=keep_pass2)
+
+            if "envit5" in keep_mt:
+                self.ensure_envit5_loaded()
+
+            if want_hymt2:
+                # Pre-warm Hy-MT2 llama-server in background ONLY when explicitly selected
+                def _warmup_hymt2() -> None:
+                    try:
+                        h = self.ensure_hymt2_loaded()
+                        if h is not None:
+                            h.ensure_started()
+                    except Exception:
+                        pass
+
+                threading.Thread(
+                    target=_warmup_hymt2,
+                    daemon=True,
+                    name="hymt2-warmup",
+                ).start()
+            elif "nllb-600m" in keep_mt and self.model_manager.is_nllb_ready():
+                self.ensure_nllb_loaded()
+
+            if need_vi_pass2:
+                self.ensure_pass2_refiner()
+            if need_en_pass2:
+                self.ensure_en_pass2_refiner()
 
         # Start real-time auto-save meeting log (.TXT & .SRT)
         self.logger.start_new_session(self.config.source_lang, self.config.target_lang)
@@ -2348,8 +2790,10 @@ class EngineRuntime:
             )
             self._asr_thread.start()
         else:
-            asr = self.ensure_onnx_asr_loaded(chosen_asr, lang_code=self.config.source_lang)
-            asr.reset()
+            asr = None
+            if chosen_asr != "soniox-cloud":
+                asr = self.ensure_onnx_asr_loaded(chosen_asr, lang_code=self.config.source_lang)
+                asr.reset()
 
             def _on_meter(level: float, clipping: bool) -> None:
                 now = time.perf_counter()
@@ -2409,15 +2853,34 @@ class EngineRuntime:
                     auto_gain=self.config.auto_gain,
                 )
 
-            self._audio_stream.start()
-            self._listening = True
-            self._asr_thread = threading.Thread(
-                target=self._audio_loop,
-                args=(asr,),
-                daemon=True,
-                name="asr-worker",
-            )
-            self._asr_thread.start()
+            try:
+                self._audio_stream.start()
+            except Exception:
+                if soniox_client is not None:
+                    try:
+                        soniox_client.stop()
+                    except Exception:
+                        pass
+                raise
+            if chosen_asr == "soniox-cloud" and soniox_client is not None:
+                self._soniox_client = soniox_client
+                self._listening = True
+                self._asr_thread = threading.Thread(
+                    target=self._soniox_audio_loop,
+                    args=(soniox_client,),
+                    daemon=True,
+                    name="soniox-audio-worker",
+                )
+                self._asr_thread.start()
+            else:
+                self._listening = True
+                self._asr_thread = threading.Thread(
+                    target=self._audio_loop,
+                    args=(asr,),
+                    daemon=True,
+                    name="asr-worker",
+                )
+                self._asr_thread.start()
 
         # Dual Audio Mode (2-Way Zoom/Meet): Spawn concurrent System Audio partner channel!
         if self.config.audio_source == "dual":
@@ -2516,7 +2979,19 @@ class EngineRuntime:
                     except Exception:
                         pass
                 setattr(self, proc_attr, None)
-        for th_attr in ("_asr_thread", "_remote_asr_thread", "_mt_thread", "_draft_mt_thread"):
+        for th_attr in ("_asr_thread", "_remote_asr_thread"):
+            th = getattr(self, th_attr, None)
+            if th is not None and th.is_alive():
+                th.join(timeout=2.0)
+            setattr(self, th_attr, None)
+        if self._soniox_client is not None:
+            sc = self._soniox_client
+            self._soniox_client = None
+            try:
+                sc.stop()
+            except Exception:
+                pass
+        for th_attr in ("_mt_thread", "_draft_mt_thread"):
             th = getattr(self, th_attr, None)
             if th is not None and th.is_alive():
                 th.join(timeout=2.0)
@@ -2653,10 +3128,16 @@ class EngineRuntime:
                 with self._model_lock:
                     self._nllb = None
                 gc.collect()
-            if self.config.audio_source == "dual":
+            if self.config.audio_source == "dual" or self._active_asr_label == "soniox-cloud":
                 need_restart = True
         if req.mt_mode is not None:
+            prev_mt_mode = self.config.mt_mode
             self.config.mt_mode = req.mt_mode
+            if prev_mt_mode != req.mt_mode and (
+                self._active_asr_label == "soniox-cloud"
+                or (req.mt_mode == "cloud-api" and self.cloud_quota.get_credentials().get("id") == "soniox")
+            ):
+                need_restart = True
             if req.mt_mode != "hy-mt2" and self._hymt2 is not None:
                 self._cancel_hymt2_idle_timer()
                 with self._model_lock:
@@ -4690,8 +5171,22 @@ def api_cloud_get():
 
 @app.post("/api/cloud/config")
 def api_cloud_update(req: CloudConfigUpdateRequest):
+    prev_provider = runtime.cloud_quota.get_public_status().get("provider")
     data = runtime.cloud_quota.update(req.model_dump(exclude_none=True))
     runtime.clear_cloud_cooldown()
+    if (
+        runtime._listening
+        and runtime.config.mt_mode == "cloud-api"
+        and (
+            prev_provider == "soniox"
+            or data.get("provider") == "soniox"
+            or runtime._active_asr_label == "soniox-cloud"
+        )
+    ):
+        try:
+            runtime.start_session(StartSessionRequest(**asdict(runtime.config)))
+        except Exception as exc:
+            logger.warning("Hot-restart after cloud provider switch failed: %s", exc)
     runtime.broadcast_threadsafe({"type": "status", "data": runtime.get_status_payload()})
     return data
 

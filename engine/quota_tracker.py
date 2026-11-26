@@ -27,11 +27,20 @@ DEFAULT_CONFIG_PATH = CACHE_DIR / "cloud_config.json"
 DEFAULT_QUOTA_PATH = CACHE_DIR / "cloud_quota.json"
 
 PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
+    "soniox": {
+        "name": "Soniox Real-Time (Nghe + Dịch 60 NN)",
+        "free_tier": 0,
+        "monthly_limit": 36_000,  # 10 hours of audio (36,000 seconds; ~$1.80)
+        "api_key": "",
+        "model": "stt-rt-v6",
+        "unit": "seconds",
+    },
     "google": {
         "name": "Google Cloud Translation",
         "free_tier": 500_000,
         "monthly_limit": 480_000,
         "api_key": "",
+        "unit": "chars",
     },
     "azure": {
         "name": "Microsoft Azure Translator (Free F0)",
@@ -40,6 +49,7 @@ PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
         "api_key": "",
         "region": "southeastasia",
         "endpoint": "https://api.cognitive.microsofttranslator.com",
+        "unit": "chars",
     },
     "gemini": {
         "name": "Google Gemini API (Ngữ cảnh + Từ điển)",
@@ -47,6 +57,7 @@ PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
         "monthly_limit": 5_000_000,
         "api_key": "",
         "model": "gemini-2.5-flash",
+        "unit": "chars",
     },
 }
 
@@ -188,6 +199,7 @@ class CloudQuotaManager:
                     "id": pid,
                     "name": PROVIDER_DEFAULTS[pid]["name"],
                     "free_tier": PROVIDER_DEFAULTS[pid]["free_tier"],
+                    "unit": PROVIDER_DEFAULTS[pid].get("unit", "chars"),
                     "has_key": bool(key),
                     "key_preview": _mask_key(key),
                     "monthly_limit": limit,
@@ -241,7 +253,8 @@ class CloudQuotaManager:
                     # Only overwrite when user actually submits a new string (empty string clears key)
                     pcfg["api_key"] = str(patch["api_key"]).strip()
                 if "monthly_limit" in patch and patch["monthly_limit"] is not None:
-                    pcfg["monthly_limit"] = max(1000, int(patch["monthly_limit"]))
+                    min_limit = 60 if target_pid == "soniox" else 1000
+                    pcfg["monthly_limit"] = max(min_limit, int(patch["monthly_limit"]))
                 if "region" in patch and patch["region"] is not None:
                     pcfg["region"] = str(patch["region"]).strip()
                 if "endpoint" in patch and patch["endpoint"] is not None:

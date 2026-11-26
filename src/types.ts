@@ -76,6 +76,7 @@ export type AudioSourceId = "mic" | "system" | "dual" | "mix";
 export type InputChannelId = "mix" | "left" | "right";
 export type AsrEngineId =
   | "auto"
+  | "soniox-cloud"
   | "hybrid-en"
   | "moonshine-en"
   | "moonshine-ja"
@@ -95,12 +96,13 @@ export type MtModeId =
   | "fast-online"
   | "local-llm";
 
-export type CloudProviderId = "azure" | "google" | "gemini";
+export type CloudProviderId = "soniox" | "azure" | "google" | "gemini";
 
 export interface CloudProviderState {
   id: CloudProviderId;
   name: string;
   free_tier: number;
+  unit?: "chars" | "seconds";
   has_key: boolean;
   key_preview: string;
   monthly_limit: number;
@@ -315,6 +317,7 @@ export interface EngineStatus {
   display_freeze_message?: string;
   cloud_api?: CloudApiStatus;
   cloud_fallback_notice?: string;
+  soniox_active?: boolean;
   envit5_device?: string;
   platform: {
     os: string;
@@ -497,6 +500,8 @@ export function shortLangName(code: string, fallback?: string): string {
 
 export function shortEngineName(engine: string): string {
   if (!engine) return "";
+  if (engine === "soniox-cloud") return "Soniox Cloud";
+  if (engine.startsWith("soniox:")) return `Soniox ${engine.slice(7).replace(/^stt-rt-/, "")}`;
   if (engine === "google-cloud") return "Google API";
   if (engine === "azure-translator") return "Azure API";
   if (engine.startsWith("gemini:")) return "Gemini API";

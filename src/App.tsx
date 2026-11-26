@@ -1695,14 +1695,28 @@ export default function App() {
     }
   };
 
+  const formatSonioxDuration = (secs: number) => {
+    const s = Math.max(0, Math.round(secs));
+    if (s < 3600) {
+      const mins = Math.round(s / 60);
+      return `${mins} phút`;
+    }
+    const hrs = s / 3600;
+    return `${hrs % 1 === 0 ? hrs.toFixed(0) : hrs.toFixed(1)} giờ`;
+  };
+
   const syncCloudFormForTab = (data: CloudApiStatus, pid: CloudProviderId) => {
     const p = data.providers[pid];
     setCloudTab(pid);
     setCloudKeyInput("");
     setCloudRegion(p?.region || "southeastasia");
     setCloudEndpoint(p?.endpoint || "https://api.cognitive.microsofttranslator.com");
-    setCloudModel(p?.model || "gemini-2.5-flash");
-    setCloudLimit(p?.monthly_limit || (pid === "azure" ? 1950000 : pid === "google" ? 480000 : 5000000));
+    setCloudModel(p?.model || (pid === "soniox" ? "stt-rt-v6" : "gemini-2.5-flash"));
+    setCloudLimit(
+      pid === "soniox"
+        ? Math.max(1, Math.round((p?.monthly_limit || 36000) / 3600))
+        : p?.monthly_limit || (pid === "azure" ? 1950000 : pid === "google" ? 480000 : 5000000)
+    );
     setCloudHardCap(Boolean(data.hard_cap_enabled));
     setCloudDraftOffline(Boolean(data.draft_offline));
     setCloudTestResult(null);
@@ -1745,7 +1759,10 @@ export default function App() {
       const body: Record<string, unknown> = {
         provider: cloudTab,
         target_provider: cloudTab,
-        monthly_limit: Math.max(1000, Number(cloudLimit) || 480000),
+        monthly_limit:
+          cloudTab === "soniox"
+            ? Math.max(60, Math.round((Number(cloudLimit) || 10) * 3600))
+            : Math.max(1000, Number(cloudLimit) || 480000),
         hard_cap_enabled: cloudHardCap,
         draft_offline: cloudDraftOffline,
       };
@@ -1758,6 +1775,9 @@ export default function App() {
       }
       if (cloudTab === "gemini") {
         body.model = cloudModel.trim() || "gemini-2.5-flash";
+      }
+      if (cloudTab === "soniox") {
+        body.model = cloudModel.trim() || "stt-rt-v6";
       }
       const res = await fetch(`${ENGINE_HTTP}/api/cloud/config`, {
         method: "POST",
@@ -1829,7 +1849,7 @@ export default function App() {
           api_key: cloudKeyInput.trim() || undefined,
           region: cloudTab === "azure" ? cloudRegion.trim() : undefined,
           endpoint: cloudTab === "azure" ? cloudEndpoint.trim() : undefined,
-          model: cloudTab === "gemini" ? cloudModel.trim() : undefined,
+          model: cloudTab === "gemini" || cloudTab === "soniox" ? cloudModel.trim() : undefined,
           target_lang: targetLang === "vie_Latn" ? "eng_Latn" : targetLang,
         }),
       });
@@ -2543,6 +2563,14 @@ export default function App() {
     (sourceLang === "eng_Latn" && targetLang === "vie_Latn");
 
   const resolvedAutoAsrBadge = (() => {
+    if (
+      mtMode === "cloud-api" &&
+      status?.cloud_api?.provider === "soniox" &&
+      status?.cloud_api?.active_ready &&
+      !["lao_Laoo", "khm_Khmr", "mya_Mymr"].includes(sourceLang)
+    ) {
+      return "Soniox Cloud";
+    }
     if (sourceLang === "vie_Latn") return status?.zipformer_ready ? "Zipformer-30M" : "VietASR";
     if (sourceLang === "eng_Latn") return status?.moonshine_en_ready ? "Hybrid-EN" : "Whisper-Turbo";
     if (sourceLang === "jpn_Jpan") return status?.moonshine_ja_ready ? "Moonshine-JA" : "Whisper-Turbo";
@@ -2783,6 +2811,12 @@ export default function App() {
     { value: "source", label: ".SRT Chỉ văn bản gốc", badge: "Gốc", description: "Xuất phụ đề nguyên văn diễn giả", icon: <FileText size={13} /> },
   ];
 
+  const sonioxModelOptions: StudioSelectOption[] = [
+    { value: "stt-rt-v6", label: "stt-rt-v6 (Real-Time v6)", badge: "Mới nhất • 60 NN", description: "Nghe + Dịch trực tiếp 60 ngôn ngữ (~0% CPU • ~$0.18/giờ)", icon: <Cloud size={13} /> },
+    { value: "stt-rt-v5", label: "stt-rt-v5 (Real-Time v5)", badge: "Ổn định", description: "Mô hình Real-Time thế hệ v5 đa ngôn ngữ", icon: <Cloud size={13} /> },
+    { value: "stt-rt-v4", label: "stt-rt-v4 (Real-Time v4)", badge: "Dự phòng", description: "Mô hình Real-Time thế hệ v4", icon: <Cloud size={13} /> },
+  ];
+
   const geminiModelOptions: StudioSelectOption[] = [
     { value: "gemini-2.5-flash", label: "gemini-2.5-flash", badge: "Khuyên dùng", description: "Nhanh ~0.9s, ổn định nhất", icon: <Sparkles size={13} /> },
     { value: "gemini-3.1-flash-lite", label: "gemini-3.1-flash-lite", badge: "Tiết kiệm", description: "Flash Lite chi phí tối ưu nhất", icon: <Sparkles size={13} /> },
@@ -2800,6 +2834,7 @@ export default function App() {
     if (mtMode === "local-llm") return `Local LLM (${llmModel || "Ollama"})`;
     if (mtMode === "cloud-api") {
       const prov = status?.cloud_api?.provider;
+      if (prov === "soniox") return "Cloud API (Soniox Real-Time 60 NN)";
       if (prov === "azure") return "Cloud API (Azure Translator)";
       if (prov === "gemini") return "Cloud API (Google Gemini)";
       return "Cloud API (Google Translate)";
@@ -3324,6 +3359,30 @@ export default function App() {
                 const wtReady = wtSt?.status === "ready";
                 const srcName = currentSrcObj?.name_vi || sourceLang;
 
+                // 0) Soniox Cloud Real-Time active -> ~0% local CPU/GPU for 60 supported languages!
+                const sonioxReady =
+                  mtMode === "cloud-api" &&
+                  status?.cloud_api?.provider === "soniox" &&
+                  status?.cloud_api?.active_ready &&
+                  !status?.cloud_api?.active_cap_reached;
+                if (sonioxReady && !["lao_Laoo", "khm_Khmr", "mya_Mymr"].includes(sourceLang)) {
+                  const sModel = status?.cloud_api?.providers?.soniox?.model || "stt-rt-v6";
+                  return (
+                    <div className="lang-readiness-banner ready">
+                      <div className="lang-readiness-row">
+                        <Cloud size={12} style={{ flexShrink: 0 }} />
+                        <span>
+                          {sourceLang === "auto"
+                            ? detectedSourceLabel
+                              ? `Soniox Cloud (${sModel}) — vừa nghe: ${detectedSourceLabel} (~0% CPU)`
+                              : `Sẵn sàng Cloud — Soniox ${sModel} (Nghe + Dịch trực tiếp 60 NN • ~0% CPU)`
+                            : `Sẵn sàng Cloud — Soniox ${sModel} (Nghe + Dịch ${srcName} • ~0% CPU)`}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                }
+
                 // 1) Experimental spoken language (e.g. Lao): always show honest, calm advisory
                 if (tier === "experimental") {
                   const isDl = wtSt?.status === "downloading";
@@ -3569,8 +3628,8 @@ export default function App() {
                   disabled={!connected}
                   title={
                     status?.cloud_api?.active_ready
-                      ? "Bật dịch Cloud API chính thức (Nháp vẫn chạy Offline để tiết kiệm hạn mức)"
-                      : "Bấm để cấu hình API Key Google / Microsoft Azure / Gemini"
+                      ? "Bật dịch Cloud API chính thức (Soniox Real-Time / Azure / Google / Gemini)"
+                      : "Bấm để cấu hình API Key Soniox Real-Time / Azure / Google / Gemini"
                   }
                 >
                   <Cloud size={12} /> Cloud
@@ -3580,7 +3639,7 @@ export default function App() {
                 className={`btn sm icon-only ${cloudOpen ? "active" : ""}`}
                 onClick={() => handleOpenCloudModal()}
                 disabled={!connected}
-                title="Cấu hình Cloud API Key (Microsoft Azure 2M Free / Google Cloud / Gemini)"
+                title="Cấu hình Cloud API Key (Soniox Real-Time 60 NN / Microsoft Azure 2M Free / Google Cloud / Gemini)"
               >
                 <Settings size={14} />
               </button>
@@ -3589,8 +3648,11 @@ export default function App() {
             {mtMode === "cloud-api" ? (() => {
               const ca = status?.cloud_api;
               const activeP = ca ? ca.providers[ca.provider] : null;
+              const isSoniox = activeP?.id === "soniox";
               const providerLabel =
-                activeP?.id === "azure"
+                isSoniox
+                  ? `Soniox (${activeP?.model || "stt-rt-v6"})`
+                  : activeP?.id === "azure"
                   ? "Microsoft Azure"
                   : activeP?.id === "google"
                   ? "Google Cloud"
@@ -3627,13 +3689,17 @@ export default function App() {
                     </span>
                     {activeP?.has_key && (
                       <span style={{ color: "var(--text-2)", fontFamily: "ui-monospace, monospace", fontSize: 10.5 }}>
-                        {activeP.used_chars.toLocaleString("vi-VN")}/{activeP.monthly_limit.toLocaleString("vi-VN")}
+                        {isSoniox
+                          ? `${formatSonioxDuration(activeP.used_chars)}/${formatSonioxDuration(activeP.monthly_limit)}`
+                          : `${activeP.used_chars.toLocaleString("vi-VN")}/${activeP.monthly_limit.toLocaleString("vi-VN")}`}
                       </span>
                     )}
                   </div>
                   <div style={{ fontSize: 10.5, color: "var(--text-2)" }}>
                     {activeP?.has_key
-                      ? "Nháp chạy Offline (0 tốn quota) • Hết hạn mức tự về Offline"
+                      ? isSoniox
+                        ? "Nghe + Dịch trực tiếp 60 NN • ~0% CPU • Tự về Offline nếu mất mạng"
+                        : "Nháp chạy Offline (0 tốn quota) • Hết hạn mức tự về Offline"
                       : "Bấm nút Cài đặt bên trên để dán API Key"}
                   </div>
                 </div>
@@ -5571,9 +5637,9 @@ export default function App() {
               <div className="row" style={{ gap: 8 }}>
                 <Cloud size={17} color="var(--accent)" />
                 <div>
-                  <div className="modal-title">Tích Hợp Cloud Translation API Chính Thức (Hybrid Nháp Offline)</div>
+                  <div className="modal-title">Tích Hợp Cloud AI &amp; Translation API Chính Thức</div>
                   <div className="modal-sub">
-                    Chỉ gửi câu đã chốt lên Cloud API (tiết kiệm ~85% hạn mức) • Tự động rơi về Offline khi chạm ngưỡng miễn phí $0
+                    Soniox Real-Time nghe &amp; dịch trực tiếp 60 NN (~0% CPU) hoặc Azure / Google / Gemini Hybrid • Tự rơi về Offline khi chạm ngưỡng
                   </div>
                 </div>
               </div>
@@ -5588,6 +5654,7 @@ export default function App() {
                 <div className="cloud-tabs">
                   {(
                     [
+                      ["soniox", "Soniox Real-Time", "Nghe + Dịch 60 NN • ~0% CPU • ~$0.18/giờ"],
                       ["azure", "Microsoft Azure", "2.000.000 ký tự/tháng Free F0"],
                       ["google", "Google Cloud", "500.000 ký tự/tháng Free"],
                       ["gemini", "Google Gemini", "Siêu rẻ • Hiểu ngữ cảnh & Từ điển"],
@@ -5615,6 +5682,8 @@ export default function App() {
                 {/* Selected Provider Config Panel */}
                 {(() => {
                   const p = cloudStatus.providers[cloudTab];
+                  const isSonioxTab = cloudTab === "soniox";
+                  const estUsd = isSonioxTab ? ((p.used_chars / 3600) * 0.18).toFixed(2) : "0.00";
                   return (
                     <div className="cloud-panel">
                       {/* Quota Meter */}
@@ -5622,7 +5691,9 @@ export default function App() {
                         <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-0)" }}>
                           Hạn mức tháng {cloudStatus.month}:{" "}
                           <span style={{ color: "var(--accent-text)" }}>
-                            {p.used_chars.toLocaleString("vi-VN")} / {p.monthly_limit.toLocaleString("vi-VN")} ký tự
+                            {isSonioxTab
+                              ? `${formatSonioxDuration(p.used_chars)} / ${formatSonioxDuration(p.monthly_limit)} (~$${estUsd})`
+                              : `${p.used_chars.toLocaleString("vi-VN")} / ${p.monthly_limit.toLocaleString("vi-VN")} ký tự`}
                           </span>{" "}
                           ({p.pct_used}%)
                         </span>
@@ -5642,7 +5713,14 @@ export default function App() {
                       {/* API Key Input */}
                       <label className="field-label">
                         <span>
-                          API Key {cloudTab === "azure" ? "(Azure Translator Key 1 / Key 2)" : cloudTab === "google" ? "(Google Cloud Translation API Key)" : "(Google AI Studio / Gemini API Key)"}
+                          API Key{" "}
+                          {isSonioxTab
+                            ? "(Soniox Console API Key — console.soniox.com)"
+                            : cloudTab === "azure"
+                            ? "(Azure Translator Key 1 / Key 2)"
+                            : cloudTab === "google"
+                            ? "(Google Cloud Translation API Key)"
+                            : "(Google AI Studio / Gemini API Key)"}
                         </span>
                         <div className="row">
                           <input
@@ -5669,6 +5747,18 @@ export default function App() {
                           )}
                         </div>
                       </label>
+
+                      {isSonioxTab && (
+                        <div className="field-label">
+                          <span>Model Soniox Real-Time</span>
+                          <StudioSelect
+                            value={cloudModel}
+                            options={sonioxModelOptions}
+                            onChange={(val) => setCloudModel(val)}
+                            title="Chọn model Soniox Real-Time"
+                          />
+                        </div>
+                      )}
 
                       {cloudTab === "azure" && (
                         <div className="row" style={{ gap: 10 }}>
@@ -5707,34 +5797,53 @@ export default function App() {
 
                       <label className="field-label">
                         <span>
-                          Ngưỡng tự khóa mỗi tháng (ký tự) —{" "}
-                          {cloudTab === "azure"
-                            ? "Gói F0 miễn phí 2.000.000/tháng (~44 giờ họp)"
-                            : cloudTab === "google"
-                            ? "Gói Free miễn phí 500.000/tháng (~11 giờ họp)"
-                            : "Tự đặt giới hạn chi tiêu an toàn"}
+                          {isSonioxTab
+                            ? `Ngưỡng tự khóa mỗi tháng (giờ âm thanh) — ~$0.18/giờ Nghe + Dịch (VD: ${cloudLimit || 10} giờ ≈ $${((Number(cloudLimit) || 10) * 0.18).toFixed(2)})`
+                            : `Ngưỡng tự khóa mỗi tháng (ký tự) — ${
+                                cloudTab === "azure"
+                                  ? "Gói F0 miễn phí 2.000.000/tháng (~44 giờ họp)"
+                                  : cloudTab === "google"
+                                  ? "Gói Free miễn phí 500.000/tháng (~11 giờ họp)"
+                                  : "Tự đặt giới hạn chi tiêu an toàn"
+                              }`}
                         </span>
                         <input
                           className="input"
                           type="number"
-                          min={1000}
-                          step={10000}
+                          min={isSonioxTab ? 1 : 1000}
+                          step={isSonioxTab ? 1 : 10000}
                           value={cloudLimit}
                           onChange={(e) => setCloudLimit(Number(e.target.value))}
                         />
                       </label>
 
-                      <label className="toggle-row">
-                        <span>Dịch nháp khi đang nói chạy 100% Offline (Tiết kiệm ~85% hạn mức API)</span>
-                        <span className="switch">
-                          <input
-                            type="checkbox"
-                            checked={cloudDraftOffline}
-                            onChange={(e) => setCloudDraftOffline(e.target.checked)}
-                          />
-                          <span className="switch-track" />
-                        </span>
-                      </label>
+                      {isSonioxTab ? (
+                        <div
+                          style={{
+                            fontSize: 11.5,
+                            color: "var(--text-2)",
+                            lineHeight: 1.45,
+                            padding: "8px 10px",
+                            borderRadius: 8,
+                            border: "1px solid var(--border)",
+                            background: "var(--bg-0)",
+                          }}
+                        >
+                          <strong style={{ color: "var(--text-0)" }}>Siêu nhẹ ~0% CPU/GPU:</strong> Soniox nghe &amp; dịch trực tiếp 60 ngôn ngữ (tự nhận diện khi diễn giả đổi tiếng giữa câu) + nạp sẵn Từ điển &amp; Slide DAU. Tự động ngưng gửi audio khi im lặng &gt;5 giây để tiết kiệm chi phí.
+                        </div>
+                      ) : (
+                        <label className="toggle-row">
+                          <span>Dịch nháp khi đang nói chạy 100% Offline (Tiết kiệm ~85% hạn mức API)</span>
+                          <span className="switch">
+                            <input
+                              type="checkbox"
+                              checked={cloudDraftOffline}
+                              onChange={(e) => setCloudDraftOffline(e.target.checked)}
+                            />
+                            <span className="switch-track" />
+                          </span>
+                        </label>
+                      )}
 
                       <label className="toggle-row">
                         <span>Tự khóa ở hạn mức &amp; tự chuyển mượt về Offline SOTA (Không phát sinh phí)</span>
