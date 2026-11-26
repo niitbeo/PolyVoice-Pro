@@ -4,7 +4,26 @@ Tất cả thay đổi đáng chú ý của **DAU Voice Pro** được ghi nhậ
 
 ---
 
-## [1.1.4] — 2026-11-25 *(Bản phát hành chính thức mới nhất)*
+## [1.2.0] — 2026-11-26 *(Bản phát hành chính thức mới nhất)*
+
+### 🌐 Phát Mã QR Hội nghị Công khai 4G/5G Miễn phí HTTPS (Zero-Server Tunnel)
+- **Phát QR Công khai 1 chạm (`*.trycloudflare.com`, \$0, không cần tài khoản):** Đại biểu dùng **4G/5G hoặc Wi-Fi cách ly hội trường** quét QR xem phụ đề đa ngôn ngữ tức thì mà không cần mở port router hay thuê máy chủ. Tự tải `cloudflared` chính chủ (~18 MB, chỉ 1 lần duy nhất cho macOS & Windows) kèm thanh tiến độ và xác minh DNS qua `1.1.1.1` DoH trước khi hiển thị QR.
+- **Tùy chọn Tên miền cố định của trường (`Cloudflare Named Tunnel`):** Hỗ trợ dán Token để phát trên tên miền cố định (VD: `https://live.dau.edu.vn`) in sẵn lên standee/backdrop hội nghị.
+- **Bảo mật cô lập 2 lớp & Khóa mã PIN 4 số:** Mở riêng cổng ASGI cô lập `127.0.0.1:18768` chỉ phục vụ `/audience` và `/ws/audience` (tuyệt đối không lộ `/api/*`, `/ws`, API Key hay log); gia cố `LoopbackGuardMiddleware` chặn mọi header reverse-proxy (`CF-Connecting-IP`, `CF-Ray`, `X-Forwarded-For`); tùy chọn khóa PIN 4 số tự nhúng vào QR; tự động đồng bộ mã QR góc trên Màn hình LED và bổ sung WebSocket Heartbeat 25 giây chống ngắt kết nối nhàn rỗi.
+
+### ☁️ Tích hợp Cloud AI Toàn diện — Soniox Real-Time Pro & 100% Google Cloud
+- **Soniox Real-Time Pro (`stt-rt-v6`, 60 ngôn ngữ, ~0% CPU):** Nghe + dịch trực tiếp trên mây, hỗ trợ **Dịch 2 chiều tự động (`two_way`)** trên 1 Micro/Mixer, phân biệt nhiều diễn giả (`S1`/`S2`), tự nối phiên WebSocket mượt mỗi 4 phút giữ nguyên ngữ cảnh 500 ký tự, và nạp sẵn Từ điển & Slide DAU.
+- **100% Google Cloud (Speech-to-Text + Translation API):** Gỡ khóa tuần tự HTTP để dịch nháp & câu chốt chạy song song trên Google Cloud (`95–165 ms`, khớp 0% giật chữ khi chốt), bổ sung `GoogleCloudStreamingASR` (`speech.googleapis.com/v1`) dùng chung 1 API Key, giao diện Cloud gọn chỉ còn 2 tab chính (**Soniox Real-Time** & **Google Cloud**).
+
+### 🖥️ Màn hình LED Toàn văn, Thư viện Phiên Họp & Chống Giật Chữ Chuẩn Quốc Tế
+- **Chế độ `Toàn văn` (`full-text`) trên Màn hình LED & Lịch sử:** Chạy văn bản song ngữ 2 cột (hoặc 1 cột) nối liền mạch không thẻ/không timestamp, cỡ chữ lên tới `140px`, 3 màu chữ (Trắng / Vàng / Xanh), tự ẩn thanh trên sau 3 giây khi đang phát, tự động chừa vùng đệm an toàn cho `QR góc` & thanh điều khiển nổi.
+- **Thư viện Phiên Họp (`Thư viện`):** Xem lại, tìm kiếm, sao chép và tải lại toàn bộ biên bản `.TXT` / phụ đề `.SRT` đã tự lưu ngay trong ứng dụng.
+- **Khử giật khung & Chế độ Êm mắt chuẩn Wordly (0% nhảy chữ):** Khóa chiều cao khung Spotlight (`0,0px` rung lắc), đồng nhất độ đậm font chữ nháp (`font-weight: 700`), tối ưu nhịp câu tiếng Việt chống treo câu dài 30–49 giây, và đưa công tắc **`Dịch nháp khi đang nói (Tắt = 0% nhảy chữ)`** ra ngay cột trái cùng thanh ticker mảnh ở đáy khung.
+- **Tối ưu hiển thị điện thoại QR (`390px`) & LED chế độ Sáng:** Hiển thị rõ nhãn `Song ngữ` trên màn hình iPhone `390px`, đồng bộ nhãn diễn giả `S1`/`S2`, và nâng độ tương phản chế độ `Sáng` cho máy chiếu hội trường ban ngày.
+
+---
+
+## [1.1.4] — 2026-11-25
 
 ### 🍎 Khắc phục triệt để quyền `Âm thanh máy` (ScreenCaptureKit) trên macOS
 - **Niêm phong chữ ký gói `.app` chuẩn Apple Silicon (`APPLE_SIGNING_IDENTITY="-"` + `Entitlements.plist`):** Khắc phục lỗi macOS TCC từ chối `Âm thanh máy` ngay cả khi người dùng đã cấp quyền trong *Ghi màn hình & Âm thanh hệ thống* (do bản build CI trước đó thiếu niêm phong `CodeResources` & `Info.plist=not bound`).

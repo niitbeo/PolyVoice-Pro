@@ -92,8 +92,9 @@ class CloudQuotaManager:
     def _default_config(self) -> dict[str, Any]:
         return {
             "provider": "soniox",
-            "hard_cap_enabled": True,
-            "draft_offline": True,
+            "hard_cap_enabled": False,
+            "draft_offline": False,
+            "google_cloud_stt": True,
             "providers": {
                 k: dict(v) for k, v in PROVIDER_DEFAULTS.items()
             },
@@ -111,6 +112,8 @@ class CloudQuotaManager:
                         base["hard_cap_enabled"] = raw["hard_cap_enabled"]
                     if isinstance(raw.get("draft_offline"), bool):
                         base["draft_offline"] = raw["draft_offline"]
+                    if isinstance(raw.get("google_cloud_stt"), bool):
+                        base["google_cloud_stt"] = raw["google_cloud_stt"]
                     raw_provs = raw.get("providers") or {}
                     for pid in PROVIDER_DEFAULTS:
                         if isinstance(raw_provs.get(pid), dict):
@@ -217,6 +220,7 @@ class CloudQuotaManager:
                 "month": self._quota["month"],
                 "hard_cap_enabled": bool(self._config["hard_cap_enabled"]),
                 "draft_offline": bool(self._config["draft_offline"]),
+                "google_cloud_stt": bool(self._config.get("google_cloud_stt", True)),
                 "active_ready": bool(provs_out[active_pid]["has_key"]),
                 "active_cap_reached": bool(provs_out[active_pid]["cap_reached"]),
                 "providers": provs_out,
@@ -233,6 +237,7 @@ class CloudQuotaManager:
             pcfg["used_chars"] = int(self._quota["usage"].get(pid, 0))
             pcfg["hard_cap_enabled"] = bool(self._config["hard_cap_enabled"])
             pcfg["draft_offline"] = bool(self._config["draft_offline"])
+            pcfg["google_cloud_stt"] = bool(self._config.get("google_cloud_stt", True))
             return pcfg
 
     def update(self, patch: dict[str, Any]) -> dict[str, Any]:
@@ -244,6 +249,8 @@ class CloudQuotaManager:
                 self._config["hard_cap_enabled"] = patch["hard_cap_enabled"]
             if isinstance(patch.get("draft_offline"), bool):
                 self._config["draft_offline"] = patch["draft_offline"]
+            if isinstance(patch.get("google_cloud_stt"), bool):
+                self._config["google_cloud_stt"] = patch["google_cloud_stt"]
 
             # Allow updating a specific provider's settings cleanly
             target_pid = patch.get("target_provider") or self._config["provider"]

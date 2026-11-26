@@ -599,6 +599,16 @@ AUDIENCE_HTML = (
       border-color: var(--border-strong);
       color: var(--accent-text);
     }
+    .badge.spk2 {
+      background: rgba(56, 189, 248, 0.14);
+      border-color: rgba(56, 189, 248, 0.38);
+      color: #38bdf8;
+    }
+    html[data-theme="light"] .badge.spk2 {
+      background: rgba(2, 132, 199, 0.10);
+      border-color: rgba(2, 132, 199, 0.28);
+      color: #0369a1;
+    }
     .src {
       color: var(--src-text);
       line-height: 1.48;
@@ -667,6 +677,95 @@ AUDIENCE_HTML = (
       text-align: center;
     }
     .freeze-overlay.show { display: flex; }
+    .pin-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 95;
+      background: rgba(8, 10, 16, 0.92);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .pin-overlay.show { display: flex; }
+    .pin-card {
+      width: min(360px, 100%);
+      background: var(--card);
+      border: 1px solid var(--border-strong);
+      border-radius: 18px;
+      padding: 24px 20px;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+    }
+    .pin-icon {
+      width: 48px;
+      height: 48px;
+      border-radius: 14px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--accent-soft);
+      border: 1px solid var(--border-strong);
+      color: var(--accent-text);
+    }
+    .pin-title {
+      font-size: 17px;
+      font-weight: 800;
+      color: var(--text);
+    }
+    .pin-sub {
+      font-size: 13px;
+      line-height: 1.5;
+      color: var(--muted);
+    }
+    .pin-form {
+      width: 100%;
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .pin-input {
+      flex: 1;
+      height: 44px;
+      border-radius: 11px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 20px;
+      font-weight: 800;
+      letter-spacing: 0.35em;
+      text-align: center;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      outline: none;
+    }
+    .pin-input:focus {
+      border-color: var(--brand);
+      box-shadow: 0 0 0 3px rgba(196, 0, 15, 0.22);
+    }
+    .pin-btn {
+      height: 44px;
+      padding: 0 18px;
+      border: none;
+      border-radius: 11px;
+      background: linear-gradient(135deg, #c4000f, #dc2626);
+      color: #ffffff;
+      font-size: 13.5px;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .pin-err {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: #f87171;
+      min-height: 18px;
+    }
     .freeze-title {
       font-size: 20px;
       font-weight: 800;
@@ -699,7 +798,7 @@ AUDIENCE_HTML = (
     }
     .jump.show { display: inline-flex; }
 
-    @media (max-width: 390px) {
+    @media (max-width: 340px) {
       header { padding-left: 10px; padding-right: 10px; }
       .ctrl-btn span.btn-label { display: none; }
       .ctrl-btn { padding: 0 9px; }
@@ -805,7 +904,7 @@ AUDIENCE_HTML = (
             <path d="M12 20h.01"/><path d="M2 8.82a15 15 0 0 1 20 0"/>
             <path d="M5 12.859a10 10 0 0 1 14 0"/><path d="M8.5 16.429a5 5 0 0 1 7 0"/>
           </svg>
-          <span>Mạng nội bộ • Không cần Internet</span>
+          <span id="emptyChipText">Mạng nội bộ • Không cần Internet</span>
         </div>
       </div>
     </main>
@@ -819,6 +918,36 @@ AUDIENCE_HTML = (
       __LOGO_IMG__
       <div class="freeze-title">DAU Voice Pro</div>
       <div class="freeze-msg" id="freezeMsg">Tạm nghỉ — Phiên dịch hội nghị sẽ tiếp tục trong giây lát</div>
+    </div>
+
+    <div class="pin-overlay" id="pinOverlay" role="dialog" aria-modal="true" aria-labelledby="pinTitle">
+      <div class="pin-card">
+        <div class="pin-icon" aria-hidden="true">
+          <svg class="lucide" width="22" height="22" viewBox="0 0 24 24">
+            <rect width="18" height="11" x="3" y="11" rx="2" ry="2"/>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+          </svg>
+        </div>
+        <div class="pin-title" id="pinTitle">Phòng hội nghị có mã PIN</div>
+        <div class="pin-sub">
+          Nhập mã PIN 4 số từ ban tổ chức hoặc quét lại mã QR mới nhất trên màn hình hội trường.
+        </div>
+        <form class="pin-form" id="pinForm">
+          <input
+            id="pinInput"
+            class="pin-input"
+            type="text"
+            inputmode="numeric"
+            pattern="[0-9]{4}"
+            maxlength="4"
+            autocomplete="one-time-code"
+            placeholder="0000"
+            aria-label="Mã PIN 4 số"
+          />
+          <button type="submit" class="pin-btn">Vào phòng</button>
+        </form>
+        <div class="pin-err" id="pinErr"></div>
+      </div>
     </div>
 
     <button class="jump" id="jumpBtn">
@@ -849,6 +978,15 @@ AUDIENCE_HTML = (
     const liveSrcText = document.getElementById("liveSrcText");
     const freezeOverlay = document.getElementById("freezeOverlay");
     const freezeMsg = document.getElementById("freezeMsg");
+    const emptyChipText = document.getElementById("emptyChipText");
+    const pinOverlay = document.getElementById("pinOverlay");
+    const pinForm = document.getElementById("pinForm");
+    const pinInput = document.getElementById("pinInput");
+    const pinErr = document.getElementById("pinErr");
+
+    if (emptyChipText && location.protocol === "https:") {
+      emptyChipText.textContent = "Kết nối HTTPS bảo mật • Hoạt động qua 4G/5G & Wi-Fi";
+    }
 
     function setFrozen(frozen, msg) {
       if (msg) freezeMsg.textContent = msg;
@@ -881,7 +1019,9 @@ AUDIENCE_HTML = (
 
     let fontSize = 20;
     let showSource = true;
-    let selectedLang = new URLSearchParams(location.search).get("lang") || "follow";
+    const urlParams = new URLSearchParams(location.search);
+    let selectedLang = urlParams.get("lang") || "follow";
+    let roomPin = (urlParams.get("pin") || "").trim();
     if ([...langSelect.options].some(o => o.value === selectedLang)) {
       langSelect.value = selectedLang;
     } else {
@@ -898,6 +1038,36 @@ AUDIENCE_HTML = (
     let pinnedBottom = true;
     let ws = null;
     let reconnectTimer = null;
+    let heartbeatTimer = null;
+    let pinBlocked = false;
+
+    function showPinPrompt(errText) {
+      pinBlocked = true;
+      if (pinErr) pinErr.textContent = errText || "";
+      if (pinOverlay) pinOverlay.classList.add("show");
+      if (pinInput) {
+        pinInput.value = "";
+        setTimeout(() => pinInput.focus(), 60);
+      }
+    }
+    function hidePinPrompt() {
+      pinBlocked = false;
+      if (pinErr) pinErr.textContent = "";
+      if (pinOverlay) pinOverlay.classList.remove("show");
+    }
+    if (pinForm) {
+      pinForm.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const val = (pinInput ? pinInput.value : "").replace(/\D/g, "").slice(0, 4);
+        if (val.length !== 4) {
+          if (pinErr) pinErr.textContent = "Vui lòng nhập đủ 4 chữ số.";
+          return;
+        }
+        roomPin = val;
+        hidePinPrompt();
+        connect();
+      });
+    }
 
     function groupByParagraph(list) {
       const out = [];
@@ -941,9 +1111,17 @@ AUDIENCE_HTML = (
       for (let i = 0; i < grouped.length; i++) {
         const item = grouped[i];
         const isLatest = i === grouped.length - 1;
-        const spkBadge = item.speaker === "remote"
-          ? `<span class="badge remote">${ICON_HEADPHONES}<span>Đối tác</span></span>`
-          : item.speaker === "self" ? `<span class="badge">${ICON_MIC}<span>Diễn giả</span></span>` : "";
+        const spkStr = String(item.speaker || "");
+        let spkBadge = "";
+        if (spkStr === "remote") {
+          spkBadge = `<span class="badge remote">${ICON_HEADPHONES}<span>Đối tác</span></span>`;
+        } else if (spkStr === "self") {
+          spkBadge = `<span class="badge">${ICON_MIC}<span>Diễn giả</span></span>`;
+        } else if (/^S\d+$/i.test(spkStr)) {
+          const num = parseInt(spkStr.slice(1), 10) || 1;
+          const cls = num % 2 === 0 ? "badge spk2" : "badge";
+          spkBadge = `<span class="${cls}">${ICON_MIC}<span>Diễn giả ${num}</span></span>`;
+        }
         html += `<div class="card${isLatest ? " latest" : ""}">
           <div class="meta"><span>${escapeHtml(item.timestamp || "")}</span>${spkBadge}</div>
           ${showSource ? `<div class="src" style="font-size:${Math.max(13, fontSize - 5)}px">${escapeHtml(item.source_text)}</div>` : ""}
@@ -993,26 +1171,50 @@ AUDIENCE_HTML = (
       connect();
     });
 
+    function stopHeartbeat() {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    }
+
     function connect() {
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
+      stopHeartbeat();
       if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
         ws.onclose = null;
         ws.close();
       }
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      const sock = new WebSocket(`${proto}//${location.host}/ws/audience?lang=${encodeURIComponent(selectedLang)}`);
+      const qs = new URLSearchParams({ lang: selectedLang });
+      if (roomPin) qs.set("pin", roomPin);
+      const sock = new WebSocket(`${proto}//${location.host}/ws/audience?${qs.toString()}`);
       ws = sock;
       sock.onopen = () => {
-        if (ws === sock) setConnState("ready");
+        if (ws !== sock) return;
+        setConnState("ready");
+        // 25s heartbeat keeps Cloudflare Tunnel WebSocket alive well under its 100s idle timeout
+        heartbeatTimer = setInterval(() => {
+          if (ws === sock && sock.readyState === WebSocket.OPEN) {
+            try { sock.send("ping"); } catch {}
+          }
+        }, 25000);
       };
       sock.onmessage = (ev) => {
         if (ws !== sock) return;
         try {
           const msg = JSON.parse(ev.data);
-          if (msg.type === "status") {
+          if (msg.type === "pong") {
+            return;
+          } else if (msg.type === "pin_required") {
+            const invalid = Boolean(msg.data && msg.data.invalid);
+            showPinPrompt(invalid ? "Mã PIN chưa đúng hoặc đã thay đổi. Vui lòng nhập lại." : "");
+            return;
+          } else if (msg.type === "status") {
+            hidePinPrompt();
             setConnState(msg.data && msg.data.listening ? "live" : "ready");
             if (msg.data && typeof msg.data.display_frozen === "boolean") {
               setFrozen(msg.data.display_frozen, msg.data.display_freeze_message);
@@ -1055,8 +1257,14 @@ AUDIENCE_HTML = (
           }
         } catch {}
       };
-      sock.onclose = () => {
+      sock.onclose = (ev) => {
         if (ws !== sock) return;
+        stopHeartbeat();
+        if (ev && ev.code === 4403) {
+          if (!pinBlocked) showPinPrompt("Phòng hội nghị yêu cầu mã PIN 4 số.");
+          return;
+        }
+        if (pinBlocked) return;
         setConnState("warn");
         reconnectTimer = setTimeout(connect, 1200);
       };

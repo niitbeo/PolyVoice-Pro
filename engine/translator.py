@@ -1251,13 +1251,20 @@ class GoogleCloudTranslator:
         self.api_key = api_key.strip()
         self._timeout_s = timeout_s
         self._client_lock = threading.Lock()
-        self._client = httpx.Client(timeout=timeout_s)
+        self._client = httpx.Client(
+            timeout=timeout_s,
+            limits=httpx.Limits(max_keepalive_connections=6, max_connections=12),
+        )
         self._cache = LRUCache(maxsize=2048)
 
     def _get_client(self) -> httpx.Client:
-        if self._client.is_closed:
-            self._client = httpx.Client(timeout=self._timeout_s)
-        return self._client
+        with self._client_lock:
+            if self._client.is_closed:
+                self._client = httpx.Client(
+                    timeout=self._timeout_s,
+                    limits=httpx.Limits(max_keepalive_connections=6, max_connections=12),
+                )
+            return self._client
 
     def close(self) -> None:
         with self._client_lock:
@@ -1289,12 +1296,12 @@ class GoogleCloudTranslator:
         payload: dict = {"q": clean, "target": tl, "format": "text"}
         if sl:
             payload["source"] = sl
-        with self._client_lock:
-            resp = self._get_client().post(
-                "https://translation.googleapis.com/language/translate/v2",
-                headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
-                json=payload,
-            )
+        client = self._get_client()
+        resp = client.post(
+            "https://translation.googleapis.com/language/translate/v2",
+            headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
+            json=payload,
+        )
         if resp.status_code >= 400:
             err_msg = ""
             try:

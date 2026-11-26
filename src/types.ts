@@ -120,6 +120,7 @@ export interface CloudApiStatus {
   month: string;
   hard_cap_enabled: boolean;
   draft_offline: boolean;
+  google_cloud_stt?: boolean;
   active_ready: boolean;
   active_cap_reached: boolean;
   providers: Record<CloudProviderId, CloudProviderState>;
@@ -196,12 +197,36 @@ export interface SessionLogDetail {
   is_active: boolean;
 }
 
+export type PublicTunnelStatus = "idle" | "downloading" | "starting" | "ready" | "error";
+export type PublicTunnelMode = "quick" | "named";
+
 export interface AudienceInfo {
   lan_ip: string;
   port: number;
+  active_mode?: "lan" | "public";
   audience_url: string;
   obs_url: string;
   qr_svg: string;
+  lan_url?: string;
+  lan_url_display?: string;
+  lan_qr_svg?: string;
+  public_active?: boolean;
+  public_ready?: boolean;
+  public_status?: PublicTunnelStatus;
+  public_mode?: PublicTunnelMode;
+  public_port?: number;
+  public_url?: string;
+  public_url_display?: string;
+  public_qr_svg?: string;
+  public_error?: string;
+  public_status_message?: string;
+  download_percent?: number;
+  cloudflared_installed?: boolean;
+  pin_enabled?: boolean;
+  room_pin?: string;
+  named_configured?: boolean;
+  named_domain?: string;
+  named_token_masked?: string;
   connected_count: number;
   active_languages: string[];
 }
@@ -341,6 +366,7 @@ export interface EngineStatus {
   cloud_api?: CloudApiStatus;
   cloud_fallback_notice?: string;
   soniox_active?: boolean;
+  google_stt_active?: boolean;
   envit5_device?: string;
   platform: {
     os: string;

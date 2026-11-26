@@ -29,6 +29,7 @@ import {
   Layers,
   LayoutList,
   Loader2,
+  Lock,
   LogOut,
   Mic,
   MicOff,
@@ -38,6 +39,7 @@ import {
   Pencil,
   Play,
   Plus,
+  Power,
   Presentation,
   QrCode,
   RefreshCw,
@@ -283,6 +285,12 @@ export default function App() {
   const [qrOpen, setQrOpen] = useState(false);
   const [audienceInfo, setAudienceInfo] = useState<AudienceInfo | null>(null);
   const [audienceCount, setAudienceCount] = useState(0);
+  const [qrTab, setQrTab] = useState<"lan" | "public">("lan");
+  const [tunnelBusy, setTunnelBusy] = useState(false);
+  const [tunnelActionError, setTunnelActionError] = useState("");
+  const [namedSectionOpen, setNamedSectionOpen] = useState(false);
+  const [namedDomainInput, setNamedDomainInput] = useState("");
+  const [namedTokenInput, setNamedTokenInput] = useState("");
 
   const [fileModalOpen, setFileModalOpen] = useState(false);
   const [fileBusy, setFileBusy] = useState(false);
@@ -322,8 +330,9 @@ export default function App() {
   const [cloudKeyInput, setCloudKeyInput] = useState("");
   const [cloudModel, setCloudModel] = useState("stt-rt-v6");
   const [cloudLimit, setCloudLimit] = useState(10);
-  const [cloudHardCap, setCloudHardCap] = useState(true);
-  const [cloudDraftOffline, setCloudDraftOffline] = useState(true);
+  const [cloudHardCap, setCloudHardCap] = useState(false);
+  const [cloudDraftOffline, setCloudDraftOffline] = useState(false);
+  const [cloudGoogleStt, setCloudGoogleStt] = useState(true);
   const [cloudSaving, setCloudSaving] = useState(false);
   const [cloudTestBusy, setCloudTestBusy] = useState(false);
   const [cloudTestResult, setCloudTestResult] = useState<{
@@ -482,6 +491,15 @@ export default function App() {
       if (mRes.ok) {
         setModels(await mRes.json());
       }
+      fetch(`${ENGINE_HTTP}/api/audience/info`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((aInfo: AudienceInfo | null) => {
+          if (aInfo) {
+            setAudienceInfo(aInfo);
+            setAudienceCount(Number(aInfo.connected_count || 0));
+          }
+        })
+        .catch(() => {});
       setConnected(true);
     } catch {
       setConnected(false);
@@ -620,6 +638,15 @@ export default function App() {
                   }
                 : prev
             );
+          } else if (msg.type === "audience_info" && msg.data) {
+            const info: AudienceInfo = msg.data;
+            setAudienceInfo(info);
+            setAudienceCount(Number(info.connected_count || 0));
+            if (info.public_error) {
+              setTunnelActionError(info.public_error);
+            } else if (info.public_ready) {
+              setTunnelActionError("");
+            }
           } else if (msg.type === "model_progress") {
             const prog: ModelState = msg.data;
             if (prog.status === "downloading") {
@@ -1177,15 +1204,123 @@ export default function App() {
 
   const handleOpenQrModal = async () => {
     setQrOpen(true);
+    setTunnelActionError("");
     try {
       const res = await fetch(`${ENGINE_HTTP}/api/audience/info`);
       if (res.ok) {
         const data: AudienceInfo = await res.json();
         setAudienceInfo(data);
         setAudienceCount(data.connected_count);
+        if (data.named_domain && !namedDomainInput) {
+          setNamedDomainInput(data.named_domain);
+        }
+        if (data.public_active || data.public_ready) {
+          setQrTab("public");
+        }
       }
     } catch (e) {
       setErrorMsg(`Không thể tạo mã QR phòng họp: ${String(e)}`);
+    }
+  };
+
+  const handleStartPublicTunnel = async (mode: "quick" | "named" = "quick") => {
+    setTunnelBusy(true);
+    setTunnelActionError("");
+    setQrTab("public");
+    try {
+      const payload: Record<string, unknown> = {
+        mode,
+        pin_enabled: audienceInfo?.pin_enabled ?? false,
+      };
+      if (mode === "named") {
+        payload.custom_domain = namedDomainInput.trim();
+        if (namedTokenInput.trim()) {
+          payload.tunnel_token = namedTokenInput.trim();
+        }
+      }
+      const res = await fetch(`${ENGINE_HTTP}/api/audience/tunnel/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setTunnelActionError(String(body?.detail || "Không thể bật đường hầm công khai 4G/5G."));
+        return;
+      }
+      setAudienceInfo(body as AudienceInfo);
+      if (mode === "named") {
+        setNamedTokenInput("");
+      }
+    } catch (e) {
+      setTunnelActionError(`Lỗi kết nối máy chủ cục bộ: ${String(e)}`);
+    } finally {
+      setTunnelBusy(false);
+    }
+  };
+
+  const handleStopPublicTunnel = async () => {
+    setTunnelBusy(true);
+    setTunnelActionError("");
+    try {
+      const res = await fetch(`${ENGINE_HTTP}/api/audience/tunnel/stop`, { method: "POST" });
+      if (res.ok) {
+        const data: AudienceInfo = await res.json();
+        setAudienceInfo(data);
+      }
+    } catch (e) {
+      setTunnelActionError(`Không thể tắt phát công khai: ${String(e)}`);
+    } finally {
+      setTunnelBusy(false);
+    }
+  };
+
+  const handleToggleRoomPin = async (nextEnabled: boolean) => {
+    setTunnelActionError("");
+    try {
+      const res = await fetch(`${ENGINE_HTTP}/api/audience/tunnel/pin`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: nextEnabled }),
+      });
+      if (res.ok) {
+        const data: AudienceInfo = await res.json();
+        setAudienceInfo(data);
+      }
+    } catch (e) {
+      setTunnelActionError(`Không thể cập nhật mã PIN: ${String(e)}`);
+    }
+  };
+
+  const handleRegenerateRoomPin = async () => {
+    setTunnelActionError("");
+    try {
+      const res = await fetch(`${ENGINE_HTTP}/api/audience/tunnel/pin`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true, regenerate: true }),
+      });
+      if (res.ok) {
+        const data: AudienceInfo = await res.json();
+        setAudienceInfo(data);
+      }
+    } catch (e) {
+      setTunnelActionError(`Không thể đổi mã PIN: ${String(e)}`);
+    }
+  };
+
+  const handleClearNamedConfig = async () => {
+    setTunnelActionError("");
+    try {
+      const res = await fetch(`${ENGINE_HTTP}/api/audience/tunnel/named`, { method: "DELETE" });
+      if (res.ok) {
+        const data: AudienceInfo = await res.json();
+        setAudienceInfo(data);
+        setNamedDomainInput("");
+        setNamedTokenInput("");
+      }
+    } catch (e) {
+      setTunnelActionError(`Không thể xóa cấu hình tên miền riêng: ${String(e)}`);
     }
   };
 
@@ -1741,6 +1876,7 @@ export default function App() {
     );
     setCloudHardCap(Boolean(data.hard_cap_enabled));
     setCloudDraftOffline(Boolean(data.draft_offline));
+    setCloudGoogleStt(data.google_cloud_stt !== false);
     setCloudTestResult(null);
   };
 
@@ -1793,6 +1929,7 @@ export default function App() {
             : Math.max(1000, Number(cloudLimit) || 480000),
         hard_cap_enabled: cloudHardCap,
         draft_offline: cloudDraftOffline,
+        google_cloud_stt: cloudGoogleStt,
       };
       if (cloudKeyInput.trim()) {
         body.api_key = cloudKeyInput.trim();
@@ -1875,9 +2012,15 @@ export default function App() {
       const data = await res.json();
       if (data.ok) {
         if (data.cloud_api) setCloudStatus(data.cloud_api);
+        const sttNote =
+          cloudTab === "google" && typeof data.stt_ok === "boolean"
+            ? data.stt_ok
+              ? " • Nghe giọng Google STT: Sẵn sàng (100% Cloud!)"
+              : " • Lưu ý: Cloud Speech-to-Text API chưa bật trên Key này (chỉ mới bật dịch chữ)."
+            : "";
         setCloudTestResult({
           ok: true,
-          message: `Kết nối thành công (${data.engine} • ${data.latency_ms}ms): "${data.translated_text}"`,
+          message: `Kết nối thành công (${data.engine} • ${data.latency_ms}ms): "${data.translated_text}"${sttNote}`,
         });
       } else {
         setCloudTestResult({
@@ -2684,8 +2827,18 @@ export default function App() {
       Date.now() < spotDwellHoldUntil &&
       partialWords < 5
   );
+  // When `translatePartials` is OFF (Wordly-style 0%-flicker conference mode), keep the last finalized
+  // bilingual sentence rock-solid in Spotlight instead of replacing it with pulsing dots, and show the
+  // live incoming speech gently in a calm 1-line bottom ticker bar!
+  const calmTickerText =
+    !translatePartials && partial?.source_text && latestItem?.translated_text
+      ? partial.source_text
+      : "";
   const showPartialAsActive = Boolean(
-    activePartial && !holdFreshSpotFinal && (partialHasMt || !translatePartials || !latestItem?.translated_text)
+    activePartial &&
+      !holdFreshSpotFinal &&
+      !calmTickerText &&
+      (partialHasMt || !latestItem?.translated_text)
   );
   const partialIsNewSentence = Boolean(
     showPartialAsActive && activePartial && (!latestItem || activePartial.id !== latestItem.id)
@@ -2718,6 +2871,9 @@ export default function App() {
       !["lao_Laoo", "khm_Khmr", "mya_Mymr"].includes(sourceLang)
     ) {
       return "Soniox Cloud";
+    }
+    if (status?.google_stt_active) {
+      return "Google Cloud STT";
     }
     if (sourceLang === "vie_Latn") return status?.zipformer_ready ? "Zipformer-30M" : "VietASR";
     if (sourceLang === "eng_Latn") return status?.moonshine_en_ready ? "Hybrid-EN" : "Whisper-Turbo";
@@ -3086,13 +3242,24 @@ export default function App() {
           )}
 
           <button
-            className={`btn topbar-btn ${qrOpen || audienceCount > 0 ? "active" : ""}`}
+            className={`btn topbar-btn ${qrOpen || audienceCount > 0 || audienceInfo?.public_ready ? "active" : ""}`}
             onClick={handleOpenQrModal}
             disabled={!connected}
-            title="Phát mã QR Wi-Fi nội bộ để khán giả quét xem phụ đề đa ngôn ngữ trên điện thoại + link OBS"
+            title={
+              audienceInfo?.public_ready
+                ? `Đang phát QR Công khai 4G/5G (${audienceInfo.public_url_display || audienceInfo.audience_url})`
+                : "Phát mã QR (LAN Offline hoặc Công khai 4G/5G miễn phí HTTPS) để đại biểu quét xem phụ đề đa ngôn ngữ + link OBS"
+            }
           >
             <QrCode size={13.5} /> <span className="topbar-btn-label">QR</span>
-            {audienceCount > 0 && <span className="btn-badge">{audienceCount}</span>}
+            {audienceInfo?.public_ready && (
+              <span className="btn-badge qr-4g-badge">
+                4G{audienceCount > 0 ? `·${audienceCount}` : ""}
+              </span>
+            )}
+            {!audienceInfo?.public_ready && audienceCount > 0 && (
+              <span className="btn-badge">{audienceCount}</span>
+            )}
           </button>
 
           <button
@@ -3829,10 +3996,25 @@ export default function App() {
                       )}
                     </span>
                     {activeP?.has_key && (
-                      <span style={{ color: "var(--text-2)", fontFamily: "ui-monospace, monospace", fontSize: 10.5 }}>
+                      <span
+                        style={{
+                          color: "var(--text-2)",
+                          fontFamily: "ui-monospace, monospace",
+                          fontSize: 10.5,
+                          whiteSpace: "nowrap",
+                          flexShrink: 0,
+                        }}
+                        title={
+                          !isSoniox && !status?.cloud_api?.hard_cap_enabled
+                            ? `Đã dùng ${activeP.used_chars.toLocaleString("vi-VN")} ký tự tháng này • Không giới hạn`
+                            : undefined
+                        }
+                      >
                         {isSoniox
                           ? `${formatSonioxDuration(activeP.used_chars)}/${formatSonioxDuration(activeP.monthly_limit)}`
-                          : `${activeP.used_chars.toLocaleString("vi-VN")}/${activeP.monthly_limit.toLocaleString("vi-VN")}`}
+                          : status?.cloud_api?.hard_cap_enabled
+                          ? `${activeP.used_chars.toLocaleString("vi-VN")}/${activeP.monthly_limit.toLocaleString("vi-VN")}`
+                          : `${activeP.used_chars.toLocaleString("vi-VN")} kt • ∞`}
                       </span>
                     )}
                   </div>
@@ -3840,7 +4022,11 @@ export default function App() {
                     {activeP?.has_key
                       ? isSoniox
                         ? "Nghe + Dịch trực tiếp 60 NN • ~0% CPU • Tự về Offline nếu mất mạng"
-                        : "Nháp chạy Offline (0 tốn quota) • Hết hạn mức tự về Offline"
+                        : status?.google_stt_active
+                        ? "100% Google Cloud (Nghe giọng + Dịch nháp & chốt) • ~0% CPU"
+                        : status?.cloud_api?.draft_offline === false
+                        ? "Dịch nháp & chốt 100% Google Cloud • Không giật chữ khi chốt câu"
+                        : "Nháp chạy Offline (tiết kiệm quota) • Câu chốt dịch bằng Google Cloud"
                       : "Bấm nút Cài đặt bên trên để dán API Key"}
                   </div>
                   {isSoniox &&
@@ -3981,6 +4167,24 @@ export default function App() {
                 title="Chọn chuẩn gom câu phụ đề"
               />
             </div>
+
+            <label
+              className="toggle-row"
+              title="Bật: dịch nháp êm theo cụm ý (~0,8s). Tắt: Chế độ Êm mắt chuẩn Wordly (0% nhảy chữ — chỉ hiện câu hoàn chỉnh, dòng đang nghe chạy ở thanh đáy)"
+            >
+              <span>Dịch nháp khi đang nói (Tắt = 0% nhảy chữ)</span>
+              <span className="switch">
+                <input
+                  type="checkbox"
+                  checked={translatePartials}
+                  onChange={(e) => {
+                    setTranslatePartials(e.target.checked);
+                    hotUpdateConfig({ translate_partials: e.target.checked });
+                  }}
+                />
+                <span className="switch-track" />
+              </span>
+            </label>
 
             <label
               className="toggle-row"
@@ -4250,22 +4454,7 @@ export default function App() {
                   </>
                 )}
 
-                <label className="toggle-row" style={{ marginTop: 4 }}>
-                  <span>Dịch ngay khi đang nói</span>
-                  <span className="switch">
-                    <input
-                      type="checkbox"
-                      checked={translatePartials}
-                      onChange={(e) => {
-                        setTranslatePartials(e.target.checked);
-                        hotUpdateConfig({ translate_partials: e.target.checked });
-                      }}
-                    />
-                    <span className="switch-track" />
-                  </span>
-                </label>
-
-                <div className="field-label">
+                <div className="field-label" style={{ marginTop: 4 }}>
                   <span>Beam giải mã Offline</span>
                   <StudioSelect
                     value={String(beamSize)}
@@ -4452,19 +4641,31 @@ export default function App() {
           {/* Live Spotlight — Smooth Continuous Top-to-Bottom 2-Tier Flow */}
           <section className={`spotlight ${status?.listening ? "live" : ""}`}>
             <div className="spotlight-head">
-              <span className="row" style={{ gap: 7 }}>
-                {isLiveSession && <span className="dot pulse" style={{ color: "var(--accent)" }} />}
-                <span>
+              <span className="row spot-head-title" style={{ gap: 7, minWidth: 0 }}>
+                {isLiveSession && <span className="dot pulse" style={{ color: "var(--accent)", flexShrink: 0 }} />}
+                <span className="spot-head-label">
                   {isLiveSession
                     ? sourceLang === "auto"
                       ? detectedSourceLabel || detectedSourceLang
-                        ? `Đang nghe (Tự nhận: ${detectedSourceLabel || shortLangName(detectedSourceLang)}) & dịch trực tiếp...`
-                        : "Đang tự nhận diện ngôn ngữ nói (99 NN) & dịch trực tiếp..."
-                      : `Đang nghe (${shortLangName(sourceLang, currentSrcObj?.name_vi)}) & dịch trực tiếp...`
+                        ? `Đang nghe (${detectedSourceLabel || shortLangName(detectedSourceLang)})...`
+                        : "Đang tự nhận diện (99 NN)..."
+                      : `Đang nghe (${shortLangName(sourceLang, currentSrcObj?.name_vi)})...`
                     : `${currentSrcObj?.name_vi || sourceLang} → ${currentTgtObj?.name_vi || targetLang}`}
                 </span>
               </span>
               <div className="metric-badges">
+                {mtMode === "cloud-api" && status?.cloud_api?.active_ready && (
+                  <span className="metric cloud-live-pill" title="Đang dịch trực tiếp qua Cloud AI chính thức">
+                    <Cloud size={10.5} />
+                    {status.soniox_active
+                      ? "Soniox 100%"
+                      : status.google_stt_active
+                      ? "Google Cloud 100%"
+                      : status.cloud_api.draft_offline === false
+                      ? "Google Cloud MT"
+                      : "Google Hybrid"}
+                  </span>
+                )}
                 {status?.slide_context?.enabled && status.slide_context.active_slide_index > 0 && (
                   <button
                     className="metric slide-match-pill"
@@ -4513,56 +4714,75 @@ export default function App() {
                 className={`spot-flow-curr ${flowCurrId !== "empty" ? "animated" : ""}`}
                 key={`curr-${flowCurrId}`}
               >
-                <div className={`spot-source ${flowCurrIsDraft ? "draft" : ""}`}>
-                  {flowCurrSource ? (
-                    <>
-                      {flowCurrSource}
-                      {flowCurrIsDraft && <span className="live-caret src" aria-hidden="true" />}
-                    </>
-                  ) : (
-                    <span className="spot-empty">
-                      Chọn <b>Ngôn ngữ nói</b> rồi bấm <b>Bắt đầu dịch</b> — hỗ trợ thu trực tiếp <b>Micro</b>, <b>YouTube</b> hoặc họp <b>2 Chiều</b>.
-                    </span>
-                  )}
+                <div className="spot-line-row">
+                  <span className="spot-lang-tag src">
+                    {shortLangName(
+                      sourceLang === "auto" ? detectedSourceLang || "auto" : sourceLang,
+                      currentSrcObj?.name_vi
+                    )}
+                  </span>
+                  <div className={`spot-source ${flowCurrIsDraft ? "draft" : ""}`}>
+                    {flowCurrSource ? (
+                      <>
+                        {flowCurrSource}
+                        {flowCurrIsDraft && <span className="live-caret src" aria-hidden="true" />}
+                      </>
+                    ) : (
+                      <span className="spot-empty">
+                        Chọn <b>Ngôn ngữ nói</b> rồi bấm <b>Bắt đầu dịch</b> — hỗ trợ thu trực tiếp <b>Micro</b>, <b>YouTube</b> hoặc họp <b>2 Chiều</b>.
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 <div className="spot-divider" />
 
-                <div className={`spot-target ${flowCurrIsDraft ? "draft" : ""}`}>
-                  {flowCurrTarget ? (
-                    flowCurrIsDraft && activePartial && (activePartial.stable_text || activePartial.unstable_text) ? (
-                      <>
-                        {activePartial.stable_text && (
-                          <span className="mt-stable">{activePartial.stable_text}</span>
-                        )}
-                        {activePartial.stable_text && activePartial.unstable_text ? " " : null}
-                        {activePartial.unstable_text && (
-                          <span className="mt-unstable">{activePartial.unstable_text}</span>
-                        )}
-                        <span className="live-caret" aria-hidden="true" />
-                      </>
-                    ) : (
-                      <>
-                        {flowCurrTarget}
-                        {flowCurrIsDraft && <span className="live-caret" aria-hidden="true" />}
-                      </>
-                    )
-                  ) : spotPendingDraft ? (
-                    <span className="spot-translating subtle" aria-label="Đang dịch trực tiếp">
-                      <span className="live-dots" aria-hidden="true">
-                        <span />
-                        <span />
-                        <span />
+                <div className="spot-line-row">
+                  <span className="spot-lang-tag tgt">
+                    {shortLangName(targetLang, currentTgtObj?.name_vi)}
+                  </span>
+                  <div className={`spot-target ${flowCurrIsDraft ? "draft" : ""}`}>
+                    {flowCurrTarget ? (
+                      flowCurrIsDraft && activePartial && (activePartial.stable_text || activePartial.unstable_text) ? (
+                        <>
+                          {activePartial.stable_text && (
+                            <span className="mt-stable">{activePartial.stable_text}</span>
+                          )}
+                          {activePartial.stable_text && activePartial.unstable_text ? " " : null}
+                          {activePartial.unstable_text && (
+                            <span className="mt-unstable">{activePartial.unstable_text}</span>
+                          )}
+                          <span className="live-caret" aria-hidden="true" />
+                        </>
+                      ) : (
+                        <>
+                          {flowCurrTarget}
+                          {flowCurrIsDraft && <span className="live-caret" aria-hidden="true" />}
+                        </>
+                      )
+                    ) : spotPendingDraft ? (
+                      <span className="spot-translating subtle" aria-label="Đang dịch trực tiếp">
+                        <span className="live-dots" aria-hidden="true">
+                          <span />
+                          <span />
+                          <span />
+                        </span>
                       </span>
-                    </span>
-                  ) : (
-                    <span className="spot-empty">
-                      Bản dịch thời gian thực sẽ xuất hiện tại đây...
-                    </span>
-                  )}
+                    ) : (
+                      <span className="spot-empty">
+                        Bản dịch thời gian thực sẽ xuất hiện tại đây...
+                      </span>
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
+            {calmTickerText && (
+              <div className="spot-calm-ticker" aria-live="polite">
+                <span className="dot pulse" style={{ color: "var(--accent)", flexShrink: 0 }} />
+                <span className="spot-calm-ticker-text">{calmTickerText}</span>
+              </div>
+            )}
           </section>
 
           {/* Quick Text Translation Test Bar */}
@@ -5162,115 +5382,440 @@ export default function App() {
             </div>
 
             {audienceInfo ? (
-              <div className="qr-grid">
-                <div className="qr-box">
-                  <div
-                    className="qr-svg"
-                    dangerouslySetInnerHTML={{ __html: audienceInfo.qr_svg }}
-                  />
-                  <div className="qr-scan-caption">
-                    <div className="qr-scan-title">Quét bằng Camera điện thoại</div>
-                    <div className="qr-scan-sub">Cùng Wi-Fi nội bộ • Không cần cài app</div>
-                  </div>
-                  <div className="qr-lang-strip">
-                    {["Anh", "Thái", "Lào", "Trung", "+200"].map((lbl) => (
-                      <span className="qr-lang-chip" key={lbl}>
-                        {lbl}
+              <>
+                <div className="qr-mode-tabs" role="tablist" aria-label="Chế độ phát QR">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={qrTab === "lan"}
+                    className={`qr-mode-tab ${qrTab === "lan" ? "active" : ""}`}
+                    onClick={() => setQrTab("lan")}
+                  >
+                    <Wifi size={14} />
+                    <div className="qr-mode-tab-text">
+                      <span>Mạng LAN (Offline)</span>
+                      <small>0% Internet • Cùng Wi-Fi nội bộ</small>
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={qrTab === "public"}
+                    className={`qr-mode-tab ${qrTab === "public" ? "active" : ""} ${
+                      audienceInfo.public_ready ? "live" : ""
+                    }`}
+                    onClick={() => setQrTab("public")}
+                  >
+                    <Globe size={14} />
+                    <div className="qr-mode-tab-text">
+                      <span className="qr-mode-tab-head">
+                        Công khai 4G/5G (Miễn phí HTTPS)
+                        {audienceInfo.public_ready && <span className="qr-live-pill">Đang phát</span>}
                       </span>
-                    ))}
-                  </div>
-                  {audienceInfo.active_languages.length > 0 && (
-                    <div className="qr-active-langs">
-                      Đang xem:{" "}
-                      {audienceInfo.active_languages
-                        .map((code) => {
-                          const found = languages.find((l) => l.code === code);
-                          return found ? found.name_vi : shortLangName(code);
-                        })
-                        .join(", ")}
+                      <small>Mọi điện thoại quét được • $0 không cần tài khoản</small>
                     </div>
-                  )}
+                  </button>
                 </div>
 
-                <div className="qr-details">
-                  <div className="qr-link-card featured">
-                    <div className="qr-link-head">
-                      <span className="qr-step-num primary">1</span>
-                      <Smartphone size={14} className="qr-link-icon primary" />
-                      <span className="qr-link-title">Khán giả trên điện thoại</span>
-                      <span className="qr-link-tag">Mạng LAN</span>
-                    </div>
-                    <div className="qr-url-row">
-                      <input
-                        className="input qr-url-input"
-                        readOnly
-                        value={audienceInfo.audience_url}
-                        onFocus={(e) => e.currentTarget.select()}
-                      />
-                      <button
-                        className="btn primary sm qr-copy-btn"
-                        onClick={() => handleCopy("qr-aud", audienceInfo.audience_url)}
-                      >
-                        {copiedId === "qr-aud" ? (
-                          <>
-                            <Check size={12} /> Đã chép
-                          </>
-                        ) : (
-                          <>
-                            <Copy size={12} /> Chép
-                          </>
+                <div className="qr-grid">
+                  <div className="qr-box">
+                    {qrTab === "lan" ? (
+                      <>
+                        <div
+                          className="qr-svg"
+                          dangerouslySetInnerHTML={{
+                            __html: audienceInfo.lan_qr_svg || audienceInfo.qr_svg,
+                          }}
+                        />
+                        <div className="qr-scan-caption">
+                          <div className="qr-scan-title">Quét bằng Camera điện thoại</div>
+                          <div className="qr-scan-sub">Cùng Wi-Fi nội bộ • Không cần cài app</div>
+                        </div>
+                      </>
+                    ) : audienceInfo.public_ready && audienceInfo.public_qr_svg ? (
+                      <>
+                        <div
+                          className="qr-svg is-public"
+                          dangerouslySetInnerHTML={{ __html: audienceInfo.public_qr_svg }}
+                        />
+                        <div className="qr-scan-caption">
+                          <div className="qr-scan-title qr-public-title">
+                            Quét bằng 4G/5G hoặc mọi Wi-Fi
+                          </div>
+                          <div className="qr-scan-sub">
+                            HTTPS tự động • Đã đồng bộ lên góc màn LED
+                          </div>
+                        </div>
+                        {audienceInfo.pin_enabled && audienceInfo.room_pin && (
+                          <div className="qr-pin-chip">
+                            <Lock size={11} /> PIN tự nhúng: <strong>{audienceInfo.room_pin}</strong>
+                          </div>
                         )}
-                      </button>
+                      </>
+                    ) : audienceInfo.public_status === "downloading" ||
+                      audienceInfo.public_status === "starting" ? (
+                      <div className="qr-public-placeholder">
+                        <Loader2 size={30} className="spin qr-public-spinner" />
+                        <div className="qr-scan-title">
+                          {audienceInfo.public_status === "downloading"
+                            ? "Đang tải Cloudflare Tunnel"
+                            : "Đang tạo tên miền HTTPS..."}
+                        </div>
+                        <div className="qr-scan-sub">
+                          {audienceInfo.public_status_message || "Vui lòng đợi vài giây..."}
+                        </div>
+                        {audienceInfo.public_status === "downloading" && (
+                          <div className="qr-dl-bar" aria-label="Tiến độ tải">
+                            <div
+                              className="qr-dl-fill"
+                              style={{
+                                width: `${Math.max(4, Math.min(100, audienceInfo.download_percent || 0))}%`,
+                              }}
+                            />
+                          </div>
+                        )}
+                        <button
+                          type="button"
+                          className="btn sm"
+                          onClick={handleStopPublicTunnel}
+                          disabled={tunnelBusy}
+                        >
+                          Hủy
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="qr-public-placeholder">
+                        <div className="qr-public-orb">
+                          <Globe size={26} />
+                        </div>
+                        <div className="qr-scan-title">Chưa bật phát Công khai</div>
+                        <div className="qr-scan-sub">
+                          Tạo tên miền HTTPS miễn phí <code>*.trycloudflare.com</code> trong ~3 giây để khách dùng 4G/5G quét QR.
+                        </div>
+                        <button
+                          type="button"
+                          className="btn primary sm"
+                          onClick={() => void handleStartPublicTunnel("quick")}
+                          disabled={tunnelBusy}
+                        >
+                          <Globe size={13} /> Bật phát Công khai 4G/5G
+                        </button>
+                      </div>
+                    )}
+
+                    <div className="qr-lang-strip">
+                      {["Anh", "Thái", "Lào", "Trung", "+200"].map((lbl) => (
+                        <span className="qr-lang-chip" key={lbl}>
+                          {lbl}
+                        </span>
+                      ))}
                     </div>
-                    <div className="qr-link-desc">
-                      Mỗi khán giả tự chọn ngôn ngữ phụ đề riêng ngay trên trình duyệt (VD: máy chiếu hiện Tiếng Anh, khách Thái/Lào chọn ngôn ngữ riêng).
-                    </div>
+                    {audienceInfo.active_languages.length > 0 && (
+                      <div className="qr-active-langs">
+                        Đang xem:{" "}
+                        {audienceInfo.active_languages
+                          .map((code) => {
+                            const found = languages.find((l) => l.code === code);
+                            return found ? found.name_vi : shortLangName(code);
+                          })
+                          .join(", ")}
+                      </div>
+                    )}
                   </div>
 
-                  <div className="qr-link-card">
-                    <div className="qr-link-head">
-                      <span className="qr-step-num">2</span>
-                      <Tv size={14} className="qr-link-icon" />
-                      <span className="qr-link-title">Phụ đề trong suốt cho OBS / Livestream</span>
-                    </div>
-                    <div className="qr-url-row">
-                      <input
-                        className="input qr-url-input"
-                        readOnly
-                        value={audienceInfo.obs_url}
-                        onFocus={(e) => e.currentTarget.select()}
-                      />
-                      <button
-                        className="btn sm qr-copy-btn"
-                        onClick={() => handleCopy("qr-obs", audienceInfo.obs_url)}
-                      >
-                        {copiedId === "qr-obs" ? (
+                  <div className="qr-details">
+                    {qrTab === "lan" ? (
+                      <div className="qr-link-card featured">
+                        <div className="qr-link-head">
+                          <span className="qr-step-num primary">1</span>
+                          <Smartphone size={14} className="qr-link-icon primary" />
+                          <span className="qr-link-title">Khán giả trên điện thoại</span>
+                          <span className="qr-link-tag">Mạng LAN</span>
+                        </div>
+                        <div className="qr-url-row">
+                          <input
+                            className="input qr-url-input"
+                            readOnly
+                            value={audienceInfo.lan_url || audienceInfo.audience_url}
+                            onFocus={(e) => e.currentTarget.select()}
+                          />
+                          <button
+                            className="btn primary sm qr-copy-btn"
+                            onClick={() =>
+                              handleCopy(
+                                "qr-aud-lan",
+                                audienceInfo.lan_url || audienceInfo.audience_url
+                              )
+                            }
+                          >
+                            {copiedId === "qr-aud-lan" ? (
+                              <>
+                                <Check size={12} /> Đã chép
+                              </>
+                            ) : (
+                              <>
+                                <Copy size={12} /> Chép
+                              </>
+                            )}
+                          </button>
+                        </div>
+                        <div className="qr-link-desc">
+                          Mỗi khán giả tự chọn ngôn ngữ phụ đề riêng ngay trên trình duyệt. Nếu Wi-Fi hội trường chặn thiết bị hoặc khách dùng 4G/5G, hãy chuyển sang tab <b>Công khai 4G/5G</b> ở trên.
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="qr-link-card featured">
+                        <div className="qr-link-head">
+                          <span className="qr-step-num primary">1</span>
+                          <Globe size={14} className="qr-link-icon primary" />
+                          <span className="qr-link-title">Đường dẫn Công khai 4G/5G</span>
+                          <span className={`qr-link-tag ${audienceInfo.public_ready ? "ok" : ""}`}>
+                            {audienceInfo.public_ready
+                              ? audienceInfo.public_mode === "named"
+                                ? "Tên miền riêng"
+                                : "HTTPS Miễn phí"
+                              : "Tắt"}
+                          </span>
+                        </div>
+
+                        {(tunnelActionError || audienceInfo.public_error) && (
+                          <div className="qr-tunnel-err" role="alert">
+                            <AlertTriangle size={13} />
+                            <span>{tunnelActionError || audienceInfo.public_error}</span>
+                          </div>
+                        )}
+
+                        {audienceInfo.public_ready && audienceInfo.public_url ? (
                           <>
-                            <Check size={12} /> Đã chép
+                            <div className="qr-url-row">
+                              <input
+                                className="input qr-url-input"
+                                readOnly
+                                value={audienceInfo.public_url}
+                                onFocus={(e) => e.currentTarget.select()}
+                              />
+                              <button
+                                className="btn primary sm qr-copy-btn"
+                                onClick={() => handleCopy("qr-aud-pub", audienceInfo.public_url || "")}
+                              >
+                                {copiedId === "qr-aud-pub" ? (
+                                  <>
+                                    <Check size={12} /> Đã chép
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy size={12} /> Chép
+                                  </>
+                                )}
+                              </button>
+                            </div>
+                            <div className="qr-tunnel-actions">
+                              <span className="qr-isolation-badge">
+                                <ShieldCheck size={12} />
+                                Cổng cô lập <code>127.0.0.1:{audienceInfo.public_port || 18768}</code> (chỉ phát phụ đề)
+                              </span>
+                              <button
+                                type="button"
+                                className="btn sm danger-ghost"
+                                onClick={handleStopPublicTunnel}
+                                disabled={tunnelBusy}
+                              >
+                                <Power size={12} /> Tắt công khai
+                              </button>
+                            </div>
                           </>
                         ) : (
-                          <>
-                            <Copy size={12} /> Chép
-                          </>
+                          <div className="qr-tunnel-actions">
+                            <button
+                              type="button"
+                              className="btn primary sm"
+                              onClick={() => void handleStartPublicTunnel("quick")}
+                              disabled={
+                                tunnelBusy ||
+                                audienceInfo.public_status === "downloading" ||
+                                audienceInfo.public_status === "starting"
+                              }
+                            >
+                              {audienceInfo.public_status === "downloading" ||
+                              audienceInfo.public_status === "starting" ? (
+                                <>
+                                  <Loader2 size={12} className="spin" /> Đang khởi động...
+                                </>
+                              ) : (
+                                <>
+                                  <Globe size={12} /> Bật 1 chạm (*.trycloudflare.com)
+                                </>
+                              )}
+                            </button>
+                            {audienceInfo.public_active && (
+                              <button
+                                type="button"
+                                className="btn sm"
+                                onClick={handleStopPublicTunnel}
+                                disabled={tunnelBusy}
+                              >
+                                Hủy
+                              </button>
+                            )}
+                          </div>
                         )}
-                      </button>
-                    </div>
-                    <div className="qr-link-desc">
-                      OBS Studio → thêm <b>Browser Source</b> (1920×260). Thêm{" "}
-                      <code>?size=36&amp;bilingual=1</code> để tùy chỉnh cỡ chữ.
+
+                        {/* Optional 4-digit Room PIN guard */}
+                        <div className="qr-pin-bar">
+                          <label className="qr-pin-toggle">
+                            <input
+                              type="checkbox"
+                              checked={Boolean(audienceInfo.pin_enabled)}
+                              onChange={(e) => void handleToggleRoomPin(e.target.checked)}
+                            />
+                            <Lock size={12} />
+                            <span>Khóa mã PIN 4 số</span>
+                          </label>
+                          {audienceInfo.pin_enabled && audienceInfo.room_pin ? (
+                            <div className="qr-pin-controls">
+                              <span className="qr-pin-code">{audienceInfo.room_pin}</span>
+                              <button
+                                type="button"
+                                className="btn xs"
+                                title="Tạo mã PIN 4 số mới"
+                                onClick={() => void handleRegenerateRoomPin()}
+                              >
+                                <RefreshCw size={11} /> Đổi PIN
+                              </button>
+                            </div>
+                          ) : (
+                            <span className="qr-pin-hint">
+                              Tự nhúng vào QR để chặn người ngoài đoán link
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Optional collapsible Fixed University Domain (Cloudflare Named Tunnel) */}
+                        <div className="qr-named-box">
+                          <button
+                            type="button"
+                            className="qr-named-toggle"
+                            onClick={() => setNamedSectionOpen((v) => !v)}
+                          >
+                            <span>
+                              Tùy chọn: Tên miền cố định của trường{" "}
+                              {audienceInfo.named_configured && audienceInfo.named_domain
+                                ? `(${audienceInfo.named_domain.replace(/^https?:\/\//, "")})`
+                                : "(Cloudflare Token)"}
+                            </span>
+                            {namedSectionOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                          </button>
+
+                          {namedSectionOpen && (
+                            <div className="qr-named-body">
+                              <div className="qr-named-fields">
+                                <input
+                                  className="input sm"
+                                  placeholder="Tên miền cố định (VD: https://live.dau.edu.vn)"
+                                  value={namedDomainInput}
+                                  onChange={(e) => setNamedDomainInput(e.target.value)}
+                                />
+                                <input
+                                  className="input sm"
+                                  type="password"
+                                  placeholder={
+                                    audienceInfo.named_configured
+                                      ? `Đã lưu Token (${audienceInfo.named_token_masked || "••••"}) — chỉ nhập nếu đổi mới`
+                                      : "Dán Cloudflare Tunnel Token (Zero Trust)"
+                                  }
+                                  value={namedTokenInput}
+                                  onChange={(e) => setNamedTokenInput(e.target.value)}
+                                />
+                              </div>
+                              <div className="qr-named-foot">
+                                <span className="qr-named-hint">
+                                  Trên Cloudflare Zero Trust trỏ Public Hostname →{" "}
+                                  <code>http://127.0.0.1:18768</code> để giữ 1 mã QR cố định in lên standee.
+                                </span>
+                                <div className="row" style={{ gap: 6, flexShrink: 0 }}>
+                                  {audienceInfo.named_configured && (
+                                    <button
+                                      type="button"
+                                      className="btn xs"
+                                      title="Xóa tên miền và token đã lưu"
+                                      onClick={() => void handleClearNamedConfig()}
+                                    >
+                                      <Trash2 size={11} /> Xóa
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    className="btn primary xs"
+                                    disabled={
+                                      tunnelBusy ||
+                                      (!namedDomainInput.trim() && !audienceInfo.named_domain) ||
+                                      (!namedTokenInput.trim() && !audienceInfo.named_configured)
+                                    }
+                                    onClick={() => void handleStartPublicTunnel("named")}
+                                  >
+                                    Bật tên miền riêng
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="qr-link-card">
+                      <div className="qr-link-head">
+                        <span className="qr-step-num">2</span>
+                        <Tv size={14} className="qr-link-icon" />
+                        <span className="qr-link-title">Phụ đề trong suốt cho OBS / Livestream</span>
+                      </div>
+                      <div className="qr-url-row">
+                        <input
+                          className="input qr-url-input"
+                          readOnly
+                          value={audienceInfo.obs_url}
+                          onFocus={(e) => e.currentTarget.select()}
+                        />
+                        <button
+                          className="btn sm qr-copy-btn"
+                          onClick={() => handleCopy("qr-obs", audienceInfo.obs_url)}
+                        >
+                          {copiedId === "qr-obs" ? (
+                            <>
+                              <Check size={12} /> Đã chép
+                            </>
+                          ) : (
+                            <>
+                              <Copy size={12} /> Chép
+                            </>
+                          )}
+                        </button>
+                      </div>
+                      <div className="qr-link-desc">
+                        OBS Studio → thêm <b>Browser Source</b> (1920×260). Thêm{" "}
+                        <code>?size=36&amp;bilingual=1</code> để tùy chỉnh cỡ chữ.
+                      </div>
                     </div>
                   </div>
                 </div>
-              </div>
+              </>
             ) : (
               <div style={{ padding: 36, textAlign: "center", color: "var(--text-2)" }}>
-                Đang tạo mã QR nội bộ...
+                Đang tạo mã QR phòng họp...
               </div>
             )}
 
             <div className="modal-foot">
               <span className="qr-foot-note">
-                <Wifi size={13} /> Chạy 100% qua mạng nội bộ (Wi-Fi / LAN), không gửi dữ liệu ra Internet.
+                {audienceInfo?.public_ready ? (
+                  <>
+                    <ShieldCheck size={13} /> Đường hầm HTTPS cô lập chỉ mở trang phụ đề — không bao giờ lộ API hay điều khiển máy chủ.
+                  </>
+                ) : (
+                  <>
+                    <Wifi size={13} /> Mặc định chạy 100% qua mạng nội bộ (Wi-Fi / LAN); chỉ mở HTTPS khi bạn chủ động bấm Bật.
+                  </>
+                )}
               </span>
               <button className="btn sm" onClick={() => setQrOpen(false)}>
                 Đóng
@@ -6212,21 +6757,36 @@ export default function App() {
                           <strong style={{ color: "var(--text-0)" }}>Siêu nhẹ ~0% CPU/GPU:</strong> Soniox nghe &amp; dịch trực tiếp 60 ngôn ngữ (tự nhận diện khi diễn giả đổi tiếng giữa câu) + nạp sẵn Từ điển &amp; Slide DAU. Tự động ngưng gửi audio khi im lặng &gt;5 giây để tiết kiệm chi phí.
                         </div>
                       ) : (
-                        <label className="toggle-row">
-                          <span>Dịch nháp khi đang nói chạy 100% Offline (Tiết kiệm ~85% hạn mức API)</span>
-                          <span className="switch">
-                            <input
-                              type="checkbox"
-                              checked={cloudDraftOffline}
-                              onChange={(e) => setCloudDraftOffline(e.target.checked)}
-                            />
-                            <span className="switch-track" />
-                          </span>
-                        </label>
+                        <>
+                          <label className="toggle-row">
+                            <span>
+                              Nghe giọng trên Google Cloud Speech-to-Text (100% Cloud Nghe + Dịch • ~0% CPU)
+                            </span>
+                            <span className="switch">
+                              <input
+                                type="checkbox"
+                                checked={cloudGoogleStt}
+                                onChange={(e) => setCloudGoogleStt(e.target.checked)}
+                              />
+                              <span className="switch-track" />
+                            </span>
+                          </label>
+                          <label className="toggle-row">
+                            <span>Dịch nháp khi đang nói chạy Offline (Tắt = 100% Google Cloud, không giật chữ)</span>
+                            <span className="switch">
+                              <input
+                                type="checkbox"
+                                checked={cloudDraftOffline}
+                                onChange={(e) => setCloudDraftOffline(e.target.checked)}
+                              />
+                              <span className="switch-track" />
+                            </span>
+                          </label>
+                        </>
                       )}
 
                       <label className="toggle-row">
-                        <span>Tự khóa ở hạn mức &amp; tự chuyển mượt về Offline SOTA (Không phát sinh phí)</span>
+                        <span>Tự khóa ở hạn mức (Tắt để chạy không giới hạn bằng số dư tài khoản)</span>
                         <span className="switch">
                           <input
                             type="checkbox"

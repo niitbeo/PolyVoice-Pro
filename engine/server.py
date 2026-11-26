@@ -111,6 +111,7 @@ from audio_capture import (
 )
 from file_translator import FileTranslateCancelled, translate_media_file
 from glossary import GlossaryManager
+from google_stt import GoogleCloudStreamingASR, probe_google_stt_api
 from languages import (
     PARAKEET_EU_LANGS,
     get_hymt2_lang_name,
@@ -123,6 +124,7 @@ from languages import (
     list_source_languages,
 )
 from model_manager import ModelManager
+from public_tunnel import PublicTunnelManager
 from quota_tracker import CloudQuotaManager
 from session_logger import SessionLogger
 from slide_context import SlideContextManager
@@ -278,6 +280,7 @@ class CloudConfigUpdateRequest(BaseModel):
     monthly_limit: Optional[int] = None
     hard_cap_enabled: Optional[bool] = None
     draft_offline: Optional[bool] = None
+    google_cloud_stt: Optional[bool] = None
 
 
 class CloudTestRequest(BaseModel):
@@ -514,6 +517,7 @@ class EngineRuntime:
         self.slide_context = SlideContextManager(_cache_dir / "slide_context.json")
         self.cloud_quota = CloudQuotaManager()
         self.logger = SessionLogger()
+        self.public_tunnel = PublicTunnelManager(self, cache_dir=_cache_dir)
         self.config = SessionConfig()
         self._display_frozen: bool = False
         self._display_freeze_message: str = "Tạm nghỉ — Phiên dịch hội nghị sẽ tiếp tục trong giây lát"
@@ -567,6 +571,8 @@ class EngineRuntime:
         self._soniox_client: Optional[SonioxRealtimeClient] = None
         self._soniox_fallback_lock = threading.Lock()
         self._soniox_ws_url: str = ""
+        self._google_stt_asr: Optional[GoogleCloudStreamingASR] = None
+        self._google_stt_probe_cache: tuple[str, float, bool, int, str] = ("", 0.0, False, 0, "")
         self._llm: Optional[LocalLLMTranslator] = None
         self._model_lock = threading.Lock()
 
@@ -817,16 +823,34 @@ class EngineRuntime:
 
     def get_audience_info(self) -> dict[str, Any]:
         lan_ip = get_local_lan_ip()
-        audience_url = f"http://{lan_ip}:{self.server_port}/audience"
+        lan_url_raw = f"http://{lan_ip}:{self.server_port}/audience"
+        tunnel = self.public_tunnel.get_public_status()
+        lan_url = (
+            f"{lan_url_raw}?pin={tunnel['room_pin']}"
+            if tunnel.get("pin_enabled") and tunnel.get("room_pin")
+            else lan_url_raw
+        )
         obs_url = f"http://127.0.0.1:{self.server_port}/obs"
-        qr = segno.make(audience_url)
-        qr_svg = qr.svg_inline(omitsize=True, border=0, dark="#0f172a", light="#ffffff")
+        lan_qr_svg = segno.make(lan_url).svg_inline(omitsize=True, border=0, dark="#0f172a", light="#ffffff")
+        if tunnel.get("public_ready") and tunnel.get("public_url") and tunnel.get("public_qr_svg"):
+            active_mode = "public"
+            audience_url = str(tunnel["public_url"])
+            qr_svg = str(tunnel["public_qr_svg"])
+        else:
+            active_mode = "lan"
+            audience_url = lan_url
+            qr_svg = lan_qr_svg
         return {
             "lan_ip": lan_ip,
             "port": self.server_port,
+            "active_mode": active_mode,
             "audience_url": audience_url,
-            "obs_url": obs_url,
             "qr_svg": qr_svg,
+            "lan_url": lan_url,
+            "lan_url_display": lan_url_raw,
+            "lan_qr_svg": lan_qr_svg,
+            "obs_url": obs_url,
+            **tunnel,
             **self.get_audience_summary(),
         }
 
@@ -1094,9 +1118,15 @@ class EngineRuntime:
         return phrases
 
     def sync_asr_hotwords(self) -> int:
+        hw = self._get_glossary_hotwords()
+        if self._google_stt_asr is not None:
+            try:
+                self._google_stt_asr.set_hotwords(hw)
+            except Exception:
+                pass
         if self._asr_zf_vi is not None:
-            return self._asr_zf_vi.update_hotwords(self._get_glossary_hotwords())
-        return 0
+            return self._asr_zf_vi.update_hotwords(hw)
+        return len(hw) if self._google_stt_asr is not None else 0
 
     def ensure_onnx_asr_loaded(self, engine_name: str, lang_code: str = "", remote: bool = False):
         with self._model_lock:
@@ -1339,6 +1369,7 @@ class EngineRuntime:
 
     def clear_cloud_cooldown(self) -> None:
         changed = False
+        self._google_stt_probe_cache = ("", 0.0, False, 0, "")
         with self._cloud_notice_lock:
             if self._cloud_cooldown_until > 0.0 or self._cloud_fallback_reason:
                 self._cloud_cooldown_until = 0.0
@@ -1346,6 +1377,17 @@ class EngineRuntime:
                 changed = True
         if changed:
             self.broadcast_threadsafe({"type": "cloud_notice", "data": {"message": "", "cooldown_s": 0}})
+
+    def _probe_google_stt_cached(self, api_key: str, force: bool = False) -> tuple[bool, int, str]:
+        k = (api_key or "").strip()
+        if not k:
+            return (False, 400, "Chưa có Google Cloud API Key.")
+        c_key, c_ts, c_ok, c_code, c_msg = self._google_stt_probe_cache
+        if not force and c_key == k and (time.monotonic() - c_ts) < 90.0:
+            return (c_ok, c_code, c_msg)
+        ok, code, msg = probe_google_stt_api(k)
+        self._google_stt_probe_cache = (k, time.monotonic(), ok, code, msg)
+        return (ok, code, msg)
 
     def get_cloud_fallback_notice(self) -> str:
         with self._cloud_notice_lock:
@@ -1417,8 +1459,12 @@ class EngineRuntime:
         sample = "Xin chào, hệ thống dịch giọng nói đã kết nối thành công."
         tgt = req.target_lang or "eng_Latn"
         try:
+            stt_ok: Optional[bool] = None
+            stt_status: Optional[int] = None
+            stt_message: str = ""
             if pid == "google":
                 tr = GoogleCloudTranslator(api_key=api_key).translate(sample, "vie_Latn", tgt)
+                stt_ok, stt_status, stt_message = self._probe_google_stt_cached(api_key, force=True)
             elif pid == "azure":
                 region = req.region if req.region is not None else creds.get("region", "")
                 endpoint = req.endpoint if req.endpoint is not None else creds.get("endpoint", "")
@@ -1430,7 +1476,10 @@ class EngineRuntime:
                 return {"ok": False, "provider": pid, "error": f"Nhà cung cấp không hỗ trợ: {pid}"}
             self.cloud_quota.record_usage(pid, len(sample))
             self.clear_cloud_cooldown()
-            return {
+            if pid == "google" and stt_ok is not None:
+                # Re-populate fresh STT cache after clear_cloud_cooldown
+                self._google_stt_probe_cache = (api_key, time.monotonic(), stt_ok, int(stt_status or 0), stt_message)
+            out_payload: dict[str, Any] = {
                 "ok": True,
                 "provider": pid,
                 "engine": tr.engine,
@@ -1438,6 +1487,11 @@ class EngineRuntime:
                 "translated_text": tr.translated_text,
                 "cloud_api": self.cloud_quota.get_public_status(),
             }
+            if pid == "google":
+                out_payload["stt_ok"] = bool(stt_ok)
+                out_payload["stt_status"] = int(stt_status or 0)
+                out_payload["stt_message"] = stt_message
+            return out_payload
         except Exception as exc:
             return {"ok": False, "provider": pid, "error": str(exc)}
 
@@ -2098,8 +2152,9 @@ class EngineRuntime:
             "active_asr_label": self._active_asr_label,
             "remote_asr_label": self._remote_asr_label,
             "detected_source_lang": self._detected_source_lang,
-            "asr_loaded": (self._soniox_client is not None) or (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_multi is not None) or (self._asr_hybrid_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_moonshine_ja is not None) or (self._asr_moonshine_ko is not None) or (self._asr_parakeet_eu is not None) or (self._asr_whisper is not None),
+            "asr_loaded": (self._soniox_client is not None) or (self._google_stt_asr is not None) or (self._asr_zf_vi is not None) or (self._asr_viet is not None) or (self._asr_zf_multi is not None) or (self._asr_hybrid_en is not None) or (self._asr_moonshine_en is not None) or (self._asr_moonshine_ja is not None) or (self._asr_moonshine_ko is not None) or (self._asr_parakeet_eu is not None) or (self._asr_whisper is not None),
             "soniox_active": bool(self._listening and self._active_asr_label == "soniox-cloud"),
+            "google_stt_active": bool(self._listening and self._active_asr_label == "google-cloud-stt"),
             "pass2_loaded": self._pass2_refiner is not None,
             "hotwords_active": self._asr_zf_vi._hotwords_count if self._asr_zf_vi is not None else 0,
             "zipformer_ready": self.model_manager.is_zipformer_streaming_ready(),
@@ -2429,6 +2484,8 @@ class EngineRuntime:
         use_soniox = self._should_use_soniox_realtime(self.config)
         soniox_client: Optional[SonioxRealtimeClient] = None
         soniox_model = DEFAULT_SONIOX_MODEL
+        use_google_stt = False
+        google_stt_asr: Optional[GoogleCloudStreamingASR] = None
 
         if use_soniox:
             s_creds = self.cloud_quota.get_credentials("soniox")
@@ -2620,113 +2677,182 @@ class EngineRuntime:
             if "nllb-600m" in keep_mt:
                 self.ensure_nllb_loaded()
         else:
-            chosen_asr = self._resolve_asr_choice(self.config)
-            if self.config.audio_source == "mix" and chosen_asr == "apple-native":
-                if self.config.source_lang == "vie_Latn" and self.model_manager.is_zipformer_streaming_ready():
-                    chosen_asr = "zipformer-30m-streaming"
-                elif (
-                    self.config.source_lang == "eng_Latn"
-                    and self.model_manager.is_moonshine_en_ready()
-                    and self.model_manager.is_silero_vad_ready()
-                ):
-                    chosen_asr = "hybrid-en"
-                elif self.config.source_lang == "eng_Latn" and self.model_manager.is_moonshine_en_ready():
-                    chosen_asr = "moonshine-en"
-                elif self.model_manager.is_whisper_turbo_ready():
-                    chosen_asr = "whisper-turbo"
-            self._active_asr_label = chosen_asr
-            self._remote_asr_label = ""
-            self._detected_source_lang = ""
-
-            # Determine exact minimal model set for this session and unload everything else from RAM!
-            is_auto_src = self.config.source_lang == "auto"
-            is_vi_en_pair = (not is_auto_src) and ({self.config.source_lang, self.config.target_lang} == {"vie_Latn", "eng_Latn"})
-            can_hymt2 = (
-                self._llama_server_ready
-                and self.model_manager.is_hymt2_ready()
-                and (is_auto_src or bool(get_hymt2_lang_name(self.config.source_lang)))
-                and bool(get_hymt2_lang_name(self.config.target_lang))
+            # Check 100% Google Cloud mode (Google Cloud Speech-to-Text + Google Cloud Translation)
+            g_creds = self.cloud_quota.get_credentials()
+            is_google_cloud_mt = (
+                self.config.mt_mode == "cloud-api"
+                and g_creds.get("id") == "google"
+                and bool(str(g_creds.get("api_key", "")).strip())
             )
-            want_hymt2 = can_hymt2 and (self.config.mt_mode == "hy-mt2")
-            keep_asr = {chosen_asr}
-            if self.config.audio_source == "dual":
-                try:
-                    keep_asr.add(self._resolve_asr_choice_for_lang(self.config.target_lang, "auto"))
-                except Exception:
-                    pass
-            keep_mt = set()
             if (
-                (is_vi_en_pair or (is_auto_src and self.config.target_lang in ("vie_Latn", "eng_Latn")))
-                and self.config.mt_mode != "nllb"
-                and self.model_manager.is_envit5_ready()
+                is_google_cloud_mt
+                and bool(g_creds.get("google_cloud_stt", True))
+                and self.config.asr_engine in ("auto", "google-cloud-stt")
             ):
-                keep_mt.add("envit5")
-            if want_hymt2:
-                keep_mt.add("hy-mt2")
-                if is_auto_src:
-                    # Keep NLLB-600M ready in auto-detect mode in case a speaker uses a language outside Hy-MT2's 38
-                    keep_mt.add("nllb-600m")
-            else:
-                need_nllb = (
-                    is_auto_src
-                    or (
-                        self.config.source_lang != self.config.target_lang
-                        and (
-                            self.config.mt_mode == "nllb"
-                            or (not is_vi_en_pair and self.config.mt_mode in ("auto-offline", "light-offline", "hy-mt2", "cloud-api"))
-                        )
+                g_key = str(g_creds.get("api_key", "")).strip()
+                g_ok, g_code, g_msg = self._probe_google_stt_cached(g_key)
+                if g_ok:
+                    vad_p = self.model_manager.silero_vad_path if self.model_manager.is_silero_vad_ready() else None
+                    pause_s = 0.42 if self.config.paragraph_mode == "short" else (0.50 if self.config.paragraph_mode == "medium" else 0.58)
+                    max_utt_s = 5.5 if self.config.paragraph_mode == "short" else (7.0 if self.config.paragraph_mode == "medium" else 8.5)
+                    google_stt_asr = GoogleCloudStreamingASR(
+                        api_key=g_key,
+                        source_lang=self.config.source_lang,
+                        target_lang=self.config.target_lang,
+                        sample_rate=SAMPLE_RATE,
+                        vad_model_path=vad_p,
+                        hotwords=self._get_glossary_hotwords(),
+                        on_async_output=self._enqueue_asr_output,
+                        pause_commit_s=pause_s,
+                        max_utterance_s=max_utt_s,
                     )
-                )
-                if need_nllb:
-                    keep_mt.add("nllb-600m")
+                    use_google_stt = True
+                elif g_code in (401, 403):
+                    self.broadcast_threadsafe(
+                        {
+                            "type": "cloud_notice",
+                            "data": {
+                                "message": (
+                                    "Google Dịch đang chạy 100% Cloud (cả nháp & chốt). "
+                                    "Để chạy 100% Nghe giọng trên Google Cloud, hãy bật Cloud Speech-to-Text API cho Key của bạn."
+                                ),
+                                "cooldown_s": 120,
+                            },
+                        }
+                    )
 
-            keep_pass2: set[str] = set()
-            need_vi_pass2 = self.config.pass2_refine and (
-                (chosen_asr == "zipformer-30m-streaming" and self.config.source_lang == "vie_Latn")
-                or (
-                    self.config.audio_source == "dual"
-                    and self.config.target_lang == "vie_Latn"
-                    and self.model_manager.is_zipformer_streaming_ready()
-                )
-            )
-            need_en_pass2 = (
-                self.config.pass2_refine
-                and chosen_asr not in ("moonshine-en", "hybrid-en")
-                and (self.config.source_lang == "eng_Latn" or (self.config.audio_source == "dual" and self.config.target_lang == "eng_Latn"))
-                and self.model_manager.is_moonshine_en_ready()
-            )
-            if need_vi_pass2:
-                keep_pass2.add("vi-pass2")
-            if need_en_pass2 or "hybrid-en" in keep_asr:
-                keep_pass2.add("en-pass2")
-
-            self._release_unused_models(keep_asr=keep_asr, keep_mt=keep_mt, keep_pass2=keep_pass2)
-
-            if "envit5" in keep_mt:
-                self.ensure_envit5_loaded()
-
-            if want_hymt2:
-                # Pre-warm Hy-MT2 llama-server in background ONLY when explicitly selected
-                def _warmup_hymt2() -> None:
+            if use_google_stt and google_stt_asr is not None:
+                chosen_asr = "google-cloud-stt"
+                self._active_asr_label = chosen_asr
+                self._remote_asr_label = ""
+                self._detected_source_lang = ""
+                keep_asr = set()
+                if self.config.audio_source == "dual":
                     try:
-                        h = self.ensure_hymt2_loaded()
-                        if h is not None:
-                            h.ensure_started()
+                        keep_asr.add(self._resolve_asr_choice_for_lang(self.config.target_lang, "auto"))
                     except Exception:
                         pass
+                # In 100% Google Cloud mode (draft_offline=False), zero offline MT/ASR/Pass-2 models needed!
+                keep_mt = set()
+                if bool(g_creds.get("draft_offline", False)):
+                    is_vi_en = {self.config.source_lang, self.config.target_lang} == {"vie_Latn", "eng_Latn"}
+                    if is_vi_en and self.model_manager.is_envit5_ready():
+                        keep_mt.add("envit5")
+                    elif self.model_manager.is_nllb_ready():
+                        keep_mt.add("nllb-600m")
+                self._release_unused_models(keep_asr=keep_asr, keep_mt=keep_mt, keep_pass2=set())
+                if "envit5" in keep_mt:
+                    self.ensure_envit5_loaded()
+                elif "nllb-600m" in keep_mt:
+                    self.ensure_nllb_loaded()
+            else:
+                chosen_asr = self._resolve_asr_choice(self.config)
+                if self.config.audio_source == "mix" and chosen_asr == "apple-native":
+                    if self.config.source_lang == "vie_Latn" and self.model_manager.is_zipformer_streaming_ready():
+                        chosen_asr = "zipformer-30m-streaming"
+                    elif (
+                        self.config.source_lang == "eng_Latn"
+                        and self.model_manager.is_moonshine_en_ready()
+                        and self.model_manager.is_silero_vad_ready()
+                    ):
+                        chosen_asr = "hybrid-en"
+                    elif self.config.source_lang == "eng_Latn" and self.model_manager.is_moonshine_en_ready():
+                        chosen_asr = "moonshine-en"
+                    elif self.model_manager.is_whisper_turbo_ready():
+                        chosen_asr = "whisper-turbo"
+                self._active_asr_label = chosen_asr
+                self._remote_asr_label = ""
+                self._detected_source_lang = ""
 
-                threading.Thread(
-                    target=_warmup_hymt2,
-                    daemon=True,
-                    name="hymt2-warmup",
-                ).start()
-            elif "nllb-600m" in keep_mt and self.model_manager.is_nllb_ready():
-                self.ensure_nllb_loaded()
+                # Determine exact minimal model set for this session and unload everything else from RAM!
+                is_auto_src = self.config.source_lang == "auto"
+                is_vi_en_pair = (not is_auto_src) and ({self.config.source_lang, self.config.target_lang} == {"vie_Latn", "eng_Latn"})
+                can_hymt2 = (
+                    self._llama_server_ready
+                    and self.model_manager.is_hymt2_ready()
+                    and (is_auto_src or bool(get_hymt2_lang_name(self.config.source_lang)))
+                    and bool(get_hymt2_lang_name(self.config.target_lang))
+                )
+                want_hymt2 = can_hymt2 and (self.config.mt_mode == "hy-mt2")
+                full_cloud_mt_only = is_google_cloud_mt and (not bool(g_creds.get("draft_offline", False)))
+                keep_asr = {chosen_asr}
+                if self.config.audio_source == "dual":
+                    try:
+                        keep_asr.add(self._resolve_asr_choice_for_lang(self.config.target_lang, "auto"))
+                    except Exception:
+                        pass
+                keep_mt = set()
+                if (
+                    not full_cloud_mt_only
+                    and (is_vi_en_pair or (is_auto_src and self.config.target_lang in ("vie_Latn", "eng_Latn")))
+                    and self.config.mt_mode != "nllb"
+                    and self.model_manager.is_envit5_ready()
+                ):
+                    keep_mt.add("envit5")
+                if want_hymt2:
+                    keep_mt.add("hy-mt2")
+                    if is_auto_src:
+                        keep_mt.add("nllb-600m")
+                elif not full_cloud_mt_only:
+                    need_nllb = (
+                        is_auto_src
+                        or (
+                            self.config.source_lang != self.config.target_lang
+                            and (
+                                self.config.mt_mode == "nllb"
+                                or (not is_vi_en_pair and self.config.mt_mode in ("auto-offline", "light-offline", "hy-mt2", "cloud-api"))
+                            )
+                        )
+                    )
+                    if need_nllb:
+                        keep_mt.add("nllb-600m")
 
-            if need_vi_pass2:
-                self.ensure_pass2_refiner()
-            if need_en_pass2:
-                self.ensure_en_pass2_refiner()
+                keep_pass2: set[str] = set()
+                need_vi_pass2 = self.config.pass2_refine and (
+                    (chosen_asr == "zipformer-30m-streaming" and self.config.source_lang == "vie_Latn")
+                    or (
+                        self.config.audio_source == "dual"
+                        and self.config.target_lang == "vie_Latn"
+                        and self.model_manager.is_zipformer_streaming_ready()
+                    )
+                )
+                need_en_pass2 = (
+                    self.config.pass2_refine
+                    and chosen_asr not in ("moonshine-en", "hybrid-en")
+                    and (self.config.source_lang == "eng_Latn" or (self.config.audio_source == "dual" and self.config.target_lang == "eng_Latn"))
+                    and self.model_manager.is_moonshine_en_ready()
+                )
+                if need_vi_pass2:
+                    keep_pass2.add("vi-pass2")
+                if need_en_pass2 or "hybrid-en" in keep_asr:
+                    keep_pass2.add("en-pass2")
+
+                self._release_unused_models(keep_asr=keep_asr, keep_mt=keep_mt, keep_pass2=keep_pass2)
+
+                if "envit5" in keep_mt:
+                    self.ensure_envit5_loaded()
+
+                if want_hymt2:
+                    def _warmup_hymt2() -> None:
+                        try:
+                            h = self.ensure_hymt2_loaded()
+                            if h is not None:
+                                h.ensure_started()
+                        except Exception:
+                            pass
+
+                    threading.Thread(
+                        target=_warmup_hymt2,
+                        daemon=True,
+                        name="hymt2-warmup",
+                    ).start()
+                elif "nllb-600m" in keep_mt and self.model_manager.is_nllb_ready():
+                    self.ensure_nllb_loaded()
+
+                if need_vi_pass2:
+                    self.ensure_pass2_refiner()
+                if need_en_pass2:
+                    self.ensure_en_pass2_refiner()
 
         # Start real-time auto-save meeting log (.TXT & .SRT)
         self.logger.start_new_session(self.config.source_lang, self.config.target_lang)
@@ -2813,7 +2939,10 @@ class EngineRuntime:
             self._asr_thread.start()
         else:
             asr = None
-            if chosen_asr != "soniox-cloud":
+            if chosen_asr == "google-cloud-stt" and google_stt_asr is not None:
+                asr = google_stt_asr
+                self._google_stt_asr = google_stt_asr
+            elif chosen_asr != "soniox-cloud":
                 asr = self.ensure_onnx_asr_loaded(chosen_asr, lang_code=self.config.source_lang)
                 asr.reset()
 
@@ -3013,6 +3142,13 @@ class EngineRuntime:
                 sc.stop()
             except Exception:
                 pass
+        if self._google_stt_asr is not None:
+            gs = self._google_stt_asr
+            self._google_stt_asr = None
+            try:
+                gs.close()
+            except Exception:
+                pass
         for th_attr in ("_mt_thread", "_draft_mt_thread"):
             th = getattr(self, th_attr, None)
             if th is not None and th.is_alive():
@@ -3027,6 +3163,10 @@ class EngineRuntime:
         return payload
 
     def shutdown(self) -> None:
+        try:
+            self.public_tunnel.stop(notify=False)
+        except Exception:
+            pass
         self._cancel_hymt2_idle_timer()
         self.stop_session()
         # Cancel any active batch file translation
@@ -3156,8 +3296,11 @@ class EngineRuntime:
             prev_mt_mode = self.config.mt_mode
             self.config.mt_mode = req.mt_mode
             if prev_mt_mode != req.mt_mode and (
-                self._active_asr_label == "soniox-cloud"
-                or (req.mt_mode == "cloud-api" and self.cloud_quota.get_credentials().get("id") == "soniox")
+                self._active_asr_label in ("soniox-cloud", "google-cloud-stt")
+                or (
+                    req.mt_mode == "cloud-api"
+                    and self.cloud_quota.get_credentials().get("id") in ("soniox", "google")
+                )
             ):
                 need_restart = True
             if req.mt_mode != "hy-mt2" and self._hymt2 is not None:
@@ -3736,10 +3879,10 @@ class EngineRuntime:
             # Crisp 8-18 word YouTube-paced English clauses (4-7.5s); UI groups 3-4 into paragraphs
             return (8, 18, 1.05)
         if mode == "short":
-            return (7, 15, 0.95)
+            return (6, 13, 0.78)
         if mode == "medium":
-            return (10, 22, 1.15)
-        return (12, 28, 1.35)
+            return (8, 17, 0.95)
+        return (10, 21, 1.10)
 
     @staticmethod
     def _apply_post_pass2_carry(text: str, prev_carry: str, allow_peel: bool = True) -> tuple[str, str]:
@@ -4096,6 +4239,7 @@ class EngineRuntime:
                     ((out.provider.startswith("whisper-turbo") or out.provider == "moonshine-v2-ja") and not is_short_unpunctuated_cjk)
                     or (out.provider == "moonshine-v2-ko" and not is_short_ko)
                     or out.provider == "moonshine-v2-en"
+                    or out.provider == "google-cloud-stt"
                     or (out.provider == "parakeet-tdt-0.6b-ultra" and (wc >= 5 or is_stop_flush))
                     or (out.provider == "hybrid-en-vad-moonshine" and wc >= 5 and not is_incomplete_en)
                 )
@@ -4225,6 +4369,7 @@ class EngineRuntime:
     def _audio_loop(self, asr) -> None:
         silent_chunks = 0
         breath_chunks = 0
+        active_speech_chunks = 0
         speech_rms = 0.04
         gated = False
         preroll: deque[np.ndarray] = deque(maxlen=2)
@@ -4258,6 +4403,7 @@ class EngineRuntime:
                     if can_gate:
                         gated = True
                         breath_chunks = 0
+                        active_speech_chunks = 0
                         preroll.append(chunk)
                         continue
 
@@ -4271,20 +4417,40 @@ class EngineRuntime:
                 self._append_para_pcm(chunk)
                 out = asr.accept_pcm(chunk)
                 self._enqueue_asr_output(out)
+                if out.kind == "final":
+                    active_speech_chunks = 0
+                    breath_chunks = 0
+                elif out.kind == "partial" or rms >= dip_thresh:
+                    active_speech_chunks += 1
 
-                # Conference Breath-Pause Soft Commit (native rule2=0.72s handles clean pauses;
-                # soft commit with 0.45s tail-flush assists on >=0.55s breath dips in long runs)
+                # Conference Breath-Pause & Anti-Drift Soft Commit:
+                # 1) Normal pauses: commit cleanly on 0.4s dip (>=18w) or 0.5s dip (>=min_words)
+                # 2) Continuous rapid talk (e.g. YouTube talks with no long silence): once speech runs
+                #    >=7.5s, commit on the first brief 0.2s dip; hard-commit at 10.5s so Zipformer NEVER
+                #    drifts for 30-50s or triggers pcm_truncated!
                 if out.kind != "final" and hasattr(asr, "soft_commit_if_ready"):
-                    min_words, _, _ = self._paragraph_thresholds()
-                    soft_min = 24 if breath_chunks == 5 else (min_words if breath_chunks == 6 else 0)
+                    min_words, target_words, _ = self._paragraph_thresholds()
+                    soft_min = 0
+                    allow_tail_block = True
+                    if active_speech_chunks >= 105:
+                        soft_min = max(6, min_words)
+                        allow_tail_block = False
+                    elif active_speech_chunks >= 75 and breath_chunks >= 2:
+                        soft_min = min_words
+                        allow_tail_block = active_speech_chunks < 92
+                    elif breath_chunks == 4:
+                        soft_min = max(16, target_words - 2)
+                    elif breath_chunks == 5:
+                        soft_min = min_words
                     if soft_min > 0:
                         soft_out = asr.soft_commit_if_ready(
                             min_words=soft_min,
-                            block_tail_fn=self._ends_with_connector,
+                            block_tail_fn=self._ends_with_connector if allow_tail_block else None,
                         )
                         if soft_out.kind == "final":
                             self._enqueue_asr_output(soft_out)
                             breath_chunks = 0
+                            active_speech_chunks = 0
         except Exception as exc:
             self.broadcast_threadsafe({"type": "error", "data": {"message": f"Lỗi thu âm / ASR: {exc}"}})
         finally:
@@ -4732,9 +4898,17 @@ class EngineRuntime:
                 if seg_id in self._committed_seg_ids:
                     continue
 
-            # Always yield draft MT while any Final sentence is translating or queued (including Hy-MT2 single-slot!)
-            # so Finals never wait behind live drafts!
-            if self._final_mt_busy or not self._final_mt_queue.empty():
+            # Check if live drafts are running on low-latency pooled Cloud API (e.g. Google Cloud 100%)
+            cloud_creds = self.cloud_quota.get_credentials() if cfg.mt_mode == "cloud-api" else None
+            is_cloud_draft = bool(
+                cloud_creds
+                and cloud_creds.get("id") != "soniox"
+                and not cloud_creds.get("draft_offline", False)
+                and str(cloud_creds.get("api_key", "")).strip()
+            )
+
+            # Yield local CPU/GPU draft MT while Final MT runs; Cloud HTTP drafts run in parallel with zero CPU contention!
+            if (not is_cloud_draft) and (self._final_mt_busy or not self._final_mt_queue.empty()):
                 with self._partial_lock:
                     if self._pending_partial is None and seg_id not in self._committed_seg_ids:
                         self._pending_partial = partial_job
@@ -4763,23 +4937,23 @@ class EngineRuntime:
                 cfg.mt_mode == "hy-mt2"
                 and {partial_job["source_lang"], partial_job["target_lang"]} != {"eng_Latn", "vie_Latn"}
             )
-            # Calm, readable YouTube cadence: ~0.45s normal (0.75s Eco), gracefully capped at 1.1s under load.
-            # When Hy-MT2 handles live non-VI/EN drafts on the shared llama-server slot, widen debounce (>= 0.90s)
-            # and skip prior-turn context on drafts (~40% faster, 0 context-leak retries) so Finals never stall.
-            base_debounce = 0.75 if cfg.eco_mode else 0.45
+            # Calm, world-standard SimulMT cadence (Wordly/Zoom/Google Meet):
+            # Avoid thrashing re-translations every 0.35s on Vietnamese->English word-order flips!
+            # Wait for a meaningful clause (>=5 words first draft, >=4 new words or ~0.80s between updates).
+            base_debounce = 0.90 if cfg.eco_mode else (0.80 if is_cloud_draft else 0.72)
             if is_hymt2_non_vien:
-                base_debounce = max(base_debounce, 0.90)
+                base_debounce = max(base_debounce, 0.95)
             if last_draft_mt_ms > 550.0:
-                cap_s = 1.25 if is_hymt2_non_vien else 1.10
-                base_debounce = min(cap_s, max(base_debounce, (last_draft_mt_ms / 1000.0) * 0.85))
+                cap_s = 1.30 if is_hymt2_non_vien else 1.15
+                base_debounce = min(cap_s, max(base_debounce, (last_draft_mt_ms / 1000.0) * 0.90))
 
             if not same_seg:
-                min_first_wc = 2 if partial_job["source_lang"].startswith(_NON_SPACED_SCRIPT_PREFIXES) else 3
-                need_wait = wc_now < min_first_wc and elapsed_s < 0.55
+                min_first_wc = 3 if partial_job["source_lang"].startswith(_NON_SPACED_SCRIPT_PREFIXES) else 5
+                need_wait = wc_now < min_first_wc and elapsed_s < 0.95
             else:
-                min_delta = 3 if (cfg.eco_mode or is_hymt2_non_vien) else 2
+                min_delta = 4 if (cfg.eco_mode or is_hymt2_non_vien or is_cloud_draft) else 3
                 need_wait = elapsed_s < base_debounce or (
-                    (wc_now - last_partial_wc) < min_delta and elapsed_s < (1.25 if is_hymt2_non_vien else 0.95)
+                    (wc_now - last_partial_wc) < min_delta and elapsed_s < (1.40 if is_hymt2_non_vien else 1.15)
                 )
 
             if need_wait:
@@ -4871,7 +5045,9 @@ class EngineRuntime:
 
         def _run_demo() -> None:
             demo_tracker = StablePrefixTracker()
-            for step in range(3, len(words) + 1, 3):
+            # Realistic conference streaming cadence (~5-word clause steps, 0.65s spacing) matching live `_draft_mt_loop`
+            step_size = 5 if len(words) >= 12 else 4
+            for step in range(step_size, len(words), step_size):
                 partial_src = self._clean_verbatim(" ".join(words[:step]), src)
                 self.broadcast_threadsafe(
                     {
@@ -4885,35 +5061,36 @@ class EngineRuntime:
                         },
                     }
                 )
-                try:
-                    mt = self.translate_text(
-                        partial_src,
-                        src,
-                        tgt,
-                        mt_mode=self.config.mt_mode,
-                        beam_size=1,
-                        is_draft=True,
-                        update_slide_state=False,
-                    )
-                    st_txt, unst_txt, full_txt = demo_tracker.update(seg_id, tgt, mt.translated_text)
-                    self.broadcast_threadsafe(
-                        {
-                            "type": "partial_mt",
-                            "data": {
-                                "id": seg_id,
-                                "translated_text": full_txt,
-                                "stable_text": st_txt,
-                                "unstable_text": unst_txt,
-                                "source_lang": src,
-                                "target_lang": tgt,
-                                "mt_ms": mt.latency_ms,
-                                "mt_engine": mt.engine,
-                            },
-                        }
-                    )
-                except Exception:
-                    pass
-                time.sleep(0.35)
+                if self.config.translate_partials:
+                    try:
+                        mt = self.translate_text(
+                            partial_src,
+                            src,
+                            tgt,
+                            mt_mode=self.config.mt_mode,
+                            beam_size=1,
+                            is_draft=True,
+                            update_slide_state=False,
+                        )
+                        st_txt, unst_txt, full_txt = demo_tracker.update(seg_id, tgt, mt.translated_text)
+                        self.broadcast_threadsafe(
+                            {
+                                "type": "partial_mt",
+                                "data": {
+                                    "id": seg_id,
+                                    "translated_text": full_txt,
+                                    "stable_text": st_txt,
+                                    "unstable_text": unst_txt,
+                                    "source_lang": src,
+                                    "target_lang": tgt,
+                                    "mt_ms": mt.latency_ms,
+                                    "mt_engine": mt.engine,
+                                },
+                            }
+                        )
+                    except Exception:
+                        pass
+                time.sleep(0.65)
 
             tr_final = ""
             mt_ms = 0.0
@@ -4971,6 +5148,17 @@ async def lifespan(_app: FastAPI):
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient", "::ffff:127.0.0.1"})
+_LOOPBACK_HEADER_HOSTS = _LOOPBACK_HOSTS | frozenset({"testserver"})
+_PROXY_HEADER_NAMES = frozenset(
+    {
+        b"cf-connecting-ip",
+        b"cf-ray",
+        b"cf-visitor",
+        b"x-forwarded-for",
+        b"x-forwarded-host",
+        b"forwarded",
+    }
+)
 _PUBLIC_HTTP_PATHS = frozenset({"/audience", "/obs", "/school-logo.png", "/favicon.ico"})
 _PUBLIC_WS_PATHS = frozenset({"/ws/audience"})
 
@@ -4979,10 +5167,44 @@ def _is_loopback_host(host: Optional[str]) -> bool:
     return (host or "").strip().lower() in _LOOPBACK_HOSTS
 
 
+def _has_proxy_headers(scope: dict[str, Any]) -> bool:
+    for name, _val in scope.get("headers") or ():
+        if name.lower() in _PROXY_HEADER_NAMES:
+            return True
+    return False
+
+
+def _is_loopback_host_header(scope: dict[str, Any]) -> bool:
+    for name, val in scope.get("headers") or ():
+        if name.lower() == b"host":
+            raw = val.decode("latin1", errors="ignore").strip().lower()
+            if not raw:
+                return True
+            if raw.startswith("["):
+                # IPv6 literal like [::1]:18765
+                end = raw.find("]")
+                host_only = raw[1:end] if end != -1 else raw
+            else:
+                host_only = raw.split(":", 1)[0]
+            return host_only in _LOOPBACK_HEADER_HOSTS
+    return True
+
+
+def _is_trusted_local_scope(scope: dict[str, Any]) -> bool:
+    client = scope.get("client")
+    client_host = client[0] if client and len(client) >= 1 else ""
+    return (
+        _is_loopback_host(client_host)
+        and not _has_proxy_headers(scope)
+        and _is_loopback_host_header(scope)
+    )
+
+
 class LoopbackGuardMiddleware:
-    """Restrict admin `/api/*` and `/ws` routes strictly to loopback clients.
-    Non-loopback LAN clients may ONLY access `GET /audience`, `GET /obs`,
-    `GET /school-logo.png`, `GET /favicon.ico`, and WS `/ws/audience`.
+    """Restrict admin `/api/*` and `/ws` routes strictly to direct loopback clients.
+    Rejects reverse-proxied requests (e.g. Cloudflare / X-Forwarded-For / non-loopback Host)
+    even when arriving from 127.0.0.1. Non-local clients may ONLY access `GET /audience`,
+    `GET /obs`, `GET /school-logo.png`, `GET /favicon.ico`, and WS `/ws/audience`.
     """
 
     def __init__(self, asgi_app: Any) -> None:
@@ -4994,9 +5216,7 @@ class LoopbackGuardMiddleware:
             await self.app(scope, receive, send)
             return
 
-        client = scope.get("client")
-        client_host = client[0] if client and len(client) >= 1 else ""
-        if _is_loopback_host(client_host):
+        if _is_trusted_local_scope(scope):
             await self.app(scope, receive, send)
             return
 
@@ -5025,7 +5245,7 @@ class LoopbackGuardMiddleware:
         )
 
 
-app = FastAPI(title="VOICERECORE Local Engine", version="1.1.4", lifespan=lifespan)
+app = FastAPI(title="VOICERECORE Local Engine", version="1.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -5204,9 +5424,9 @@ def api_cloud_update(req: CloudConfigUpdateRequest):
         runtime._listening
         and runtime.config.mt_mode == "cloud-api"
         and (
-            prev_provider == "soniox"
-            or data.get("provider") == "soniox"
-            or runtime._active_asr_label == "soniox-cloud"
+            prev_provider in ("soniox", "google")
+            or data.get("provider") in ("soniox", "google")
+            or runtime._active_asr_label in ("soniox-cloud", "google-cloud-stt")
         )
     ):
         try:
@@ -5280,9 +5500,64 @@ def page_obs():
     return HTMLResponse(OBS_HTML)
 
 
+class PublicTunnelStartRequest(BaseModel):
+    mode: str = "quick"
+    pin_enabled: Optional[bool] = None
+    custom_domain: Optional[str] = None
+    tunnel_token: Optional[str] = None
+
+
+class PublicTunnelPinRequest(BaseModel):
+    enabled: Optional[bool] = None
+    regenerate: bool = False
+    custom_pin: Optional[str] = None
+
+
 @app.get("/api/audience/info")
 def api_audience_info():
     return runtime.get_audience_info()
+
+
+@app.get("/api/audience/tunnel/status")
+def api_audience_tunnel_status():
+    return runtime.get_audience_info()
+
+
+@app.post("/api/audience/tunnel/start")
+def api_audience_tunnel_start(req: PublicTunnelStartRequest):
+    try:
+        return runtime.public_tunnel.start(
+            mode=req.mode,
+            pin_enabled=req.pin_enabled,
+            custom_domain=req.custom_domain,
+            tunnel_token=req.tunnel_token,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Không thể bật phát công khai: {exc}") from exc
+
+
+@app.post("/api/audience/tunnel/stop")
+def api_audience_tunnel_stop():
+    return runtime.public_tunnel.stop()
+
+
+@app.post("/api/audience/tunnel/pin")
+def api_audience_tunnel_pin(req: PublicTunnelPinRequest):
+    try:
+        return runtime.public_tunnel.update_pin(
+            enabled=req.enabled,
+            regenerate=req.regenerate,
+            custom_pin=req.custom_pin,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/audience/tunnel/named")
+def api_audience_tunnel_clear_named():
+    return runtime.public_tunnel.clear_named_config()
 
 
 @app.post("/api/session/summarize")
@@ -5531,8 +5806,7 @@ def api_demo_simulate(req: DemoRequest):
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    client_host = ws.client.host if ws.client else ""
-    if not _is_loopback_host(client_host):
+    if not _is_trusted_local_scope(ws.scope):
         await ws.close(code=1008, reason="Admin WebSocket restricted to localhost")
         return
     await ws.accept()
@@ -5549,8 +5823,26 @@ async def ws_endpoint(ws: WebSocket):
 
 
 @app.websocket("/ws/audience")
-async def ws_audience_endpoint(ws: WebSocket, lang: str = "follow"):
+async def ws_audience_endpoint(ws: WebSocket, lang: str = "follow", pin: str = ""):
     await ws.accept()
+    # Direct localhost clients (e.g. local OBS Browser Source on 127.0.0.1) bypass PIN,
+    # while remote LAN or proxied clients respect the conference room PIN when enabled.
+    if not _is_trusted_local_scope(ws.scope) and runtime.public_tunnel.pin_enabled:
+        if not runtime.public_tunnel.verify_pin(pin):
+            try:
+                await ws.send_json(
+                    {
+                        "type": "pin_required",
+                        "data": {"invalid": bool((pin or "").strip())},
+                    }
+                )
+            except Exception:
+                pass
+            try:
+                await ws.close(code=4403, reason="PIN required")
+            except Exception:
+                pass
+            return
     try:
         await runtime.register_audience_ws(ws, lang=lang)
         while True:

@@ -243,6 +243,23 @@ export default function OverlayWindow() {
     }
   }, [fullTextColor]);
 
+  // Re-pin & sync scroll positions cleanly whenever entering Full-Text or re-mounting the left column
+  useEffect(() => {
+    if (layoutMode !== "full-text") return;
+    ftSrcPinnedRef.current = true;
+    ftTgtPinnedRef.current = true;
+    setFtSrcScrolledUp(false);
+    setFtTgtScrolledUp(false);
+    requestAnimationFrame(() => {
+      if (ftSrcScrollRef.current) {
+        ftSrcScrollRef.current.scrollTop = ftSrcScrollRef.current.scrollHeight;
+      }
+      if (ftTgtScrollRef.current) {
+        ftTgtScrollRef.current.scrollTop = ftTgtScrollRef.current.scrollHeight;
+      }
+    });
+  }, [layoutMode, fullTextDual]);
+
   // Independent Smart Scroll for Continuous Full-Text panes (only auto-scrolls when pinned near bottom)
   useEffect(() => {
     if (layoutMode !== "full-text") return;
@@ -490,6 +507,8 @@ export default function OverlayWindow() {
               setPartial(null);
               setInflightPartial(null);
             }
+          } else if (msg.type === "audience_info" && msg.data?.qr_svg) {
+            setAudienceInfo(msg.data);
           }
         } catch {
           // ignore
@@ -1546,14 +1565,23 @@ export default function OverlayWindow() {
         )}
 
         {showCornerQr && audienceInfo?.qr_svg && !displayFrozen && (
-          <div className="overlay-corner-qr" title={audienceInfo.audience_url}>
+          <div
+            className={`overlay-corner-qr ${audienceInfo.active_mode === "public" ? "is-public" : ""}`}
+            title={audienceInfo.audience_url}
+          >
             <div
               className="overlay-corner-qr-box"
               dangerouslySetInnerHTML={{ __html: audienceInfo.qr_svg }}
             />
             <div className="overlay-corner-qr-caption">
-              <strong>Quét QR phụ đề</strong>
-              <span>Chọn ngôn ngữ riêng</span>
+              <strong>
+                {audienceInfo.active_mode === "public" ? "Quét QR 4G / Wi-Fi" : "Quét QR phụ đề"}
+              </strong>
+              <span>
+                {audienceInfo.pin_enabled && audienceInfo.room_pin
+                  ? `PIN: ${audienceInfo.room_pin}`
+                  : "Chọn ngôn ngữ riêng"}
+              </span>
             </div>
           </div>
         )}
