@@ -352,11 +352,14 @@ class SonioxRealtimeClient:
         source_lang: str = "auto",
         target_lang: str = "vie_Latn",
         model: str = DEFAULT_SONIOX_MODEL,
+        translation_type: str = "one_way",
+        max_endpoint_delay_ms: int = 1800,
+        session_reset_s: float = 240.0,
         context: Optional[dict[str, Any]] = None,
         sample_rate: int = 16000,
         ws_url: str = SONIOX_WS_URL,
-        on_partial: Optional[Callable[[str, str, str, float], None]] = None,
-        on_final: Optional[Callable[[str, str, str, float], None]] = None,
+        on_partial: Optional[Callable[..., None]] = None,
+        on_final: Optional[Callable[..., None]] = None,
         on_detected_lang: Optional[Callable[[str], None]] = None,
         on_usage_seconds: Optional[Callable[[int], None]] = None,
         on_error: Optional[Callable[[int, str], None]] = None,
@@ -365,6 +368,9 @@ class SonioxRealtimeClient:
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.model = (model or DEFAULT_SONIOX_MODEL).strip() or DEFAULT_SONIOX_MODEL
+        self.translation_type = "two_way" if translation_type == "two_way" else "one_way"
+        self.max_endpoint_delay_ms = max(300, min(3000, int(max_endpoint_delay_ms or 1800)))
+        self.session_reset_s = float(session_reset_s)
         self.context = context
         self.sample_rate = sample_rate
         self.ws_url = ws_url
@@ -380,15 +386,19 @@ class SonioxRealtimeClient:
         self._connected_event = threading.Event()
         self._fatal_error: str = ""
         self._fatal_code: int = 0
+        self.reset_count: int = 0
 
         # Token accumulators for the active utterance
         self._final_orig: list[str] = []
         self._final_trans: list[str] = []
         self._last_src_iso: str = ""
         self._last_reported_nllb: str = ""
-        self._last_partial_sig: tuple[str, str] = ("", "")
+        self._current_speaker: str = ""
+        self._last_partial_sig: tuple[str, str, str] = ("", "", "")
         self._last_send_mono: float = 0.0
         self._sent_bytes_unreported: int = 0
+        self._recent_translations: list[str] = []
+        self._saw_endpoint_since_reset: bool = False
 
     def start(self) -> None:
         self._stop_event.clear()
@@ -444,9 +454,36 @@ class SonioxRealtimeClient:
             th.join(timeout=3.5)
         self._thread = None
 
-    def _build_start_config(self) -> dict[str, Any]:
+    def _is_two_way_active(self) -> bool:
         src_iso = nllb_to_soniox_iso(self.source_lang)
         tgt_iso = nllb_to_soniox_iso(self.target_lang)
+        return (
+            self.translation_type == "two_way"
+            and self.source_lang != "auto"
+            and bool(src_iso)
+            and bool(tgt_iso)
+            and src_iso != tgt_iso
+        )
+
+    def _add_carryover(self, text: str) -> None:
+        clean = (text or "").strip()
+        if not clean:
+            return
+        self._recent_translations.append(clean)
+        total = sum(len(x) for x in self._recent_translations)
+        while total > 500 and len(self._recent_translations) > 1:
+            removed = self._recent_translations.pop(0)
+            total -= len(removed)
+
+    def _get_carryover_text(self) -> str:
+        if not self._recent_translations:
+            return ""
+        return " ".join(self._recent_translations).strip()[-500:]
+
+    def _build_start_config(self, carryover_text: str = "") -> dict[str, Any]:
+        src_iso = nllb_to_soniox_iso(self.source_lang)
+        tgt_iso = nllb_to_soniox_iso(self.target_lang)
+        two_way = self._is_two_way_active()
         cfg: dict[str, Any] = {
             "model": self.model,
             "audio_format": "pcm_s16le",
@@ -454,22 +491,37 @@ class SonioxRealtimeClient:
             "num_channels": 1,
             "enable_language_identification": True,
             "enable_endpoint_detection": True,
+            "max_endpoint_delay_ms": self.max_endpoint_delay_ms,
+            "enable_speaker_diarization": True,
         }
-        hints: list[str] = []
-        if src_iso:
-            hints.append(src_iso)
-        if tgt_iso and tgt_iso not in hints:
-            hints.append(tgt_iso)
-        if hints:
-            cfg["language_hints"] = hints
-        # Enable inline Soniox translation whenever target is supported (and != fixed source)
-        if tgt_iso and (self.source_lang == "auto" or src_iso != tgt_iso):
+        if two_way:
+            cfg["language_hints"] = [src_iso, tgt_iso]
             cfg["translation"] = {
-                "type": "one_way",
-                "target_language": tgt_iso,
+                "type": "two_way",
+                "language_a": src_iso,
+                "language_b": tgt_iso,
             }
-        if self.context:
-            cfg["context"] = self.context
+        else:
+            if src_iso:
+                cfg["language_hints"] = [src_iso]
+                if self.source_lang != "auto":
+                    cfg["language_hints_strict"] = True
+            elif tgt_iso:
+                cfg["language_hints"] = [tgt_iso]
+            # Enable inline Soniox translation whenever target is supported (and != fixed source)
+            if tgt_iso and (self.source_lang == "auto" or src_iso != tgt_iso):
+                cfg["translation"] = {
+                    "type": "one_way",
+                    "target_language": tgt_iso,
+                }
+
+        merged_ctx: dict[str, Any] = dict(self.context) if isinstance(self.context, dict) else {}
+        if carryover_text:
+            base_text = str(merged_ctx.get("text") or "").strip()
+            carry_line = f"Recent conversation: {carryover_text}"
+            merged_ctx["text"] = f"{base_text}\n\n{carry_line}".strip() if base_text else carry_line
+        if merged_ctx:
+            cfg["context"] = merged_ctx
         return cfg
 
     @staticmethod
@@ -478,6 +530,19 @@ class SonioxRealtimeClient:
             return ""
         raw = "".join(tokens)
         return " ".join(raw.split()).strip()
+
+    @staticmethod
+    def _normalize_speaker(raw_speaker: Any) -> str:
+        if raw_speaker is None:
+            return ""
+        s = str(raw_speaker).strip()
+        if not s:
+            return ""
+        if s.upper().startswith("S") and s[1:].isdigit():
+            return f"S{s[1:]}"
+        if s.isdigit():
+            return f"S{s}"
+        return s
 
     def _flush_usage_locked(self, force: bool = False) -> None:
         bytes_per_sec = self.sample_rate * 2  # 16-bit mono
@@ -491,26 +556,56 @@ class SonioxRealtimeClient:
                     pass
 
     def _resolve_current_src_nllb(self) -> str:
+        if self._is_two_way_active():
+            if self._last_src_iso:
+                return soniox_iso_to_nllb(self._last_src_iso, self.source_lang)
+            return self._last_reported_nllb or self.source_lang
         if self.source_lang != "auto":
             return self.source_lang
         if self._last_src_iso:
             return soniox_iso_to_nllb(self._last_src_iso, "eng_Latn")
         return self._last_reported_nllb or "eng_Latn"
 
-    def _emit_final_utterance(self, latency_ms: float, override_src_nllb: str = "") -> None:
+    def _resolve_current_tgt_nllb(self, src_nllb: str) -> str:
+        if self._is_two_way_active():
+            return self.source_lang if src_nllb == self.target_lang else self.target_lang
+        return self.target_lang
+
+    @staticmethod
+    def _invoke_text_cb(cb: Callable[..., None], orig: str, trans: str, src_nllb: str, tgt_nllb: str, speaker: str, lat_ms: float) -> None:
+        # Support both 6-arg `(orig, trans, src, tgt, speaker, ms)` and legacy 4-arg `(orig, trans, src, ms)` callers
+        try:
+            cb(orig, trans, src_nllb, tgt_nllb, speaker, lat_ms)
+        except TypeError:
+            cb(orig, trans, src_nllb, lat_ms)
+
+    def _emit_final_utterance(
+        self,
+        latency_ms: float,
+        override_src_nllb: str = "",
+        override_speaker: Optional[str] = None,
+    ) -> None:
         orig = self._join_tokens(self._final_orig)
         trans = self._join_tokens(self._final_trans)
         self._final_orig.clear()
         self._final_trans.clear()
-        self._last_partial_sig = ("", "")
+        self._last_partial_sig = ("", "", "")
         if not orig and not trans:
             return
         src_nllb = override_src_nllb or self._resolve_current_src_nllb()
+        tgt_nllb = self._resolve_current_tgt_nllb(src_nllb)
+        speaker = self._current_speaker if override_speaker is None else override_speaker
         if not orig and trans:
             orig = trans
+        if trans:
+            self._add_carryover(trans)
+        elif orig:
+            self._add_carryover(orig)
         if self._on_final:
             try:
-                self._on_final(orig, trans, src_nllb, round(latency_ms, 1))
+                self._invoke_text_cb(
+                    self._on_final, orig, trans, src_nllb, tgt_nllb, speaker, round(latency_ms, 1)
+                )
             except Exception as exc:
                 logger.warning("Soniox on_final callback failed: %s", exc)
 
@@ -547,6 +642,7 @@ class SonioxRealtimeClient:
                 continue
             if txt == "<end>":
                 saw_endpoint = True
+                self._saw_endpoint_since_reset = True
                 continue
             if txt == "<fin>":
                 continue
@@ -563,7 +659,16 @@ class SonioxRealtimeClient:
                 else:
                     nonfinal_trans.append(txt)
             else:
+                spk = self._normalize_speaker(tok.get("speaker"))
                 lang_iso = str(tok.get("language") or "").strip().lower()
+                if is_final and spk and spk != self._current_speaker:
+                    prev_spk = self._current_speaker
+                    if prev_spk and (self._final_orig or self._final_trans):
+                        self._emit_final_utterance(latency_ms, override_speaker=prev_spk)
+                    self._current_speaker = spk
+                elif spk and not self._current_speaker:
+                    self._current_speaker = spk
+
                 if lang_iso:
                     nllb = soniox_iso_to_nllb(lang_iso, "")
                     if is_final:
@@ -595,32 +700,48 @@ class SonioxRealtimeClient:
                 else:
                     nonfinal_orig.append(txt)
 
-        # Commit cleanly on semantic `<end>` token OR long sentence boundary (>36 words)
+        # Commit cleanly on:
+        # 1) semantic `<end>` token, OR
+        # 2) completed punctuated sentence when BOTH original & translation are already finalized
+        #    (cuts LED waiting time during continuous uninterrupted speeches!), OR
+        # 3) long passthrough boundary (>34 words / 140 chars).
         if saw_endpoint:
             self._emit_final_utterance(latency_ms)
         else:
             cur_final_orig = self._join_tokens(self._final_orig)
             cur_final_trans = self._join_tokens(self._final_trans)
-            long_punct_boundary = (
-                cur_final_orig
-                and (len(cur_final_orig.split()) >= 34 or len(cur_final_orig) >= 140)
-                and cur_final_orig.endswith((".", "!", "?", "。", "！", "？"))
-                and (bool(cur_final_trans) or self._resolve_current_src_nllb() == self.target_lang)
+            src_now = self._resolve_current_src_nllb()
+            tgt_now = self._resolve_current_tgt_nllb(src_now)
+            ends_punct = cur_final_orig.endswith((".", "!", "?", "。", "！", "？"))
+            complete_translated_sentence = (
+                bool(cur_final_orig)
+                and bool(cur_final_trans)
+                and ends_punct
+                and (len(cur_final_orig.split()) >= 6 or len(cur_final_orig) >= 14)
             )
-            if long_punct_boundary:
+            long_punct_boundary = (
+                bool(cur_final_orig)
+                and ends_punct
+                and (len(cur_final_orig.split()) >= 34 or len(cur_final_orig) >= 140)
+                and (bool(cur_final_trans) or src_now == tgt_now)
+            )
+            if complete_translated_sentence or long_punct_boundary:
                 self._emit_final_utterance(latency_ms)
             else:
                 live_orig = self._join_tokens([*self._final_orig, *nonfinal_orig])
                 live_trans = self._join_tokens([*self._final_trans, *nonfinal_trans])
-                sig = (live_orig, live_trans)
+                sig = (live_orig, live_trans, self._current_speaker)
                 if (live_orig or live_trans) and sig != self._last_partial_sig:
                     self._last_partial_sig = sig
                     if self._on_partial:
                         try:
-                            self._on_partial(
+                            self._invoke_text_cb(
+                                self._on_partial,
                                 live_orig,
                                 live_trans,
-                                self._resolve_current_src_nllb(),
+                                src_now,
+                                tgt_now,
+                                self._current_speaker,
                                 round(latency_ms, 1),
                             )
                         except Exception:
@@ -643,6 +764,51 @@ class SonioxRealtimeClient:
             except Exception:
                 pass
 
+    async def _open_ws(self, ssl_ctx: Optional[ssl.SSLContext], carryover: str = ""):
+        ws = await websockets.connect(
+            self.ws_url,
+            additional_headers={"Authorization": f"Bearer {self.api_key}"},
+            ssl=ssl_ctx,
+            open_timeout=10,
+            close_timeout=5,
+            ping_interval=20,
+            ping_timeout=20,
+        )
+        await ws.send(json.dumps(self._build_start_config(carryover_text=carryover)))
+        self._last_send_mono = time.monotonic()
+        # Brief 0.30s check for immediate auth/402 error before treating connection as healthy
+        try:
+            first_raw = await asyncio.wait_for(ws.recv(), timeout=0.30)
+            first_data = json.loads(first_raw)
+            if self._handle_response_message(first_data):
+                await ws.close()
+                return None
+        except asyncio.TimeoutError:
+            pass
+        return ws
+
+    async def _drain_old_ws(self, old_ws: Any) -> None:
+        """Gracefully flush & close an old WebSocket after make-before-break handoff."""
+        try:
+            await old_ws.send("")
+        except Exception:
+            pass
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                rem = max(0.1, deadline - time.monotonic())
+                raw = await asyncio.wait_for(old_ws.recv(), timeout=rem)
+                data = json.loads(raw)
+                if self._handle_response_message(data):
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                await old_ws.close()
+            except Exception:
+                pass
+
     async def _async_session_loop(self) -> None:
         ssl_ctx = _build_ssl_context() if self.ws_url.startswith("wss://") else None
         max_attempts = 2
@@ -650,88 +816,130 @@ class SonioxRealtimeClient:
 
         while not self._stop_event.is_set() and attempt < max_attempts:
             attempt += 1
+            active_ws: Any = None
+            recv_task: Optional[asyncio.Task[Any]] = None
+            drain_tasks: set[asyncio.Task[Any]] = set()
             try:
-                async with websockets.connect(
-                    self.ws_url,
-                    additional_headers={"Authorization": f"Bearer {self.api_key}"},
-                    ssl=ssl_ctx,
-                    open_timeout=10,
-                    close_timeout=5,
-                    ping_interval=20,
-                    ping_timeout=20,
-                ) as ws:
-                    await ws.send(json.dumps(self._build_start_config()))
-                    self._last_send_mono = time.monotonic()
-                    # Wait briefly (up to 0.35s) for an immediate config/402/401 error before marking connected
-                    first_err = False
-                    try:
-                        first_raw = await asyncio.wait_for(ws.recv(), timeout=0.35)
-                        first_data = json.loads(first_raw)
-                        if self._handle_response_message(first_data):
-                            first_err = True
-                    except asyncio.TimeoutError:
-                        pass
-                    if first_err:
-                        return
+                active_ws = await self._open_ws(ssl_ctx, carryover=self._get_carryover_text())
+                if active_ws is None:
+                    return
 
-                    self._connected_event.set()
-                    attempt = 0  # Reset reconnect budget after healthy connection
+                self._connected_event.set()
+                attempt = 0  # Reset reconnect budget after healthy connection
+                ws_opened_mono = time.monotonic()
+                self._saw_endpoint_since_reset = False
+                ws_lock = asyncio.Lock()
+                recv_failed: list[Optional[Exception]] = [None]
 
-                    async def _sender() -> None:
-                        last_tx = time.monotonic()
-                        while True:
-                            try:
-                                chunk = await asyncio.to_thread(self._pcm_queue.get, True, 0.25)
-                            except queue.Empty:
-                                if self._stop_event.is_set():
+                def _spawn_receiver(sock: Any) -> asyncio.Task[Any]:
+                    async def _recv_loop() -> None:
+                        try:
+                            async for raw in sock:
+                                data = json.loads(raw)
+                                if self._handle_response_message(data):
                                     break
-                                if (time.monotonic() - last_tx) >= 12.0:
-                                    await ws.send(json.dumps({"type": "keepalive"}))
-                                    last_tx = time.monotonic()
-                                continue
-                            if chunk is None:
-                                break
-                            await ws.send(chunk)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            # Ignore close errors if this socket was already superseded by make-before-break
+                            if active_ws is sock:
+                                recv_failed[0] = exc
+
+                    return asyncio.create_task(_recv_loop())
+
+                recv_task = _spawn_receiver(active_ws)
+                last_tx = time.monotonic()
+
+                while not self._stop_event.is_set():
+                    if self._fatal_error:
+                        break
+                    if recv_failed[0] is not None:
+                        raise recv_failed[0]
+
+                    # Make-before-break seamless session reset (default every 4 minutes) with context carryover
+                    if self.session_reset_s > 0:
+                        age_s = time.monotonic() - ws_opened_mono
+                        should_reset = (age_s >= self.session_reset_s and self._saw_endpoint_since_reset) or (
+                            age_s >= self.session_reset_s + 15.0
+                        )
+                        if should_reset:
+                            try:
+                                new_ws = await self._open_ws(ssl_ctx, carryover=self._get_carryover_text())
+                                if new_ws is None:
+                                    break
+                                async with ws_lock:
+                                    old_ws = active_ws
+                                    old_recv = recv_task
+                                    active_ws = new_ws
+                                    ws_opened_mono = time.monotonic()
+                                    self._saw_endpoint_since_reset = False
+                                    self.reset_count += 1
+                                    recv_task = _spawn_receiver(active_ws)
+                                if old_recv is not None:
+                                    old_recv.cancel()
+                                dt = asyncio.create_task(self._drain_old_ws(old_ws))
+                                drain_tasks.add(dt)
+                                dt.add_done_callback(drain_tasks.discard)
+                                logger.info(
+                                    "Soniox make-before-break seamless reset #%d complete (carryover=%d chars)",
+                                    self.reset_count,
+                                    len(self._get_carryover_text()),
+                                )
+                            except Exception as reset_exc:
+                                logger.warning("Soniox seamless reset skipped (keeping active WS): %s", reset_exc)
+                                ws_opened_mono = time.monotonic() - max(0.0, self.session_reset_s - 30.0)
+
+                    try:
+                        chunk = await asyncio.to_thread(self._pcm_queue.get, True, 0.25)
+                    except queue.Empty:
+                        if self._stop_event.is_set():
+                            break
+                        if (time.monotonic() - last_tx) >= 12.0:
+                            async with ws_lock:
+                                await active_ws.send(json.dumps({"type": "keepalive"}))
                             last_tx = time.monotonic()
-                            self._last_send_mono = last_tx
-                            self._sent_bytes_unreported += len(chunk)
-                            self._flush_usage_locked(force=False)
-                        # Graceful Soniox End-of-Stream frame so final tokens & translations flush
-                        try:
-                            await ws.send("")
-                        except Exception:
-                            pass
+                        continue
 
-                    async def _receiver() -> None:
-                        async for raw in ws:
-                            data = json.loads(raw)
-                            if self._handle_response_message(data):
-                                break
+                    if chunk is None:
+                        break
 
-                    send_task = asyncio.create_task(_sender())
-                    recv_task = asyncio.create_task(_receiver())
-                    done, pending = await asyncio.wait(
-                        {send_task, recv_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    # If sender finished first (user pressed Stop), give receiver up to 2.5s to flush `<end>`/`finished`
-                    if send_task in done and recv_task in pending:
-                        try:
-                            await asyncio.wait_for(recv_task, timeout=2.5)
-                        except Exception:
-                            recv_task.cancel()
-                    else:
-                        for task in pending:
-                            task.cancel()
-                        for task in done:
-                            exc = task.exception()
-                            if exc is not None and not isinstance(exc, asyncio.CancelledError):
-                                raise exc
+                    async with ws_lock:
+                        await active_ws.send(chunk)
+                    last_tx = time.monotonic()
+                    self._last_send_mono = last_tx
+                    self._sent_bytes_unreported += len(chunk)
+                    self._flush_usage_locked(force=False)
 
-                    if self._fatal_error or self._stop_event.is_set():
-                        self._emit_final_utterance(100.0)
-                        return
+                # Graceful End-of-Stream flush on the active WebSocket
+                if active_ws is not None:
+                    try:
+                        await active_ws.send("")
+                    except Exception:
+                        pass
+                if recv_task is not None and not recv_task.done():
+                    try:
+                        await asyncio.wait_for(recv_task, timeout=2.5)
+                    except Exception:
+                        recv_task.cancel()
+                if drain_tasks:
+                    await asyncio.gather(*list(drain_tasks), return_exceptions=True)
+                if active_ws is not None:
+                    try:
+                        await active_ws.close()
+                    except Exception:
+                        pass
+
+                if self._fatal_error or self._stop_event.is_set():
+                    self._emit_final_utterance(100.0)
+                    return
             except Exception as exc:
+                if recv_task is not None and not recv_task.done():
+                    recv_task.cancel()
+                if active_ws is not None:
+                    try:
+                        await active_ws.close()
+                    except Exception:
+                        pass
                 if self._stop_event.is_set():
                     self._emit_final_utterance(100.0)
                     return

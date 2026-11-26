@@ -168,7 +168,16 @@ class SessionLogger:
             tr_txt = entry.get("translated_text", "").strip()
             para_id = str(entry.get("paragraph_id") or "").strip()
             speaker = str(entry.get("speaker") or "").strip()
-            spk_tag = "[Bạn] " if speaker == "self" else "[Đối tác] " if speaker == "remote" else ""
+            if speaker == "self":
+                spk_tag = "[Bạn] "
+            elif speaker == "remote":
+                spk_tag = "[Đối tác] "
+            elif speaker.upper().startswith("S") and speaker[1:].isdigit():
+                spk_tag = f"[Diễn giả {speaker[1:]}] "
+            elif speaker:
+                spk_tag = f"[{speaker}] "
+            else:
+                spk_tag = ""
 
             # .TXT: group consecutive sentences with same paragraph_id & speaker into coherent paragraphs,
             # updating the trailing block in-place with immediate flush (100% crash-safe).
@@ -241,3 +250,106 @@ class SessionLogger:
             return True
         except Exception:
             return False
+
+    def _resolve_safe_log_path(self, filename: str) -> Path:
+        name = (filename or "").strip()
+        if (
+            not name
+            or "/" in name
+            or "\\" in name
+            or ".." in name
+            or not name.lower().endswith(".txt")
+        ):
+            raise ValueError("Tên file biên bản không hợp lệ.")
+        root = self.logs_dir.resolve()
+        target = (root / name).resolve()
+        if target.parent != root:
+            raise ValueError("Đường dẫn file biên bản nằm ngoài thư mục cho phép.")
+        return target
+
+    def list_sessions(self, limit: int = 80) -> list[dict]:
+        """Return newest-first list of saved meeting transcripts in `logs_dir`."""
+        self.logs_dir = _ensure_writable_dir(self.logs_dir)
+        with self._lock:
+            active_name = self._txt_path.name if self._txt_path is not None else ""
+        items: list[dict] = []
+        try:
+            txt_files = sorted(
+                self.logs_dir.glob("*.txt"),
+                key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+                reverse=True,
+            )
+        except OSError:
+            return []
+
+        for p in txt_files[: max(1, min(200, int(limit)))]:
+            try:
+                st = p.stat()
+                srt_p = p.with_suffix(".srt")
+                preview = ""
+                direction = ""
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    for _ in range(30):
+                        line = fh.readline()
+                        if not line:
+                            break
+                        s = line.strip()
+                        if not s or s.startswith("==="):
+                            continue
+                        if s.startswith("Hướng dịch:"):
+                            direction = s.replace("Hướng dịch:", "").strip()
+                            continue
+                        preview = s[:140]
+                        break
+                items.append(
+                    {
+                        "filename": p.name,
+                        "srt_filename": srt_p.name if srt_p.is_file() else "",
+                        "modified_ts": st.st_mtime,
+                        "modified_str": time.strftime("%d/%m/%Y %H:%M", time.localtime(st.st_mtime)),
+                        "size_bytes": st.st_size,
+                        "direction": direction,
+                        "preview": preview or "(Chưa có nội dung)",
+                        "is_active": p.name == active_name,
+                    }
+                )
+            except OSError:
+                continue
+        return items
+
+    def read_session(self, filename: str) -> dict:
+        target = self._resolve_safe_log_path(filename)
+        if not target.is_file():
+            raise FileNotFoundError(f"Không tìm thấy biên bản: {filename}")
+        st = target.stat()
+        content = target.read_text(encoding="utf-8", errors="replace")
+        srt_p = target.with_suffix(".srt")
+        srt_content = srt_p.read_text(encoding="utf-8", errors="replace") if srt_p.is_file() else ""
+        with self._lock:
+            is_active = self._txt_path is not None and self._txt_path.name == target.name
+        return {
+            "ok": True,
+            "filename": target.name,
+            "srt_filename": srt_p.name if srt_p.is_file() else "",
+            "content": content,
+            "srt_content": srt_content,
+            "size_bytes": st.st_size,
+            "modified_str": time.strftime("%d/%m/%Y %H:%M:%S", time.localtime(st.st_mtime)),
+            "is_active": is_active,
+        }
+
+    def delete_session(self, filename: str, *, is_listening: bool = False) -> dict:
+        target = self._resolve_safe_log_path(filename)
+        with self._lock:
+            if is_listening and self._txt_path is not None and self._txt_path.name == target.name:
+                raise RuntimeError("Không thể xóa file biên bản của phiên dịch đang chạy.")
+        if not target.is_file():
+            raise FileNotFoundError(f"Không tìm thấy biên bản: {filename}")
+        target.unlink()
+        srt_p = target.with_suffix(".srt")
+        if srt_p.is_file():
+            try:
+                srt_p.unlink()
+            except OSError:
+                pass
+        return {"ok": True, "deleted": target.name}

@@ -167,10 +167,33 @@ export interface SessionConfig {
   translate_partials: boolean;
   pass2_refine: boolean;
   eco_mode: boolean;
+  soniox_two_way?: boolean;
   beam_size: number;
   llm_url: string;
   llm_model: string;
   llm_api_key: string;
+}
+
+export interface SessionLogSummary {
+  filename: string;
+  srt_filename: string;
+  modified_ts: number;
+  modified_str: string;
+  size_bytes: number;
+  direction: string;
+  preview: string;
+  is_active: boolean;
+}
+
+export interface SessionLogDetail {
+  ok: boolean;
+  filename: string;
+  srt_filename: string;
+  content: string;
+  srt_content: string;
+  size_bytes: number;
+  modified_str: string;
+  is_active: boolean;
 }
 
 export interface AudienceInfo {
@@ -327,12 +350,12 @@ export interface EngineStatus {
   boot_error: string;
 }
 
-export type OverlayLayoutMode = "led-stage" | "stacked" | "youtube" | "target-only" | "split";
+export type OverlayLayoutMode = "led-stage" | "full-text" | "stacked" | "youtube" | "target-only" | "split";
 export const OVERLAY_LAYOUT_KEY = "polyvoice_overlay_layout";
 
 export interface PartialEvent {
   id: string;
-  speaker?: "self" | "remote" | "";
+  speaker?: string;
   source_text: string;
   translated_text: string;
   stable_text?: string;
@@ -348,7 +371,7 @@ export interface TranscriptEntry {
   id: string;
   paragraph_id?: string;
   item_ids?: string[];
-  speaker?: "self" | "remote" | "";
+  speaker?: string;
   sentence_count?: number;
   source_text: string;
   translated_text: string;
@@ -360,6 +383,15 @@ export interface TranscriptEntry {
   mt_engine: string;
   timestamp: string;
   log_saved_count?: number;
+}
+
+export function formatSpeakerLabel(speaker?: string): string {
+  const s = (speaker || "").trim();
+  if (!s) return "";
+  if (s === "self") return "Bạn";
+  if (s === "remote") return "Đối tác";
+  if (/^S\d+$/i.test(s)) return `Diễn giả ${s.slice(1)}`;
+  return s;
 }
 
 export type EvaluationIssueType = "ok" | "nuance" | "mt_inaccurate" | "asr_error";

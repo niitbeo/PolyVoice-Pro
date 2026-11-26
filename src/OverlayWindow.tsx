@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlignLeft,
   ArrowDown,
+  BookOpenText,
   Columns2,
   Contrast,
   Eye,
@@ -40,17 +41,27 @@ import {
   ThemeMode,
   TranscriptEntry,
   applyTheme,
+  formatSpeakerLabel,
   getInitialTheme,
   groupEntriesByParagraph,
   isTauriEnv,
   shortLangName,
 } from "./types";
 
+const OVERLAY_FT_DUAL_KEY = "polyvoice_ft_dual";
+const OVERLAY_FT_COLOR_KEY = "polyvoice_ft_color";
+const FULLTEXT_COLORS = [
+  { id: "white", hex: "#ffffff", label: "Trắng tinh" },
+  { id: "yellow", hex: "#fde047", label: "Vàng hội trường" },
+  { id: "cyan", hex: "#7dd3fc", label: "Xanh sáng dịu" },
+] as const;
+
 function getInitialOverlayLayout(): OverlayLayoutMode {
   try {
     const saved = localStorage.getItem(OVERLAY_LAYOUT_KEY);
     if (
       saved === "led-stage" ||
+      saved === "full-text" ||
       saved === "stacked" ||
       saved === "youtube" ||
       saved === "target-only" ||
@@ -62,6 +73,31 @@ function getInitialOverlayLayout(): OverlayLayoutMode {
     // ignore
   }
   return "led-stage";
+}
+
+function getInitialFullTextDual(): boolean {
+  try {
+    const saved = localStorage.getItem(OVERLAY_FT_DUAL_KEY);
+    if (saved === "0" || saved === "false") return false;
+  } catch {
+    // ignore
+  }
+  return true;
+}
+
+function getInitialFullTextColor(): string {
+  try {
+    const saved = localStorage.getItem(OVERLAY_FT_COLOR_KEY);
+    if (saved && FULLTEXT_COLORS.some((c) => c.hex === saved)) return saved;
+  } catch {
+    // ignore
+  }
+  return "#ffffff";
+}
+
+function stepFontSize(current: number, deltaDir: 1 | -1): number {
+  const step = current >= 80 ? 8 : current >= 48 ? 4 : 2;
+  return Math.max(14, Math.min(140, current + deltaDir * step));
 }
 
 function renderLiveTarget(partial: PartialEvent) {
@@ -144,6 +180,10 @@ export default function OverlayWindow() {
   );
   const [showCornerQr, setShowCornerQr] = useState(false);
   const [showLedSource, setShowLedSource] = useState<boolean>(() => getInitialLedShowSource());
+  const [fullTextDual, setFullTextDual] = useState<boolean>(() => getInitialFullTextDual());
+  const [fullTextColor, setFullTextColor] = useState<string>(() => getInitialFullTextColor());
+  const [ftSrcScrolledUp, setFtSrcScrolledUp] = useState(false);
+  const [ftTgtScrolledUp, setFtTgtScrolledUp] = useState(false);
   const [detectedSourceLang, setDetectedSourceLang] = useState<string>("");
   const [detectedSourceLabel, setDetectedSourceLabel] = useState<string>("");
   const [audienceInfo, setAudienceInfo] = useState<AudienceInfo | null>(null);
@@ -152,6 +192,10 @@ export default function OverlayWindow() {
   const partialRef = useRef<PartialEvent | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const ledScrollRef = useRef<HTMLDivElement | null>(null);
+  const ftSrcScrollRef = useRef<HTMLDivElement | null>(null);
+  const ftTgtScrollRef = useRef<HTMLDivElement | null>(null);
+  const ftSrcPinnedRef = useRef(true);
+  const ftTgtPinnedRef = useRef(true);
   const pinnedToBottomRef = useRef(true);
   const scrollAnimRef = useRef<number | null>(null);
   const hideBarTimerRef = useRef<number | null>(null);
@@ -182,6 +226,59 @@ export default function OverlayWindow() {
       // ignore
     }
   }, [showLedSource]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(OVERLAY_FT_DUAL_KEY, fullTextDual ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  }, [fullTextDual]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(OVERLAY_FT_COLOR_KEY, fullTextColor);
+    } catch {
+      // ignore
+    }
+  }, [fullTextColor]);
+
+  // Independent Smart Scroll for Continuous Full-Text panes (only auto-scrolls when pinned near bottom)
+  useEffect(() => {
+    if (layoutMode !== "full-text") return;
+    requestAnimationFrame(() => {
+      const srcEl = ftSrcScrollRef.current;
+      if (srcEl && ftSrcPinnedRef.current) {
+        srcEl.scrollTop = srcEl.scrollHeight;
+      }
+      const tgtEl = ftTgtScrollRef.current;
+      if (tgtEl && ftTgtPinnedRef.current) {
+        tgtEl.scrollTop = tgtEl.scrollHeight;
+      }
+    });
+  }, [entries, partial, fontSize, fullTextDual, layoutMode]);
+
+  const handleFtScroll = (which: "src" | "tgt") => {
+    const el = which === "src" ? ftSrcScrollRef.current : ftTgtScrollRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+    if (which === "src") {
+      ftSrcPinnedRef.current = nearBottom;
+      setFtSrcScrolledUp(!nearBottom);
+    } else {
+      ftTgtPinnedRef.current = nearBottom;
+      setFtTgtScrolledUp(!nearBottom);
+    }
+  };
+
+  const scrollFullTextToBottom = () => {
+    ftSrcPinnedRef.current = true;
+    ftTgtPinnedRef.current = true;
+    setFtSrcScrolledUp(false);
+    setFtTgtScrolledUp(false);
+    ftSrcScrollRef.current?.scrollTo({ top: ftSrcScrollRef.current.scrollHeight, behavior: "smooth" });
+    ftTgtScrollRef.current?.scrollTo({ top: ftTgtScrollRef.current.scrollHeight, behavior: "smooth" });
+  };
 
   // Keep LED stage sentences scrolled cleanly to the newest finalized row when text wraps tall
   useEffect(() => {
@@ -219,22 +316,24 @@ export default function OverlayWindow() {
     };
   }, []);
 
-  // Auto-hide topbar cleanly when Stage / Clean Presentation Mode is active
+  const autoHideActive = stageMode || (layoutMode === "full-text" && Boolean(status?.listening));
+
+  // Auto-hide topbar cleanly when Stage Mode is active OR while live-translating in Full-Text Flow mode
   const revealControlsTemporarily = useCallback(() => {
     setControlsVisible(true);
     if (hideBarTimerRef.current) {
       window.clearTimeout(hideBarTimerRef.current);
       hideBarTimerRef.current = null;
     }
-    if (stageMode) {
+    if (autoHideActive) {
       hideBarTimerRef.current = window.setTimeout(() => {
         setControlsVisible(false);
-      }, 2600);
+      }, 3000);
     }
-  }, [stageMode]);
+  }, [autoHideActive]);
 
   useEffect(() => {
-    if (!stageMode) {
+    if (!autoHideActive) {
       if (hideBarTimerRef.current) {
         window.clearTimeout(hideBarTimerRef.current);
         hideBarTimerRef.current = null;
@@ -249,7 +348,7 @@ export default function OverlayWindow() {
         hideBarTimerRef.current = null;
       }
     };
-  }, [stageMode, revealControlsTemporarily]);
+  }, [autoHideActive, revealControlsTemporarily]);
 
   useEffect(() => {
     document.body.classList.add("overlay-body");
@@ -553,6 +652,46 @@ export default function OverlayWindow() {
 
   const groupedEntries = useMemo(() => groupEntriesByParagraph(entries), [entries]);
 
+  // Continuous Full-Text Flow blocks: merge consecutive entries seamlessly into running book-like
+  // paragraphs, breaking ONLY when speaker or spoken language changes!
+  const fullTextBlocks = useMemo(() => {
+    const blocks: Array<{
+      id: string;
+      speaker: string;
+      source_lang: string;
+      target_lang: string;
+      source_text: string;
+      translated_text: string;
+    }> = [];
+    for (const item of entries) {
+      const spk = (item.speaker || "").trim();
+      const prev = blocks[blocks.length - 1];
+      const sameFlow =
+        prev &&
+        prev.speaker === spk &&
+        prev.source_lang === item.source_lang &&
+        prev.target_lang === item.target_lang;
+      if (sameFlow) {
+        if (item.source_text) {
+          prev.source_text = `${prev.source_text} ${item.source_text}`.replace(/\s{2,}/g, " ").trim();
+        }
+        if (item.translated_text) {
+          prev.translated_text = `${prev.translated_text} ${item.translated_text}`.replace(/\s{2,}/g, " ").trim();
+        }
+      } else {
+        blocks.push({
+          id: item.id,
+          speaker: spk,
+          source_lang: item.source_lang,
+          target_lang: item.target_lang,
+          source_text: (item.source_text || "").trim(),
+          translated_text: (item.translated_text || "").trim(),
+        });
+      }
+    }
+    return blocks;
+  }, [entries]);
+
   const isAutoSrc = status?.config?.source_lang === "auto";
   const detectedNice = detectedSourceLabel || (detectedSourceLang ? shortLangName(detectedSourceLang) : "");
   const srcLabel = isAutoSrc
@@ -585,17 +724,22 @@ export default function OverlayWindow() {
       ? `rgba(255, 255, 255, ${opacity})`
       : layoutMode === "led-stage"
       ? `rgba(5, 7, 12, ${opacity})`
+      : layoutMode === "full-text"
+      ? `rgba(24, 26, 33, ${Math.min(opacity, 0.92)})`
       : `rgba(11, 14, 23, ${opacity})`;
 
   const isEmpty = entries.length === 0 && !partial;
   const srcStackedSize = Math.max(14, Math.round(fontSize * 0.66));
-  const hideTopbar = stageMode && !controlsVisible;
+  const hideTopbar = autoHideActive && !controlsVisible;
+  const ftTargetInk = theme === "light" ? "#0f172a" : fullTextColor;
 
   return (
     <div
-      className={`overlay-stage-root ${filledMonitor ? "filled" : ""} ${stageMode ? "stage-clean" : ""}`}
+      className={`overlay-stage-root ${filledMonitor ? "filled" : ""} ${stageMode ? "stage-clean" : ""} ${
+        layoutMode === "full-text" ? "full-text-mode" : ""
+      }`}
       onMouseMove={(e) => {
-        if (stageMode && e.clientY <= 72) {
+        if (autoHideActive && e.clientY <= 72) {
           revealControlsTemporarily();
         }
       }}
@@ -605,7 +749,7 @@ export default function OverlayWindow() {
         <div
           className={`overlay-chrome ${hideTopbar ? "auto-hidden" : ""}`}
           onMouseEnter={() => {
-            if (stageMode) {
+            if (autoHideActive) {
               if (hideBarTimerRef.current) {
                 window.clearTimeout(hideBarTimerRef.current);
                 hideBarTimerRef.current = null;
@@ -614,7 +758,7 @@ export default function OverlayWindow() {
             }
           }}
           onMouseLeave={() => {
-            if (stageMode) revealControlsTemporarily();
+            if (autoHideActive) revealControlsTemporarily();
           }}
         >
           {/* Tier 1: Dedicated Modal Titlebar — easy to grab & drag anywhere */}
@@ -683,6 +827,13 @@ export default function OverlayWindow() {
                   <MonitorPlay size={12} /> Sân khấu LED
                 </button>
                 <button
+                  className={`overlay-layout-btn ${layoutMode === "full-text" ? "active" : ""}`}
+                  onClick={() => setLayoutMode("full-text")}
+                  title="Toàn văn bản liền mạch: cả bài nói trôi thành 1 trang văn bản sạch (1 cột hoặc 2 cột song song, không thẻ/timestamp)"
+                >
+                  <BookOpenText size={12} /> Toàn văn
+                </button>
+                <button
                   className={`overlay-layout-btn ${layoutMode === "stacked" ? "active" : ""}`}
                   onClick={() => setLayoutMode("stacked")}
                   title="Xếp tầng chuẩn hội trường: Gốc nhỏ ở trên • Bản dịch lớn ở dưới"
@@ -731,15 +882,15 @@ export default function OverlayWindow() {
                 <button
                   className="overlay-step-btn"
                   title="Giảm cỡ chữ"
-                  onClick={() => setFontSize((s) => Math.max(16, s - 2))}
+                  onClick={() => setFontSize((s) => stepFontSize(s, -1))}
                 >
                   <Minus size={12} />
                 </button>
                 <span className="overlay-size-tag">{fontSize}px</span>
                 <button
                   className="overlay-step-btn"
-                  title="Tăng cỡ chữ"
-                  onClick={() => setFontSize((s) => Math.min(56, s + 2))}
+                  title="Tăng cỡ chữ (tới 140px cho hội trường lớn)"
+                  onClick={() => setFontSize((s) => stepFontSize(s, 1))}
                 >
                   <Plus size={12} />
                 </button>
@@ -847,12 +998,153 @@ export default function OverlayWindow() {
         {/* Scrollable Conference Subtitle Feed */}
         <div
           className={`overlay-feed ${layoutMode === "led-stage" ? "led-stage" : ""} ${
-            showCornerQr && audienceInfo?.qr_svg && !displayFrozen ? "has-corner-qr" : ""
-          }`}
+            layoutMode === "full-text" ? "full-text" : ""
+          } ${showCornerQr && audienceInfo?.qr_svg && !displayFrozen ? "has-corner-qr" : ""}`}
           ref={scrollRef}
           onScroll={handleScroll}
         >
-          {layoutMode === "led-stage" ? (
+          {layoutMode === "full-text" ? (
+            <div className={`overlay-fulltext-grid ${fullTextDual ? "dual" : "single"}`}>
+              {fullTextDual && (
+                <div
+                  className="overlay-fulltext-pane src"
+                  ref={ftSrcScrollRef}
+                  onScroll={() => handleFtScroll("src")}
+                  style={{ fontSize }}
+                >
+                  {isEmpty ? (
+                    <div className="overlay-fulltext-placeholder">
+                      {status?.listening ? "Đang lắng nghe diễn giả..." : `Đang chờ giọng nói (${srcLabel})...`}
+                    </div>
+                  ) : (
+                    <>
+                      {fullTextBlocks.map((blk, i) => {
+                        const prevBlk = i > 0 ? fullTextBlocks[i - 1] : null;
+                        const spkLabel = formatSpeakerLabel(blk.speaker);
+                        const showSpk = Boolean(spkLabel) && (!prevBlk || prevBlk.speaker !== blk.speaker);
+                        const showLang =
+                          fullTextBlocks.length > 1 && (!prevBlk || prevBlk.source_lang !== blk.source_lang);
+                        return (
+                          <div className="overlay-fulltext-para" key={`ft-src-${blk.id}`}>
+                            {(showSpk || showLang) && (
+                              <span className="overlay-fulltext-inline-meta">
+                                {showSpk && <span className="overlay-fulltext-speaker">{spkLabel}:</span>}
+                                {showLang && (
+                                  <span className="overlay-fulltext-lang">
+                                    {shortLangName(blk.source_lang)}
+                                  </span>
+                                )}
+                              </span>
+                            )}
+                            <span>{blk.source_text}</span>
+                            {i === fullTextBlocks.length - 1 &&
+                              partial?.source_text &&
+                              (!partial.speaker || partial.speaker === blk.speaker) &&
+                              partial.source_lang === blk.source_lang && (
+                                <span className="overlay-fulltext-live-tail">
+                                  {" "}
+                                  {partial.source_text}
+                                  <span className="live-caret src" aria-hidden="true" />
+                                </span>
+                              )}
+                          </div>
+                        );
+                      })}
+                      {partial?.source_text &&
+                        (fullTextBlocks.length === 0 ||
+                          (Boolean(partial.speaker) &&
+                            partial.speaker !== fullTextBlocks[fullTextBlocks.length - 1].speaker) ||
+                          partial.source_lang !== fullTextBlocks[fullTextBlocks.length - 1].source_lang) && (
+                          <div className="overlay-fulltext-para">
+                            {formatSpeakerLabel(partial.speaker) && (
+                              <span className="overlay-fulltext-inline-meta">
+                                <span className="overlay-fulltext-speaker">
+                                  {formatSpeakerLabel(partial.speaker)}:
+                                </span>
+                              </span>
+                            )}
+                            <span className="overlay-fulltext-live-tail">
+                              {partial.source_text}
+                              <span className="live-caret src" aria-hidden="true" />
+                            </span>
+                          </div>
+                        )}
+                    </>
+                  )}
+                </div>
+              )}
+
+              <div
+                className="overlay-fulltext-pane tgt"
+                ref={ftTgtScrollRef}
+                onScroll={() => handleFtScroll("tgt")}
+                style={{ fontSize, color: ftTargetInk }}
+              >
+                {isEmpty ? (
+                  <div className="overlay-fulltext-placeholder">
+                    {status?.listening
+                      ? "Bản dịch toàn văn sẽ trôi liền mạch tại đây..."
+                      : `Chế độ Toàn văn (${tgtLabel}) — sẵn sàng phiên dịch`}
+                  </div>
+                ) : (
+                  <>
+                    {fullTextBlocks.map((blk, i) => {
+                      const prevBlk = i > 0 ? fullTextBlocks[i - 1] : null;
+                      const spkLabel = formatSpeakerLabel(blk.speaker);
+                      const showSpk = Boolean(spkLabel) && (!prevBlk || prevBlk.speaker !== blk.speaker);
+                      const showLang =
+                        !fullTextDual &&
+                        fullTextBlocks.length > 1 &&
+                        (!prevBlk || prevBlk.source_lang !== blk.source_lang);
+                      const liveTgtMatchesLast =
+                        i === fullTextBlocks.length - 1 &&
+                        Boolean(partial?.translated_text || partial?.stable_text || partial?.unstable_text) &&
+                        (!partial?.speaker || partial.speaker === blk.speaker) &&
+                        partial?.target_lang === blk.target_lang;
+                      return (
+                        <div className="overlay-fulltext-para" key={`ft-tgt-${blk.id}`}>
+                          {(showSpk || showLang) && (
+                            <span className="overlay-fulltext-inline-meta">
+                              {showSpk && <span className="overlay-fulltext-speaker">{spkLabel}:</span>}
+                              {showLang && (
+                                <span className="overlay-fulltext-lang">
+                                  {shortLangName(blk.source_lang)} → {shortLangName(blk.target_lang)}
+                                </span>
+                              )}
+                            </span>
+                          )}
+                          <span>{blk.translated_text || "—"}</span>
+                          {liveTgtMatchesLast && partial && (
+                            <span className="overlay-fulltext-live-tail tgt">
+                              {" "}
+                              {renderLiveTarget(partial)}
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {partial &&
+                      Boolean(partial.translated_text || partial.stable_text || partial.unstable_text) &&
+                      (fullTextBlocks.length === 0 ||
+                        (Boolean(partial.speaker) &&
+                          partial.speaker !== fullTextBlocks[fullTextBlocks.length - 1].speaker) ||
+                        partial.target_lang !== fullTextBlocks[fullTextBlocks.length - 1].target_lang) && (
+                        <div className="overlay-fulltext-para">
+                          {formatSpeakerLabel(partial.speaker) && (
+                            <span className="overlay-fulltext-inline-meta">
+                              <span className="overlay-fulltext-speaker">
+                                {formatSpeakerLabel(partial.speaker)}:
+                              </span>
+                            </span>
+                          )}
+                          <span className="overlay-fulltext-live-tail tgt">{renderLiveTarget(partial)}</span>
+                        </div>
+                      )}
+                  </>
+                )}
+              </div>
+            </div>
+          ) : layoutMode === "led-stage" ? (
             <div className="overlay-led-container">
               <div className="overlay-led-sentences" ref={ledScrollRef}>
                 {entries.length === 0 ? (
@@ -1078,8 +1370,15 @@ export default function OverlayWindow() {
                   <div className="overlay-cell left">
                     {!stageMode && (
                       <div className="overlay-cell-meta">
-                        {item.speaker === "self" && <span className="spk-badge self">Bạn</span>}
-                        {item.speaker === "remote" && <span className="spk-badge remote">Đối tác</span>}
+                        {formatSpeakerLabel(item.speaker) && (
+                          <span
+                            className={`spk-badge ${
+                              item.speaker === "self" ? "self" : item.speaker === "remote" ? "remote" : "diar"
+                            }`}
+                          >
+                            {formatSpeakerLabel(item.speaker)}
+                          </span>
+                        )}
                         <span>{item.timestamp}</span>
                         {(item.sentence_count ?? 1) > 1 ? <span>• {item.sentence_count} câu</span> : null}
                       </div>
@@ -1135,8 +1434,15 @@ export default function OverlayWindow() {
                   >
                     {!stageMode && (
                       <div className="overlay-cell-meta">
-                        {item.speaker === "self" && <span className="spk-badge self">Bạn</span>}
-                        {item.speaker === "remote" && <span className="spk-badge remote">Đối tác</span>}
+                        {formatSpeakerLabel(item.speaker) && (
+                          <span
+                            className={`spk-badge ${
+                              item.speaker === "self" ? "self" : item.speaker === "remote" ? "remote" : "diar"
+                            }`}
+                          >
+                            {formatSpeakerLabel(item.speaker)}
+                          </span>
+                        )}
                         <span>{item.timestamp}</span>
                         {(item.sentence_count ?? 1) > 1 ? <span>• {item.sentence_count} câu</span> : null}
                         {item.mt_ms > 0 ? <span>• {item.mt_ms}ms</span> : null}
@@ -1176,10 +1482,67 @@ export default function OverlayWindow() {
           )}
         </div>
 
-        {userScrolledUp && layoutMode !== "led-stage" && (
-          <button className="overlay-jump-btn" onClick={scrollToBottom}>
+        {((userScrolledUp && layoutMode !== "led-stage" && layoutMode !== "full-text") ||
+          (layoutMode === "full-text" && (ftSrcScrolledUp || ftTgtScrolledUp))) && (
+          <button
+            className="overlay-jump-btn"
+            onClick={layoutMode === "full-text" ? scrollFullTextToBottom : scrollToBottom}
+          >
             <ArrowDown size={14} /> Xuống câu mới nhất
           </button>
+        )}
+
+        {/* Floating Bottom-Right Quick Controls for Continuous Full-Text Mode (A-/A+ up to 140px, 3 text colors, 1/2 col toggle) */}
+        {layoutMode === "full-text" && !displayFrozen && (
+          <div className="overlay-fulltext-pill" role="toolbar" aria-label="Điều khiển nhanh chế độ Toàn văn">
+            <div className="overlay-ft-font">
+              <button
+                type="button"
+                className="overlay-ft-btn"
+                title="Giảm cỡ chữ"
+                onClick={() => setFontSize((s) => stepFontSize(s, -1))}
+              >
+                A−
+              </button>
+              <span className="overlay-ft-size">{fontSize}</span>
+              <button
+                type="button"
+                className="overlay-ft-btn"
+                title="Tăng cỡ chữ (tới 140px)"
+                onClick={() => setFontSize((s) => stepFontSize(s, 1))}
+              >
+                A+
+              </button>
+            </div>
+
+            {theme === "dark" && (
+              <div className="overlay-ft-colors" role="group" aria-label="Màu chữ bản dịch">
+                {FULLTEXT_COLORS.map((c) => (
+                  <button
+                    key={c.id}
+                    type="button"
+                    className={`overlay-color-dot ${fullTextColor === c.hex ? "active" : ""}`}
+                    style={{ backgroundColor: c.hex }}
+                    title={`Màu chữ: ${c.label}`}
+                    onClick={() => setFullTextColor(c.hex)}
+                  />
+                ))}
+              </div>
+            )}
+
+            <button
+              type="button"
+              className={`overlay-ft-btn toggle ${fullTextDual ? "active" : ""}`}
+              title={
+                fullTextDual
+                  ? "Đang hiện 2 cột Song ngữ (Gốc | Dịch) — bấm để chuyển sang 1 cột Chỉ dịch"
+                  : "Đang hiện 1 cột Chỉ dịch — bấm để chia 2 cột Song ngữ (Gốc | Dịch)"
+              }
+              onClick={() => setFullTextDual((v) => !v)}
+            >
+              {fullTextDual ? <Columns2 size={14} /> : <AlignLeft size={14} />}
+            </button>
+          </div>
         )}
 
         {showCornerQr && audienceInfo?.qr_svg && !displayFrozen && (

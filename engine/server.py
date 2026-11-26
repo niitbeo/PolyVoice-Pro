@@ -194,6 +194,7 @@ class SessionConfig:
     translate_partials: bool = True
     pass2_refine: bool = True          # 2-Pass Vietnamese refinement (punctuation + ITN + error fix)
     eco_mode: bool = False             # Low-CPU mode for 2-3h seminars (relaxed partial MT debounce)
+    soniox_two_way: bool = False       # Soniox native 2-way translation on a single Mic/Mixer
     beam_size: int = 1
     llm_url: str = "http://127.0.0.1:11434/v1"
     llm_model: str = "translategemma:4b"
@@ -215,6 +216,7 @@ class StartSessionRequest(BaseModel):
     translate_partials: bool = True
     pass2_refine: bool = True
     eco_mode: bool = False
+    soniox_two_way: bool = False
     beam_size: int = 1
     llm_url: str = "http://127.0.0.1:11434/v1"
     llm_model: str = "translategemma:4b"
@@ -236,6 +238,7 @@ class UpdateConfigRequest(BaseModel):
     translate_partials: Optional[bool] = None
     pass2_refine: Optional[bool] = None
     eco_mode: Optional[bool] = None
+    soniox_two_way: Optional[bool] = None
     beam_size: Optional[int] = None
     llm_url: Optional[str] = None
     llm_model: Optional[str] = None
@@ -1957,6 +1960,7 @@ class EngineRuntime:
         latency_ms: float,
         model: str,
         speaker: str = "",
+        target_lang: str = "",
     ) -> None:
         """Commit one finalized Soniox utterance to History, SessionLogger, LED/OBS, and LAN Audience."""
         prot_terms = set(self._get_glossary_hotwords())
@@ -1980,7 +1984,7 @@ class EngineRuntime:
         self._stable_prefix.clear_if(seg_id)
         self._stable_prefix.reset()
 
-        tgt_lang = self.config.target_lang
+        tgt_lang = target_lang or self.config.target_lang
         trans_clean = (raw_translated or "").strip()
 
         # If target language is outside Soniox's 60 languages (e.g. Lao / Khmer / Burmese),
@@ -2415,6 +2419,7 @@ class EngineRuntime:
             translate_partials=req.translate_partials,
             pass2_refine=req.pass2_refine,
             eco_mode=req.eco_mode,
+            soniox_two_way=bool(req.soniox_two_way),
             beam_size=max(1, min(3, req.beam_size)),
             llm_url=req.llm_url,
             llm_model=req.llm_model,
@@ -2432,7 +2437,7 @@ class EngineRuntime:
             speaker_tag_s = "self" if self.config.audio_source == "dual" else ""
 
             def _on_soniox_detected_lang(det_nllb: str) -> None:
-                if self.config.source_lang != "auto":
+                if self.config.source_lang != "auto" and not self.config.soniox_two_way:
                     return
                 if det_nllb and det_nllb != self._detected_source_lang:
                     self._detected_source_lang = det_nllb
@@ -2447,13 +2452,21 @@ class EngineRuntime:
                         }
                     )
 
-            def _on_soniox_partial(orig: str, trans: str, src_nllb: str, lat_ms: float) -> None:
+            def _on_soniox_partial(
+                orig: str,
+                trans: str,
+                src_nllb: str,
+                tgt_nllb: str,
+                spk_label: str,
+                lat_ms: float,
+            ) -> None:
                 if self._stop_event.is_set():
                     return
                 if not self._current_segment_id:
                     self._current_segment_id = uuid.uuid4().hex[:10]
                 seg_id = self._current_segment_id
-                tgt_lang = self.config.target_lang
+                tgt_lang = tgt_nllb or self.config.target_lang
+                eff_speaker = speaker_tag_s or spk_label
                 clean_orig = self._clean_verbatim(
                     self.glossary.apply_asr_fixes(orig),
                     src_nllb,
@@ -2470,7 +2483,7 @@ class EngineRuntime:
                             "source_lang": src_nllb,
                             "target_lang": tgt_lang,
                             "asr_ms": round(lat_ms, 1),
-                            "speaker": speaker_tag_s,
+                            "speaker": eff_speaker,
                         },
                     }
                 )
@@ -2522,14 +2535,22 @@ class EngineRuntime:
                         }
                     self._draft_wakeup.set()
 
-            def _on_soniox_final(orig: str, trans: str, src_nllb: str, lat_ms: float) -> None:
+            def _on_soniox_final(
+                orig: str,
+                trans: str,
+                src_nllb: str,
+                tgt_nllb: str,
+                spk_label: str,
+                lat_ms: float,
+            ) -> None:
                 self._commit_soniox_final(
                     orig,
                     trans,
                     src_nllb,
                     lat_ms,
                     model=soniox_model,
-                    speaker=speaker_tag_s,
+                    speaker=speaker_tag_s or spk_label,
+                    target_lang=tgt_nllb or self.config.target_lang,
                 )
 
             def _on_soniox_usage(secs: int) -> None:
@@ -2552,6 +2573,7 @@ class EngineRuntime:
                 source_lang=self.config.source_lang,
                 target_lang=self.config.target_lang,
                 model=soniox_model,
+                translation_type="two_way" if self.config.soniox_two_way else "one_way",
                 context=self._build_soniox_session_context(),
                 sample_rate=SAMPLE_RATE,
                 ws_url=self._soniox_ws_url or SONIOX_WS_URL,
@@ -3157,6 +3179,10 @@ class EngineRuntime:
             self.config.pass2_refine = req.pass2_refine
         if req.eco_mode is not None:
             self.config.eco_mode = req.eco_mode
+        if req.soniox_two_way is not None and bool(req.soniox_two_way) != self.config.soniox_two_way:
+            self.config.soniox_two_way = bool(req.soniox_two_way)
+            if self._active_asr_label == "soniox-cloud":
+                need_restart = True
         if req.beam_size is not None:
             self.config.beam_size = max(1, min(3, req.beam_size))
         if req.llm_url is not None:
@@ -5211,6 +5237,37 @@ def api_logs_status():
 @app.post("/api/logs/open")
 def api_logs_open():
     return {"ok": runtime.logger.open_logs_folder(), **runtime.logger.get_status()}
+
+
+@app.get("/api/logs/sessions")
+def api_logs_sessions(limit: int = 80):
+    return {
+        "ok": True,
+        "logs_dir": str(runtime.logger.logs_dir),
+        "sessions": runtime.logger.list_sessions(limit=limit),
+    }
+
+
+@app.get("/api/logs/sessions/{filename}")
+def api_logs_session_read(filename: str):
+    try:
+        return runtime.logger.read_session(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/api/logs/sessions/{filename}")
+def api_logs_session_delete(filename: str):
+    try:
+        return runtime.logger.delete_session(filename, is_listening=runtime._listening)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/audience", response_class=HTMLResponse)

@@ -7,6 +7,7 @@ import {
   ArrowUpCircle,
   AudioLines,
   BookOpen,
+  BookOpenText,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -26,6 +27,7 @@ import {
   Headphones,
   Languages,
   Layers,
+  LayoutList,
   Loader2,
   LogOut,
   Mic,
@@ -85,12 +87,15 @@ import {
   MtModeId,
   ParagraphModeId,
   PartialEvent,
+  SessionLogDetail,
+  SessionLogSummary,
   SlideContextPayload,
   SourceLanguageEntry,
   THEME_STORAGE_KEY,
   ThemeMode,
   TranscriptEntry,
   applyTheme,
+  formatSpeakerLabel,
   getInitialTheme,
   groupEntriesByParagraph,
   isTauriEnv,
@@ -360,6 +365,23 @@ export default function App() {
   const [quickText, setQuickText] = useState("");
   const [quickBusy, setQuickBusy] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [sonioxTwoWay, setSonioxTwoWay] = useState(false);
+  const [historyViewMode, setHistoryViewMode] = useState<"cards" | "full-text">("cards");
+
+  // Session History Library Modal (browse past saved conference logs in-app)
+  const [sessionLibOpen, setSessionLibOpen] = useState(false);
+  const [sessionLibLoading, setSessionLibLoading] = useState(false);
+  const [sessionLibItems, setSessionLibItems] = useState<SessionLogSummary[]>([]);
+  const [sessionLibQuery, setSessionLibQuery] = useState("");
+  const [sessionLibSelected, setSessionLibSelected] = useState("");
+  const [sessionLibDetail, setSessionLibDetail] = useState<SessionLogDetail | null>(null);
+  const [sessionLibDetailBusy, setSessionLibDetailBusy] = useState(false);
+  const [sessionLibDeleting, setSessionLibDeleting] = useState(false);
+
+  const histFtSrcRef = useRef<HTMLDivElement | null>(null);
+  const histFtTgtRef = useRef<HTMLDivElement | null>(null);
+  const histFtSrcPinnedRef = useRef(true);
+  const histFtTgtPinnedRef = useRef(true);
 
   const ttsRef = useRef(ttsEnabled);
   ttsRef.current = ttsEnabled;
@@ -406,6 +428,7 @@ export default function App() {
     if (h.config?.paragraph_mode) setParagraphMode(h.config.paragraph_mode);
     if (typeof h.config?.pass2_refine === "boolean") setPass2Refine(h.config.pass2_refine);
     if (typeof h.config?.eco_mode === "boolean") setEcoMode(h.config.eco_mode);
+    if (typeof h.config?.soniox_two_way === "boolean") setSonioxTwoWay(h.config.soniox_two_way);
     if (typeof h.config?.translate_partials === "boolean") {
       setTranslatePartials(h.config.translate_partials);
     }
@@ -740,6 +763,7 @@ export default function App() {
           translate_partials: translatePartials,
           pass2_refine: pass2Refine,
           eco_mode: ecoMode,
+          soniox_two_way: sonioxTwoWay,
           beam_size: beamSize,
           llm_url: llmUrl,
           llm_model: llmModel,
@@ -767,6 +791,7 @@ export default function App() {
     translatePartials,
     pass2Refine,
     ecoMode,
+    sonioxTwoWay,
     beamSize,
     llmUrl,
     llmModel,
@@ -1882,6 +1907,84 @@ export default function App() {
     }
   };
 
+  const handleSelectSessionLog = useCallback(async (filename: string) => {
+    setSessionLibSelected(filename);
+    setSessionLibDetailBusy(true);
+    try {
+      const res = await fetch(`${ENGINE_HTTP}/api/logs/sessions/${encodeURIComponent(filename)}`);
+      if (res.ok) {
+        const detail: SessionLogDetail = await res.json();
+        setSessionLibDetail(detail);
+      } else {
+        setSessionLibDetail(null);
+      }
+    } catch {
+      setSessionLibDetail(null);
+    } finally {
+      setSessionLibDetailBusy(false);
+    }
+  }, []);
+
+  const handleOpenSessionLibrary = useCallback(async () => {
+    setSessionLibOpen(true);
+    setSessionLibLoading(true);
+    try {
+      const res = await fetch(`${ENGINE_HTTP}/api/logs/sessions?limit=80`);
+      if (res.ok) {
+        const data = await res.json();
+        const items: SessionLogSummary[] = data.sessions || [];
+        setSessionLibItems(items);
+        if (items.length > 0) {
+          void handleSelectSessionLog(items[0].filename);
+        } else {
+          setSessionLibSelected("");
+          setSessionLibDetail(null);
+        }
+      }
+    } catch (e) {
+      setErrorMsg(`Không thể tải thư viện biên bản: ${String(e)}`);
+    } finally {
+      setSessionLibLoading(false);
+    }
+  }, [handleSelectSessionLog]);
+
+  const handleDeleteSessionLog = async (filename: string) => {
+    if (!filename) return;
+    setSessionLibDeleting(true);
+    try {
+      const res = await fetch(`${ENGINE_HTTP}/api/logs/sessions/${encodeURIComponent(filename)}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: "Không thể xóa biên bản" }));
+        setErrorMsg(err.detail || "Không thể xóa biên bản");
+        return;
+      }
+      const next = sessionLibItems.filter((x) => x.filename !== filename);
+      setSessionLibItems(next);
+      if (next.length > 0) {
+        void handleSelectSessionLog(next[0].filename);
+      } else {
+        setSessionLibSelected("");
+        setSessionLibDetail(null);
+      }
+    } catch (e) {
+      setErrorMsg(`Lỗi xóa biên bản: ${String(e)}`);
+    } finally {
+      setSessionLibDeleting(false);
+    }
+  };
+
+  const handleDownloadSessionFile = (filename: string, content: string) => {
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const checkForAppUpdate = useCallback(async (silent = true) => {
     if (!silent) {
       setUpdateChecking(true);
@@ -2493,6 +2596,57 @@ export default function App() {
     () => groupEntriesByParagraph([...history].reverse()).reverse(),
     [history]
   );
+
+  // Chronological Continuous Full-Text blocks for Main History "Toàn văn" mode
+  const mainFullTextBlocks = useMemo(() => {
+    const chrono = [...history].reverse();
+    const blocks: Array<{
+      id: string;
+      speaker: string;
+      source_lang: string;
+      target_lang: string;
+      source_text: string;
+      translated_text: string;
+    }> = [];
+    for (const item of chrono) {
+      const spk = (item.speaker || "").trim();
+      const prev = blocks[blocks.length - 1];
+      if (
+        prev &&
+        prev.speaker === spk &&
+        prev.source_lang === item.source_lang &&
+        prev.target_lang === item.target_lang
+      ) {
+        if (item.source_text) prev.source_text = `${prev.source_text} ${item.source_text}`.replace(/\s{2,}/g, " ").trim();
+        if (item.translated_text) {
+          prev.translated_text = `${prev.translated_text} ${item.translated_text}`.replace(/\s{2,}/g, " ").trim();
+        }
+      } else {
+        blocks.push({
+          id: item.id,
+          speaker: spk,
+          source_lang: item.source_lang,
+          target_lang: item.target_lang,
+          source_text: (item.source_text || "").trim(),
+          translated_text: (item.translated_text || "").trim(),
+        });
+      }
+    }
+    return blocks;
+  }, [history]);
+
+  // Independent Smart Scroll for Main History Full-Text panes
+  useEffect(() => {
+    if (historyViewMode !== "full-text") return;
+    requestAnimationFrame(() => {
+      if (histFtSrcRef.current && histFtSrcPinnedRef.current) {
+        histFtSrcRef.current.scrollTop = histFtSrcRef.current.scrollHeight;
+      }
+      if (histFtTgtRef.current && histFtTgtPinnedRef.current) {
+        histFtTgtRef.current.scrollTop = histFtTgtRef.current.scrollHeight;
+      }
+    });
+  }, [mainFullTextBlocks, historyViewMode]);
 
   const latestItem = history[0] || null;
   const prevHistoryItem = history[1] || null;
@@ -3689,6 +3843,34 @@ export default function App() {
                         : "Nháp chạy Offline (0 tốn quota) • Hết hạn mức tự về Offline"
                       : "Bấm nút Cài đặt bên trên để dán API Key"}
                   </div>
+                  {isSoniox &&
+                    activeP?.has_key &&
+                    sourceLang !== "auto" &&
+                    sourceLang !== targetLang &&
+                    !["lao_Laoo", "khm_Khmr", "mya_Mymr"].includes(sourceLang) &&
+                    !["lao_Laoo", "khm_Khmr", "mya_Mymr"].includes(targetLang) && (
+                      <label
+                        className="toggle-row"
+                        style={{ marginTop: 4, paddingTop: 6, borderTop: "1px solid var(--border-subtle)" }}
+                        title="Chỉ cần 1 Micro hoặc Mixer hội trường: diễn giả nói chiều nào Soniox tự dịch chiều ngược lại"
+                      >
+                        <span style={{ fontSize: 11, fontWeight: 600 }}>
+                          Dịch 2 chiều tự động ({shortLangName(sourceLang)} ⇄ {shortLangName(targetLang)})
+                        </span>
+                        <span className="switch">
+                          <input
+                            type="checkbox"
+                            checked={sonioxTwoWay}
+                            onChange={(e) => {
+                              const next = e.target.checked;
+                              setSonioxTwoWay(next);
+                              hotUpdateConfig({ soniox_two_way: next });
+                            }}
+                          />
+                          <span className="switch-track" />
+                        </span>
+                      </label>
+                    )}
                 </div>
               );
             })() : (
@@ -4417,11 +4599,29 @@ export default function App() {
                 )}
               </div>
               <div className="history-head-actions">
+                <div className="history-view-seg" role="group" aria-label="Chế độ xem lịch sử">
+                  <button
+                    type="button"
+                    className={`history-view-btn ${historyViewMode === "cards" ? "active" : ""}`}
+                    onClick={() => setHistoryViewMode("cards")}
+                    title="Xem lịch sử dạng từng thẻ có nút sửa & đánh giá"
+                  >
+                    <LayoutList size={11.5} /> Thẻ
+                  </button>
+                  <button
+                    type="button"
+                    className={`history-view-btn ${historyViewMode === "full-text" ? "active" : ""}`}
+                    onClick={() => setHistoryViewMode("full-text")}
+                    title="Xem toàn văn bản song ngữ nối liền mạch (không thẻ, không timestamp)"
+                  >
+                    <BookOpenText size={11.5} /> Toàn văn
+                  </button>
+                </div>
                 <button
                   className="btn sm eval-trigger-btn"
                   onClick={handleEvaluateSession}
                   disabled={!connected || history.length === 0 || evalBusy}
-                  title="Dùng Google Gemini API đánh giá độ chính xác ngữ nghĩa toàn phiên dịch & gợi ý bản sửa"
+                  title="Dùng Google API đánh giá độ chính xác ngữ nghĩa toàn phiên dịch & gợi ý bản sửa"
                 >
                   {evalBusy ? <Loader2 size={12} className="spin" /> : <ShieldCheck size={12} />} Đánh giá
                 </button>
@@ -4435,11 +4635,11 @@ export default function App() {
                 </button>
                 <button
                   className="btn sm"
-                  onClick={handleOpenLogsFolder}
+                  onClick={() => void handleOpenSessionLibrary()}
                   disabled={!connected}
-                  title={`Mở thư mục biên bản tự động lưu (${status?.logs?.logs_dir || "~/Documents/VOICERECORE_Logs"})`}
+                  title="Mở Thư viện Phiên Họp để xem lại, tìm kiếm & tải các biên bản cũ"
                 >
-                  <FolderOpen size={12} /> Biên bản
+                  <FolderOpen size={12} /> Thư viện
                 </button>
                 <button
                   className="btn sm"
@@ -4478,6 +4678,76 @@ export default function App() {
               </div>
             </div>
 
+            {historyViewMode === "full-text" ? (
+              <div className="history-fulltext-grid">
+                <div
+                  className="history-fulltext-col src"
+                  ref={histFtSrcRef}
+                  onScroll={(e) => {
+                    const el = e.currentTarget;
+                    histFtSrcPinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+                  }}
+                >
+                  {mainFullTextBlocks.length === 0 ? (
+                    <div style={{ color: "var(--text-2)", fontSize: 13 }}>
+                      Chưa có câu dịch nào. Văn bản gốc sẽ trôi liền mạch tại cột này.
+                    </div>
+                  ) : (
+                    mainFullTextBlocks.map((blk) => {
+                      const spk = formatSpeakerLabel(blk.speaker);
+                      return (
+                        <div className="history-fulltext-para" key={`mft-src-${blk.id}`}>
+                          {spk && (
+                            <span
+                              className={`spk-badge ${
+                                blk.speaker === "self" ? "self" : blk.speaker === "remote" ? "remote" : "diar"
+                              }`}
+                              style={{ marginRight: 6 }}
+                            >
+                              {spk}
+                            </span>
+                          )}
+                          <span>{blk.source_text}</span>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+                <div
+                  className="history-fulltext-col tgt"
+                  ref={histFtTgtRef}
+                  onScroll={(e) => {
+                    const el = e.currentTarget;
+                    histFtTgtPinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+                  }}
+                >
+                  {mainFullTextBlocks.length === 0 ? (
+                    <div style={{ color: "var(--text-2)", fontSize: 13 }}>
+                      Bản dịch nối liền thành đoạn văn hoàn chỉnh sẽ hiển thị tại cột này.
+                    </div>
+                  ) : (
+                    mainFullTextBlocks.map((blk) => {
+                      const spk = formatSpeakerLabel(blk.speaker);
+                      return (
+                        <div className="history-fulltext-para" key={`mft-tgt-${blk.id}`}>
+                          {spk && (
+                            <span
+                              className={`spk-badge ${
+                                blk.speaker === "self" ? "self" : blk.speaker === "remote" ? "remote" : "diar"
+                              }`}
+                              style={{ marginRight: 6 }}
+                            >
+                              {spk}
+                            </span>
+                          )}
+                          <span>{blk.translated_text || "—"}</span>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            ) : (
             <div className="history-list">
               {groupedHistory.length === 0 ? (
                 <div className="history-item" style={{ color: "var(--text-2)", fontSize: 13, display: "block", lineHeight: 1.5 }}>
@@ -4519,8 +4789,15 @@ export default function App() {
                     >
                       <div className="history-meta">
                         <span className="row" style={{ gap: 6, minWidth: 0 }} title={techTooltip}>
-                          {item.speaker === "self" && <span className="spk-badge self">Bạn</span>}
-                          {item.speaker === "remote" && <span className="spk-badge remote">Đối tác</span>}
+                          {formatSpeakerLabel(item.speaker) && (
+                            <span
+                              className={`spk-badge ${
+                                item.speaker === "self" ? "self" : item.speaker === "remote" ? "remote" : "diar"
+                              }`}
+                            >
+                              {formatSpeakerLabel(item.speaker)}
+                            </span>
+                          )}
                           <span>
                             {item.timestamp}
                             {(item.sentence_count ?? 1) > 1 ? ` • ${item.sentence_count} câu` : ""} • {srcShort} →{" "}
@@ -4677,6 +4954,7 @@ export default function App() {
                 })
               )}
             </div>
+            )}
           </section>
         </main>
       </div>
@@ -5616,6 +5894,168 @@ export default function App() {
           </div>
         </div>
       )}
+      {/* Session History Library Modal (Browse & Copy Past Saved Conference Transcripts) */}
+      {sessionLibOpen && (
+        <div className="modal-backdrop" onClick={() => setSessionLibOpen(false)}>
+          <div className="modal-card" style={{ width: "min(960px, 100%)" }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <div className="row" style={{ gap: 8 }}>
+                <FolderOpen size={17} color="var(--accent)" />
+                <div>
+                  <div className="modal-title">Thư Viện Phiên Họp Đã Lưu ({sessionLibItems.length} biên bản)</div>
+                  <div className="modal-sub">
+                    Xem lại, tìm kiếm, sao chép hoặc tải lại file .TXT / .SRT của các buổi hội nghị trước
+                  </div>
+                </div>
+              </div>
+              <div className="row" style={{ gap: 6 }}>
+                <button
+                  className="btn sm"
+                  onClick={handleOpenLogsFolder}
+                  title="Mở thư mục gốc chứa biên bản trên máy"
+                >
+                  <FolderOpen size={12} /> Mở thư mục
+                </button>
+                <button className="btn sm icon-only" onClick={() => setSessionLibOpen(false)} title="Đóng">
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+
+            <div className="session-lib-body">
+              <div className="session-lib-sidebar">
+                <div style={{ position: "relative" }}>
+                  <Search
+                    size={12.5}
+                    style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--text-2)" }}
+                  />
+                  <input
+                    className="input"
+                    style={{ paddingLeft: 27 }}
+                    placeholder="Tìm ngày hoặc nội dung..."
+                    value={sessionLibQuery}
+                    onChange={(e) => setSessionLibQuery(e.target.value)}
+                  />
+                </div>
+                <div className="session-lib-list">
+                  {sessionLibLoading ? (
+                    <div style={{ padding: 16, textAlign: "center", color: "var(--text-2)", fontSize: 12 }}>
+                      <Loader2 size={15} className="spin" /> Đang tải danh sách...
+                    </div>
+                  ) : sessionLibItems.length === 0 ? (
+                    <div style={{ padding: 16, textAlign: "center", color: "var(--text-2)", fontSize: 12 }}>
+                      Chưa có biên bản hội nghị nào được lưu.
+                    </div>
+                  ) : (
+                    sessionLibItems
+                      .filter((it) => {
+                        const q = sessionLibQuery.trim().toLowerCase();
+                        if (!q) return true;
+                        return (
+                          it.filename.toLowerCase().includes(q) ||
+                          it.modified_str.toLowerCase().includes(q) ||
+                          it.preview.toLowerCase().includes(q) ||
+                          it.direction.toLowerCase().includes(q)
+                        );
+                      })
+                      .map((it) => (
+                        <button
+                          key={it.filename}
+                          className={`session-lib-item ${sessionLibSelected === it.filename ? "active" : ""}`}
+                          onClick={() => void handleSelectSessionLog(it.filename)}
+                        >
+                          <div className="session-lib-name">
+                            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {it.modified_str}
+                            </span>
+                            {it.is_active && (
+                              <span style={{ color: "var(--green-text)", fontSize: 10 }}>● Đang ghi</span>
+                            )}
+                          </div>
+                          <div className="session-lib-meta">
+                            <span>{it.direction || it.filename}</span>
+                            <span>{(it.size_bytes / 1024).toFixed(1)} KB</span>
+                          </div>
+                          <div className="session-lib-preview">{it.preview}</div>
+                        </button>
+                      ))
+                  )}
+                </div>
+              </div>
+
+              <div className="session-lib-viewer">
+                {sessionLibDetailBusy ? (
+                  <div style={{ padding: 28, textAlign: "center", color: "var(--text-2)", fontSize: 12.5 }}>
+                    <Loader2 size={16} className="spin" /> Đang đọc biên bản...
+                  </div>
+                ) : sessionLibDetail ? (
+                  <>
+                    <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 6 }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text-0)" }}>
+                          {sessionLibDetail.filename}
+                        </div>
+                        <div style={{ fontSize: 11, color: "var(--text-2)" }}>
+                          Lưu lúc {sessionLibDetail.modified_str} • {(sessionLibDetail.size_bytes / 1024).toFixed(1)} KB
+                        </div>
+                      </div>
+                      <div className="row" style={{ gap: 6 }}>
+                        <button
+                          className="btn sm"
+                          onClick={() => handleCopy(`lib-${sessionLibDetail.filename}`, sessionLibDetail.content)}
+                        >
+                          {copiedId === `lib-${sessionLibDetail.filename}` ? (
+                            <>
+                              <Check size={12} /> Đã chép
+                            </>
+                          ) : (
+                            <>
+                              <Copy size={12} /> Sao chép
+                            </>
+                          )}
+                        </button>
+                        <button
+                          className="btn sm"
+                          onClick={() => handleDownloadSessionFile(sessionLibDetail.filename, sessionLibDetail.content)}
+                        >
+                          <Download size={12} /> .TXT
+                        </button>
+                        {sessionLibDetail.srt_content && (
+                          <button
+                            className="btn sm"
+                            onClick={() =>
+                              handleDownloadSessionFile(
+                                sessionLibDetail.srt_filename || sessionLibDetail.filename.replace(/\.txt$/i, ".srt"),
+                                sessionLibDetail.srt_content
+                              )
+                            }
+                          >
+                            <Download size={12} /> .SRT
+                          </button>
+                        )}
+                        <button
+                          className="btn sm"
+                          disabled={sessionLibDeleting || (sessionLibDetail.is_active && Boolean(status?.listening))}
+                          onClick={() => void handleDeleteSessionLog(sessionLibDetail.filename)}
+                          title="Xóa biên bản này khỏi máy"
+                        >
+                          <Trash2 size={12} /> Xóa
+                        </button>
+                      </div>
+                    </div>
+                    <div className="session-lib-content">{sessionLibDetail.content}</div>
+                  </>
+                ) : (
+                  <div style={{ padding: 28, textAlign: "center", color: "var(--text-2)", fontSize: 12.5 }}>
+                    Chọn một phiên họp bên trái để xem toàn bộ nội dung biên bản.
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Official Cloud Translation API Modal (Google Cloud / Microsoft Azure F0 / Google Gemini) */}
       {cloudOpen && (
         <div className="modal-backdrop" onClick={() => setCloudOpen(false)}>
