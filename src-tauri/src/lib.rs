@@ -12,8 +12,31 @@ const ENGINE_PORT: u16 = 18765;
 
 struct EngineProcess(Mutex<Option<Child>>);
 struct SavedOverlayBounds(Mutex<Option<(tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>)>>);
+struct OverlayDockMode(AtomicBool);
+struct OverlayClickThrough(AtomicBool);
 struct AllowAppExit(AtomicBool);
 struct FrontendReady(AtomicBool);
+
+#[derive(Clone, serde::Serialize)]
+struct MonitorInfo {
+    index: usize,
+    name: String,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    scale_factor: f64,
+    is_primary: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct OverlayDockPayload {
+    docked: bool,
+    monitor_index: usize,
+    monitor_name: String,
+    anchor: String,
+    click_through: bool,
+}
 
 fn engine_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], ENGINE_PORT))
@@ -444,7 +467,11 @@ async fn confirm_exit_app(app: tauri::AppHandle) -> Result<(), String> {
 fn hide_overlay(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("overlay") {
         let _ = win.set_ignore_cursor_events(false);
+        if let Some(ct) = app.try_state::<OverlayClickThrough>() {
+            ct.0.store(false, Ordering::SeqCst);
+        }
         let _ = win.hide();
+        let _ = app.emit("overlay-clickthrough-changed", false);
         let _ = app.emit("overlay-visibility", false);
     }
     Ok(())
@@ -458,7 +485,11 @@ fn toggle_overlay(app: tauri::AppHandle) -> Result<bool, String> {
     let visible = win.is_visible().map_err(|e| e.to_string())?;
     if visible {
         let _ = win.set_ignore_cursor_events(false);
+        if let Some(ct) = app.try_state::<OverlayClickThrough>() {
+            ct.0.store(false, Ordering::SeqCst);
+        }
         win.hide().map_err(|e| e.to_string())?;
+        let _ = app.emit("overlay-clickthrough-changed", false);
         let _ = app.emit("overlay-visibility", false);
         Ok(false)
     } else {
@@ -474,7 +505,210 @@ fn set_overlay_clickthrough(app: tauri::AppHandle, ignore: bool) -> Result<(), S
         .get_webview_window("overlay")
         .ok_or_else(|| ERR_OVERLAY_NOT_FOUND.to_string())?;
     win.set_ignore_cursor_events(ignore)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if let Some(ct) = app.try_state::<OverlayClickThrough>() {
+        ct.0.store(ignore, Ordering::SeqCst);
+    }
+    let _ = app.emit("overlay-clickthrough-changed", ignore);
+    Ok(())
+}
+
+#[tauri::command]
+fn list_monitors(app: tauri::AppHandle) -> Result<Vec<MonitorInfo>, String> {
+    let ref_win = app
+        .get_webview_window("main")
+        .or_else(|| app.get_webview_window("overlay"))
+        .ok_or_else(|| "Không tìm thấy cửa sổ ứng dụng".to_string())?;
+    let monitors = ref_win.available_monitors().map_err(|e| e.to_string())?;
+    let primary = ref_win.primary_monitor().ok().flatten();
+    let prim_key = primary.as_ref().map(|m| (*m.position(), *m.size()));
+
+    let mut out = Vec::with_capacity(monitors.len());
+    for (idx, m) in monitors.iter().enumerate() {
+        let pos = *m.position();
+        let size = *m.size();
+        let is_primary = match prim_key {
+            Some((pp, ps)) => pp == pos && ps == size,
+            None => idx == 0,
+        };
+        let raw_name = m
+            .name()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("Màn hình {}", idx + 1));
+        out.push(MonitorInfo {
+            index: idx,
+            name: raw_name,
+            width: size.width,
+            height: size.height,
+            x: pos.x,
+            y: pos.y,
+            scale_factor: m.scale_factor(),
+            is_primary,
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn dock_overlay_subtitle_bar(
+    app: tauri::AppHandle,
+    saved: tauri::State<'_, SavedOverlayBounds>,
+    dock_state: tauri::State<'_, OverlayDockMode>,
+    ct_state: tauri::State<'_, OverlayClickThrough>,
+    monitor_index: Option<usize>,
+    anchor: Option<String>,
+    height_px: Option<u32>,
+    click_through: Option<bool>,
+) -> Result<OverlayDockPayload, String> {
+    let win = app
+        .get_webview_window("overlay")
+        .ok_or_else(|| ERR_OVERLAY_NOT_FOUND.to_string())?;
+
+    let monitors = win.available_monitors().map_err(|e| e.to_string())?;
+    if monitors.is_empty() {
+        return Err("Không tìm thấy màn hình hiển thị nào".to_string());
+    }
+    let primary = win.primary_monitor().ok().flatten();
+    let prim_key = primary.as_ref().map(|m| (*m.position(), *m.size()));
+
+    let chosen_idx = match monitor_index {
+        Some(idx) if idx < monitors.len() => idx,
+        _ => {
+            // Auto-prefer Monitor #2 (external projector / LED screen) if available
+            monitors
+                .iter()
+                .enumerate()
+                .find(|(idx, m)| match prim_key {
+                    Some((pp, ps)) => !(*m.position() == pp && *m.size() == ps),
+                    None => *idx > 0,
+                })
+                .map(|(idx, _)| idx)
+                .unwrap_or(0)
+        }
+    };
+
+    let mon = &monitors[chosen_idx];
+    let mon_name = mon
+        .name()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("Màn hình {}", chosen_idx + 1));
+
+    // Preserve pre-dock LED bounds once so "Mở Màn LED lớn" restores cleanly
+    if !dock_state.0.load(Ordering::SeqCst) {
+        if let Ok(mut guard) = saved.0.lock() {
+            if guard.is_none() {
+                if let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) {
+                    *guard = Some((pos, size));
+                }
+            }
+        }
+    }
+
+    if matches!(win.is_maximized(), Ok(true)) {
+        let _ = win.unmaximize();
+    }
+
+    let area = mon.work_area();
+    let scale = mon.scale_factor().max(1.0);
+    let area_w_log = (area.size.width as f64) / scale;
+    let area_h_log = (area.size.height as f64) / scale;
+
+    let target_w_log = (area_w_log * 0.88)
+        .clamp(480.0, 1680.0)
+        .min((area_w_log - 24.0).max(420.0));
+    let target_h_log = (height_px.unwrap_or(172).clamp(112, 340) as f64)
+        .min((area_h_log * 0.42).max(112.0));
+
+    let phys_w = (target_w_log * scale).round().max(420.0) as u32;
+    let phys_h = (target_h_log * scale).round().max(108.0) as u32;
+    let x = area.position.x + ((area.size.width.saturating_sub(phys_w)) / 2) as i32;
+    let margin_y = (22.0 * scale).round() as i32;
+    let anchor_norm = match anchor.as_deref() {
+        Some("top") => "top".to_string(),
+        _ => "bottom".to_string(),
+    };
+    let y = if anchor_norm == "top" {
+        area.position.y + margin_y
+    } else {
+        area.position.y + area.size.height.saturating_sub(phys_h) as i32 - margin_y
+    };
+
+    let _ = win.set_shadow(false);
+    let _ = win.set_always_on_top(true);
+    let _ = win.set_visible_on_all_workspaces(true);
+    win.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(phys_w, phys_h)))
+        .map_err(|e| e.to_string())?;
+    win.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)))
+        .map_err(|e| e.to_string())?;
+
+    let ct = click_through.unwrap_or(false);
+    let _ = win.set_ignore_cursor_events(ct);
+    dock_state.0.store(true, Ordering::SeqCst);
+    ct_state.0.store(ct, Ordering::SeqCst);
+
+    win.show().map_err(|e| e.to_string())?;
+
+    let payload = OverlayDockPayload {
+        docked: true,
+        monitor_index: chosen_idx,
+        monitor_name: mon_name,
+        anchor: anchor_norm,
+        click_through: ct,
+    };
+    let _ = app.emit("overlay-visibility", true);
+    let _ = app.emit("overlay-clickthrough-changed", ct);
+    let _ = app.emit("overlay-dock-mode", payload.clone());
+    Ok(payload)
+}
+
+#[tauri::command]
+fn undock_overlay_subtitle_bar(
+    app: tauri::AppHandle,
+    saved: tauri::State<'_, SavedOverlayBounds>,
+    dock_state: tauri::State<'_, OverlayDockMode>,
+    ct_state: tauri::State<'_, OverlayClickThrough>,
+) -> Result<(), String> {
+    let win = app
+        .get_webview_window("overlay")
+        .ok_or_else(|| ERR_OVERLAY_NOT_FOUND.to_string())?;
+
+    dock_state.0.store(false, Ordering::SeqCst);
+    ct_state.0.store(false, Ordering::SeqCst);
+
+    let _ = win.set_ignore_cursor_events(false);
+    let _ = win.set_shadow(true);
+    let _ = win.set_visible_on_all_workspaces(false);
+
+    if let Ok(mut guard) = saved.0.lock() {
+        if let Some((pos, size)) = guard.take() {
+            let monitors = win.available_monitors().unwrap_or_default();
+            if monitors.is_empty() || bounds_visible_on_monitors(pos, size, &monitors) {
+                let _ = win.set_size(tauri::Size::Physical(size));
+                let _ = win.set_position(tauri::Position::Physical(pos));
+            } else {
+                let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize::new(1120.0, 620.0)));
+                let _ = win.center();
+            }
+        } else {
+            let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize::new(1120.0, 620.0)));
+            let _ = win.center();
+        }
+    }
+
+    let _ = win.show();
+    let payload = OverlayDockPayload {
+        docked: false,
+        monitor_index: 0,
+        monitor_name: String::new(),
+        anchor: "bottom".to_string(),
+        click_through: false,
+    };
+    let _ = app.emit("overlay-visibility", true);
+    let _ = app.emit("overlay-clickthrough-changed", false);
+    let _ = app.emit("overlay-dock-mode", payload);
+    Ok(())
 }
 
 #[tauri::command]
@@ -567,15 +801,33 @@ pub fn run() {
     let app = tauri::Builder::default()
         .manage(EngineProcess(Mutex::new(None)))
         .manage(SavedOverlayBounds(Mutex::new(None)))
+        .manage(OverlayDockMode(AtomicBool::new(false)))
+        .manage(OverlayClickThrough(AtomicBool::new(false)))
         .manage(AllowAppExit(AtomicBool::new(false)))
         .manage(FrontendReady(AtomicBool::new(false)))
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
+                .with_handler(|app, shortcut, event| {
                     if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                        let _ = app.emit("toggle-listening", ());
+                        if shortcut.key == tauri_plugin_global_shortcut::Code::KeyX {
+                            if let Some(win) = app.get_webview_window("overlay") {
+                                if matches!(win.is_visible(), Ok(true)) {
+                                    let next = app
+                                        .try_state::<OverlayClickThrough>()
+                                        .map(|s| !s.0.load(Ordering::SeqCst))
+                                        .unwrap_or(true);
+                                    let _ = win.set_ignore_cursor_events(next);
+                                    if let Some(s) = app.try_state::<OverlayClickThrough>() {
+                                        s.0.store(next, Ordering::SeqCst);
+                                    }
+                                    let _ = app.emit("overlay-clickthrough-changed", next);
+                                }
+                            }
+                        } else {
+                            let _ = app.emit("toggle-listening", ());
+                        }
                     }
                 })
                 .build(),
@@ -591,6 +843,7 @@ pub fn run() {
 
             use tauri_plugin_global_shortcut::GlobalShortcutExt;
             let _ = app.global_shortcut().register("CommandOrControl+Shift+Space");
+            let _ = app.global_shortcut().register("CommandOrControl+Shift+X");
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -598,7 +851,11 @@ pub fn run() {
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = window.set_ignore_cursor_events(false);
+                    if let Some(ct) = window.app_handle().try_state::<OverlayClickThrough>() {
+                        ct.0.store(false, Ordering::SeqCst);
+                    }
                     let _ = window.hide();
+                    let _ = window.app_handle().emit("overlay-clickthrough-changed", false);
                     let _ = window.app_handle().emit("overlay-visibility", false);
                 }
                 return;
@@ -642,7 +899,10 @@ pub fn run() {
             toggle_overlay,
             set_overlay_clickthrough,
             set_overlay_always_on_top,
-            toggle_overlay_fill_monitor
+            toggle_overlay_fill_monitor,
+            list_monitors,
+            dock_overlay_subtitle_bar,
+            undock_overlay_subtitle_bar
         ])
         .build(tauri::generate_context!())
         .expect("error while building VOICERECORE");

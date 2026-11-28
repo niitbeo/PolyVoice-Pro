@@ -2,9 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   AlignJustify,
+  ArrowDownToLine,
   ArrowLeftRight,
   ArrowRight,
   ArrowUpCircle,
+  ArrowUpToLine,
   AudioLines,
   BookOpen,
   BookOpenText,
@@ -33,10 +35,12 @@ import {
   LogOut,
   Mic,
   MicOff,
+  Monitor,
   MonitorSpeaker,
   Moon,
   MousePointerClick,
   Pencil,
+  PictureInPicture2,
   Play,
   Plus,
   Power,
@@ -86,7 +90,9 @@ import {
   MeetingSummary,
   ModelState,
   ModelsStatus,
+  MonitorInfo,
   MtModeId,
+  OverlayDockPayload,
   ParagraphModeId,
   PartialEvent,
   SessionLogDetail,
@@ -248,7 +254,13 @@ export default function App() {
   const [llmModel, setLlmModel] = useState("translategemma:4b");
   const [ttsEnabled, setTtsEnabled] = useState(false);
   const [overlayOpen, setOverlayOpen] = useState(false);
+  const [overlayDocked, setOverlayDocked] = useState(false);
+  const [dockMenuOpen, setDockMenuOpen] = useState(false);
+  const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
+  const [dockAnchor, setDockAnchor] = useState<"bottom" | "top">("bottom");
+  const [dockedMonitorIdx, setDockedMonitorIdx] = useState(0);
   const [clickThrough, setClickThrough] = useState(false);
+  const dockMenuRef = useRef<HTMLDivElement | null>(null);
   const [theme, setTheme] = useState<ThemeMode>(() => getInitialTheme());
   const [showAllLangs, setShowAllLangs] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -847,9 +859,16 @@ export default function App() {
     let cancelled = false;
     let unlistenToggle: (() => void) | undefined;
     let unlistenOverlay: (() => void) | undefined;
+    let unlistenDock: (() => void) | undefined;
+    let unlistenCt: (() => void) | undefined;
     let unlistenCloseReq: (() => void) | undefined;
     Promise.all([import("@tauri-apps/api/event"), import("@tauri-apps/api/core")])
       .then(([{ listen }, { invoke }]) => {
+        invoke<MonitorInfo[]>("list_monitors")
+          .then((list) => {
+            if (!cancelled && Array.isArray(list)) setMonitors(list);
+          })
+          .catch(() => {});
         listen("toggle-listening", () => {
           if (!connectedRef.current) return;
           toggleListeningRef.current();
@@ -867,6 +886,33 @@ export default function App() {
           .then((fn) => {
             if (cancelled) fn();
             else unlistenOverlay = fn;
+          })
+          .catch(() => {});
+        listen<OverlayDockPayload>("overlay-dock-mode", (ev) => {
+          const p = ev.payload;
+          if (!p) return;
+          setOverlayDocked(Boolean(p.docked));
+          if (p.anchor === "top" || p.anchor === "bottom") {
+            setDockAnchor(p.anchor);
+          }
+          if (typeof p.monitor_index === "number") {
+            setDockedMonitorIdx(p.monitor_index);
+          }
+          if (typeof p.click_through === "boolean") {
+            setClickThrough(p.click_through);
+          }
+        })
+          .then((fn) => {
+            if (cancelled) fn();
+            else unlistenDock = fn;
+          })
+          .catch(() => {});
+        listen<boolean>("overlay-clickthrough-changed", (ev) => {
+          setClickThrough(Boolean(ev.payload));
+        })
+          .then((fn) => {
+            if (cancelled) fn();
+            else unlistenCt = fn;
           })
           .catch(() => {});
         listen("app-close-requested", () => {
@@ -891,15 +937,30 @@ export default function App() {
       cancelled = true;
       unlistenToggle?.();
       unlistenOverlay?.();
+      unlistenDock?.();
+      unlistenCt?.();
       unlistenCloseReq?.();
     };
   }, []);
+
+  // Close the Dưới Slide / Video dropdown when clicking outside
+  useEffect(() => {
+    if (!dockMenuOpen) return;
+    const onMouseDown = (e: MouseEvent) => {
+      if (dockMenuRef.current && !dockMenuRef.current.contains(e.target as Node)) {
+        setDockMenuOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", onMouseDown);
+    return () => window.removeEventListener("mousedown", onMouseDown);
+  }, [dockMenuOpen]);
 
   // Keyboard shortcuts: Escape closes open modals (when not busy) + browser Cmd/Ctrl+Shift+Space fallback
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        if (exitConfirmOpen && !exitBusy) setExitConfirmOpen(false);
+        if (dockMenuOpen) setDockMenuOpen(false);
+        else if (exitConfirmOpen && !exitBusy) setExitConfirmOpen(false);
         else if (slideModalOpen) setSlideModalOpen(false);
         else if (glossaryOpen) setGlossaryOpen(false);
         else if (qrOpen) setQrOpen(false);
@@ -924,6 +985,7 @@ export default function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
+    dockMenuOpen,
     exitConfirmOpen,
     exitBusy,
     slideModalOpen,
@@ -1144,9 +1206,173 @@ export default function App() {
     }
   };
 
-  const handleToggleOverlay = async () => {
+  const refreshMonitors = useCallback(async (): Promise<MonitorInfo[]> => {
+    if (!isTauriEnv()) return [];
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const list = await invoke<MonitorInfo[]>("list_monitors");
+      if (Array.isArray(list)) {
+        setMonitors(list);
+        return list;
+      }
+    } catch {
+      // ignore
+    }
+    return [];
+  }, []);
+
+  const handleUndockToLed = async () => {
+    setDockMenuOpen(false);
     if (isTauriEnv()) {
       try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("undock_overlay_subtitle_bar");
+        setOverlayOpen(true);
+        setOverlayDocked(false);
+        setClickThrough(false);
+      } catch (e) {
+        setErrorMsg(`Không thể mở rộng sang Màn LED: ${String(e)}`);
+      }
+      return;
+    }
+    const existing = overlayPopupRef.current;
+    if (existing && !existing.closed) {
+      existing.close();
+      overlayPopupRef.current = null;
+    }
+    const win = window.open(
+      `${window.location.origin}/#overlay`,
+      "voicerecore-overlay",
+      "width=1120,height=620,menubar=no,toolbar=no,location=no,status=no"
+    );
+    if (!win) {
+      setErrorMsg("Trình duyệt đã chặn cửa sổ bật lên (popup). Hãy cho phép popup để mở Màn LED.");
+      setOverlayOpen(false);
+      setOverlayDocked(false);
+      return;
+    }
+    overlayPopupRef.current = win;
+    setOverlayOpen(true);
+    setOverlayDocked(false);
+    try {
+      win.addEventListener("beforeunload", () => {
+        overlayPopupRef.current = null;
+        setOverlayOpen(false);
+        setOverlayDocked(false);
+      });
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleHideOverlay = async () => {
+    setDockMenuOpen(false);
+    if (isTauriEnv()) {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("hide_overlay");
+        setOverlayOpen(false);
+        setClickThrough(false);
+      } catch (e) {
+        setErrorMsg(`Không thể đóng phụ đề nổi: ${String(e)}`);
+      }
+      return;
+    }
+    const existing = overlayPopupRef.current;
+    if (existing && !existing.closed) {
+      existing.close();
+    }
+    overlayPopupRef.current = null;
+    setOverlayOpen(false);
+    setOverlayDocked(false);
+  };
+
+  const handleDockSubtitleBar = async (opts?: {
+    monitorIndex?: number | null;
+    anchor?: "bottom" | "top";
+    clickThrough?: boolean;
+  }) => {
+    setDockMenuOpen(false);
+    const chosenAnchor = opts?.anchor ?? dockAnchor;
+    if (isTauriEnv()) {
+      try {
+        const list = monitors.length > 0 ? monitors : await refreshMonitors();
+        let targetMon: MonitorInfo | undefined;
+        if (typeof opts?.monitorIndex === "number") {
+          targetMon = list.find((m) => m.index === opts.monitorIndex);
+        } else {
+          targetMon = list.find((m) => !m.is_primary) || list[0];
+        }
+        // Smart default: auto-enable Click-Through when docking beneath Slides on Monitor #2,
+        // keep draggable (clickThrough = false) on Monitor #1 so user can place over Video freely.
+        const autoCt =
+          typeof opts?.clickThrough === "boolean"
+            ? opts.clickThrough
+            : Boolean(targetMon && !targetMon.is_primary);
+        const { invoke } = await import("@tauri-apps/api/core");
+        const payload = await invoke<OverlayDockPayload>("dock_overlay_subtitle_bar", {
+          monitorIndex: opts?.monitorIndex ?? null,
+          anchor: chosenAnchor,
+          heightPx: 176,
+          clickThrough: autoCt,
+        });
+        setOverlayOpen(true);
+        setOverlayDocked(true);
+        setDockAnchor(payload.anchor === "top" ? "top" : "bottom");
+        setDockedMonitorIdx(payload.monitor_index);
+        setClickThrough(payload.click_through);
+      } catch (e) {
+        setErrorMsg(`Không thể ghim thanh phụ đề Dưới Slide / Video: ${String(e)}`);
+      }
+      return;
+    }
+    const existing = overlayPopupRef.current;
+    if (existing && !existing.closed) {
+      existing.close();
+      overlayPopupRef.current = null;
+    }
+    const win = window.open(
+      `${window.location.origin}/#overlay?bar=1`,
+      "voicerecore-overlay",
+      "width=1040,height=188,menubar=no,toolbar=no,location=no,status=no"
+    );
+    if (!win) {
+      setErrorMsg("Trình duyệt đã chặn cửa sổ bật lên (popup). Hãy cho phép popup để mở thanh phụ đề nổi.");
+      setOverlayOpen(false);
+      setOverlayDocked(false);
+      return;
+    }
+    overlayPopupRef.current = win;
+    setOverlayOpen(true);
+    setOverlayDocked(true);
+    setDockAnchor(chosenAnchor);
+    try {
+      win.addEventListener("beforeunload", () => {
+        overlayPopupRef.current = null;
+        setOverlayOpen(false);
+        setOverlayDocked(false);
+      });
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleQuickToggleSlideBar = () => {
+    if (overlayOpen && overlayDocked) {
+      void handleHideOverlay();
+    } else {
+      void handleDockSubtitleBar();
+    }
+  };
+
+  const handleToggleOverlay = async () => {
+    setDockMenuOpen(false);
+    if (isTauriEnv()) {
+      try {
+        if (overlayDocked) {
+          await handleUndockToLed();
+          return;
+        }
         const { invoke } = await import("@tauri-apps/api/core");
         const visible = await invoke<boolean>("toggle_overlay");
         setOverlayOpen(visible);
@@ -1159,32 +1385,13 @@ export default function App() {
       }
     } else {
       const existing = overlayPopupRef.current;
-      if (existing && !existing.closed) {
+      if (existing && !existing.closed && !overlayDocked) {
         existing.close();
         overlayPopupRef.current = null;
         setOverlayOpen(false);
         return;
       }
-      const win = window.open(
-        `${window.location.origin}/#overlay`,
-        "voicerecore-overlay",
-        "width=1120,height=620,menubar=no,toolbar=no,location=no,status=no"
-      );
-      if (!win) {
-        setErrorMsg("Trình duyệt đã chặn cửa sổ bật lên (popup). Hãy cho phép popup để mở Phụ đề nổi.");
-        setOverlayOpen(false);
-        return;
-      }
-      overlayPopupRef.current = win;
-      setOverlayOpen(true);
-      try {
-        win.addEventListener("beforeunload", () => {
-          overlayPopupRef.current = null;
-          setOverlayOpen(false);
-        });
-      } catch {
-        // ignore
-      }
+      await handleUndockToLed();
     }
   };
 
@@ -3206,12 +3413,197 @@ export default function App() {
 
         <div className="topbar-right">
           <button
-            className={`btn topbar-btn ${overlayOpen ? "active" : ""}`}
+            className={`btn topbar-btn ${overlayOpen && !overlayDocked ? "active" : ""}`}
             onClick={handleToggleOverlay}
-            title="Mở cửa sổ Sân khấu LED / Phụ đề nổi (kéo sang màn hình LED hoặc máy chiếu phụ)"
+            title="Mở cửa sổ Sân khấu LED lớn (6 chế độ hiển thị cho màn hình LED hoặc máy chiếu)"
           >
             <Layers size={13.5} /> <span className="topbar-btn-label">Màn LED</span>
           </button>
+
+          <div className="topbar-dock-wrap" ref={dockMenuRef}>
+            <div className={`topbar-split-group ${overlayOpen && overlayDocked ? "active" : ""}`}>
+              <button
+                type="button"
+                className={`btn topbar-btn topbar-split-main ${overlayOpen && overlayDocked ? "active" : ""}`}
+                onClick={handleQuickToggleSlideBar}
+                title={
+                  overlayOpen && overlayDocked
+                    ? "Đang bật thanh phụ đề mờ Dưới Slide / Video — bấm để tắt"
+                    : "Bật nhanh 1 chạm: ghim thanh phụ đề mờ trong suốt dưới Slide (tự chọn Màn 2 + Xuyên chuột) hoặc kéo nổi trên Video"
+                }
+              >
+                <PictureInPicture2 size={13.5} />{" "}
+                <span className="topbar-btn-label">Dưới Slide / Video</span>
+              </button>
+              <button
+                type="button"
+                className={`btn topbar-split-caret ${overlayOpen && overlayDocked ? "active" : ""} ${
+                  dockMenuOpen ? "open" : ""
+                }`}
+                aria-haspopup="menu"
+                aria-expanded={dockMenuOpen}
+                aria-label="Chọn màn hình và vị trí thanh phụ đề Dưới Slide / Video"
+                title="Chọn Màn hình 1 / Màn hình 2, mép trên / mép dưới & Xuyên chuột"
+                onClick={() => {
+                  const next = !dockMenuOpen;
+                  setDockMenuOpen(next);
+                  if (next) void refreshMonitors();
+                }}
+              >
+                <ChevronDown size={12.5} />
+              </button>
+            </div>
+
+            {dockMenuOpen && (
+              <div className="topbar-dock-menu" role="menu">
+                <div className="dock-menu-head">
+                  <span className="dock-menu-title">
+                    <PictureInPicture2 size={13} /> Thanh phụ đề kính mờ
+                  </span>
+                  <span className="dock-menu-kbd">{isMacOs ? "⌘⇧X" : "Ctrl+Shift+X"}</span>
+                </div>
+
+                {isTauriEnv() && monitors.length > 0 ? (
+                  <div className="dock-menu-section">
+                    <div className="dock-menu-label">Chọn màn hình ghim nhanh</div>
+                    {[...monitors]
+                      .sort((a, b) => Number(a.is_primary) - Number(b.is_primary))
+                      .map((m) => {
+                        const isExternal = !m.is_primary;
+                        const isActiveHere =
+                          overlayOpen && overlayDocked && dockedMonitorIdx === m.index;
+                        return (
+                          <button
+                            key={m.index}
+                            type="button"
+                            role="menuitem"
+                            className={`dock-menu-item ${isActiveHere ? "active" : ""}`}
+                            onClick={() =>
+                              void handleDockSubtitleBar({
+                                monitorIndex: m.index,
+                                anchor: dockAnchor,
+                                clickThrough: isExternal,
+                              })
+                            }
+                          >
+                            <Monitor size={14} className="dock-menu-icon" />
+                            <div className="dock-menu-item-body">
+                              <div className="dock-menu-item-title">
+                                <span>
+                                  {isExternal ? "Dưới Slide — " : "Nổi trên Video — "}Màn {m.index + 1}
+                                </span>
+                                <span className="dock-menu-res">
+                                  {m.width}×{m.height}
+                                </span>
+                              </div>
+                              <div className="dock-menu-item-sub">
+                                {m.name} • {isExternal ? "Tự bật Xuyên chuột" : "Kéo thả tự do lên Video"}
+                              </div>
+                            </div>
+                            {isActiveHere && <Check size={13.5} className="dock-menu-check" />}
+                          </button>
+                        );
+                      })}
+                  </div>
+                ) : (
+                  <div className="dock-menu-section">
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className={`dock-menu-item ${overlayOpen && overlayDocked ? "active" : ""}`}
+                      onClick={() => void handleDockSubtitleBar({ anchor: "bottom" })}
+                    >
+                      <Monitor size={14} className="dock-menu-icon" />
+                      <div className="dock-menu-item-body">
+                        <div className="dock-menu-item-title">
+                          <span>Mở thanh phụ đề mờ Dưới Slide / Video</span>
+                        </div>
+                        <div className="dock-menu-item-sub">
+                          Kính mờ 75% (0%–90%) • Đặt dưới Slide / Video
+                        </div>
+                      </div>
+                    </button>
+                  </div>
+                )}
+
+                <div className="dock-menu-divider" />
+
+                <div className="dock-menu-anchor-row" role="group" aria-label="Vị trí ghim trên màn hình">
+                  <button
+                    type="button"
+                    className={`dock-anchor-pill ${dockAnchor === "bottom" ? "active" : ""}`}
+                    onClick={() =>
+                      void handleDockSubtitleBar({
+                        monitorIndex: overlayDocked ? dockedMonitorIdx : null,
+                        anchor: "bottom",
+                      })
+                    }
+                  >
+                    <ArrowDownToLine size={12.5} /> Mép dưới
+                  </button>
+                  <button
+                    type="button"
+                    className={`dock-anchor-pill ${dockAnchor === "top" ? "active" : ""}`}
+                    onClick={() =>
+                      void handleDockSubtitleBar({
+                        monitorIndex: overlayDocked ? dockedMonitorIdx : null,
+                        anchor: "top",
+                      })
+                    }
+                  >
+                    <ArrowUpToLine size={12.5} /> Mép trên
+                  </button>
+                </div>
+
+                {overlayOpen && (
+                  <>
+                    <div className="dock-menu-divider" />
+                    {isTauriEnv() && (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className={`dock-menu-item compact ${clickThrough ? "active" : ""}`}
+                        onClick={() => {
+                          setDockMenuOpen(false);
+                          void handleToggleClickThrough();
+                        }}
+                      >
+                        <MousePointerClick size={13.5} className="dock-menu-icon" />
+                        <span>
+                          {clickThrough ? "Tắt Xuyên chuột (để kéo chỉnh)" : "Bật Xuyên chuột (bấm Slide bên dưới)"}
+                        </span>
+                      </button>
+                    )}
+                    {overlayDocked && (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="dock-menu-item compact"
+                        onClick={() => void handleUndockToLed()}
+                      >
+                        <Layers size={13.5} className="dock-menu-icon" />
+                        <span>Mở rộng về Màn LED lớn (6 chế độ)</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="dock-menu-item compact danger"
+                      onClick={() => void handleHideOverlay()}
+                    >
+                      <X size={13.5} className="dock-menu-icon" />
+                      <span>Đóng thanh phụ đề nổi</span>
+                    </button>
+                  </>
+                )}
+
+                <div className="dock-menu-tip">
+                  Rê chuột lên thanh phụ đề để đổi độ mờ (0%–90%), màu chữ, cỡ chữ hoặc kéo đặt lên Video. Bấm{" "}
+                  <strong>{isMacOs ? "⌘⇧X" : "Ctrl+Shift+X"}</strong> bất kỳ lúc nào để bật/tắt Xuyên chuột.
+                </div>
+              </div>
+            )}
+          </div>
 
           <button
             className={`btn icon-only ${displayFrozen ? "active" : ""}`}
@@ -3232,8 +3624,10 @@ export default function App() {
               onClick={handleToggleClickThrough}
               title={
                 clickThrough
-                  ? "Đang BẬT xuyên chuột — bấm để tắt và tương tác lại với cửa sổ phụ đề"
-                  : "Cho phép bấm chuột xuyên qua cửa sổ phụ đề để điều khiển slide PowerPoint bên dưới"
+                  ? `Đang BẬT xuyên chuột — bấm nút này hoặc nhấn ${isMacOs ? "⌘⇧X" : "Ctrl+Shift+X"} để tắt và tương tác lại với thanh phụ đề`
+                  : `Cho phép bấm chuột xuyên qua thanh phụ đề để điều khiển Slide PowerPoint / Video bên dưới (Phím tắt: ${
+                      isMacOs ? "⌘⇧X" : "Ctrl+Shift+X"
+                    })`
               }
             >
               <MousePointerClick size={13.5} /> <span className="topbar-btn-label">Xuyên chuột</span>

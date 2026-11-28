@@ -4,7 +4,17 @@ Tất cả thay đổi đáng chú ý của **DAU Voice Pro** được ghi nhậ
 
 ---
 
-## [1.2.0] — 2026-11-26 *(Bản phát hành chính thức mới nhất)*
+## [1.3.0] — 2026-11-28 *(Bản phát hành chính thức mới nhất)*
+
+### 🎬 Thanh Phụ Đề Kính Mờ Trong Suốt 1 Chạm — Dưới Slide (Màn 2) & Nổi Trên Video
+- **1 chạm ghim Dưới Slide / Video ngay thanh công cụ chính:** Tự động phát hiện màn hình thứ 2 (máy chiếu / màn hình trình chiếu PowerPoint, Keynote, Google Slides) để ghim dải phụ đề kính mờ gọn đẹp ở mép dưới **Màn 2** và **tự bật Xuyên chuột** giúp diễn giả bấm chuyển slide mượt mà không bị vướng; khi dùng 1 màn hình sẽ mở dải phụ đề nổi tự do để kéo thả lên **YouTube, Zoom, hoặc video MP4**.
+- **Cửa sổ trong suốt hoàn toàn 100% không viền, không bóng đổ (`macOS` & `Windows`):** Hỗ trợ 4 mức nền kính mờ linh hoạt (**Mờ 75% mặc định / Đậm 90% / Trong suốt 0% chữ có viền sắc nét / Mờ 55%**), 2 màu chữ tương phản cao (**Trắng / Vàng** đồng bộ cả chữ chốt lẫn chữ đang dịch trực tiếp), bật/tắt nhanh dòng câu gốc (**Gốc: Bật/Tắt**), tăng/giảm cỡ chữ (`16px–56px`), đổi vị trí **Mép dưới ↔ Mép trên**, và theo mọi Space trên macOS (`visible_on_all_workspaces`).
+- **Thanh điều khiển tự ẩn thông minh & Chuyển mượt sang Màn LED lớn:** Rê chuột vào thanh phụ đề để chỉnh nhanh hoặc kéo vị trí, tự ẩn hoàn toàn sau khi rời chuột hoặc đứng yên > 3,2 giây để màn hình chỉ còn phụ đề thuần sạch; bấm **`Màn LED`** để mở rộng lại đầy đủ 6 chế độ hội trường (và ngược lại) mà không mất cấu hình kích thước riêng.
+- **Phím tắt toàn cục `Cmd + Shift + X` (macOS) / `Ctrl + Shift + X` (Windows):** Bật hoặc tắt nhanh chế độ **Xuyên chuột** từ bất kỳ ứng dụng nào (kể cả khi đang trình chiếu PowerPoint toàn màn hình hoặc xem YouTube).
+
+---
+
+## [1.2.0] — 2026-11-26
 
 ### 🌐 Phát Mã QR Hội nghị Công khai 4G/5G Miễn phí HTTPS (Zero-Server Tunnel)
 - **Phát QR Công khai 1 chạm (`*.trycloudflare.com`, \$0, không cần tài khoản):** Đại biểu dùng **4G/5G hoặc Wi-Fi cách ly hội trường** quét QR xem phụ đề đa ngôn ngữ tức thì mà không cần mở port router hay thuê máy chủ. Tự tải `cloudflared` chính chủ (~18 MB, chỉ 1 lần duy nhất cho macOS & Windows) kèm thanh tiến độ và xác minh DNS qua `1.1.1.1` DoH trước khi hiển thị QR.

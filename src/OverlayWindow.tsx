@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlignLeft,
   ArrowDown,
+  ArrowDownToLine,
+  ArrowUpToLine,
   BookOpenText,
   Columns2,
   Contrast,
@@ -9,12 +11,16 @@ import {
   EyeOff,
   GripHorizontal,
   Languages,
+  Layers,
   Maximize2,
   Mic,
   Minimize2,
   Minus,
+  Monitor,
   MonitorPlay,
   Moon,
+  MousePointerClick,
+  PictureInPicture2,
   Pin,
   PinOff,
   Plus,
@@ -33,7 +39,9 @@ import {
   ENGINE_HTTP,
   ENGINE_WS,
   EngineStatus,
+  MonitorInfo,
   OVERLAY_LAYOUT_KEY,
+  OverlayDockPayload,
   OverlayLayoutMode,
   ParagraphModeId,
   PartialEvent,
@@ -50,11 +58,64 @@ import {
 
 const OVERLAY_FT_DUAL_KEY = "polyvoice_ft_dual";
 const OVERLAY_FT_COLOR_KEY = "polyvoice_ft_color";
+const BAR_ALPHA_KEY = "polyvoice_bar_alpha";
+const BAR_COLOR_KEY = "polyvoice_bar_color";
+const BAR_SOURCE_KEY = "polyvoice_bar_source";
+const BAR_FONT_KEY = "polyvoice_bar_font";
+const BAR_ALPHA_PRESETS = [0.75, 0.9, 0, 0.55] as const;
 const FULLTEXT_COLORS = [
   { id: "white", hex: "#ffffff", label: "Trắng tinh" },
   { id: "yellow", hex: "#fde047", label: "Vàng hội trường" },
   { id: "cyan", hex: "#7dd3fc", label: "Xanh sáng dịu" },
 ] as const;
+
+function isInitialFloatingBarUrl(): boolean {
+  if (typeof window === "undefined") return false;
+  return window.location.hash.includes("bar=1") || window.location.search.includes("bar=1");
+}
+
+function getInitialBarAlpha(): number {
+  try {
+    const raw = localStorage.getItem(BAR_ALPHA_KEY);
+    if (raw !== null) {
+      const n = Number(raw);
+      if (BAR_ALPHA_PRESETS.some((p) => Math.abs(p - n) < 0.01)) return n;
+    }
+  } catch {
+    // ignore
+  }
+  return 0.75;
+}
+
+function getInitialBarColor(): "#ffffff" | "#fde047" {
+  try {
+    const saved = localStorage.getItem(BAR_COLOR_KEY);
+    if (saved === "#fde047") return "#fde047";
+  } catch {
+    // ignore
+  }
+  return "#ffffff";
+}
+
+function getInitialBarShowSource(): boolean {
+  try {
+    const saved = localStorage.getItem(BAR_SOURCE_KEY);
+    if (saved === "1" || saved === "true") return true;
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+function getInitialBarFontSize(): number {
+  try {
+    const raw = Number(localStorage.getItem(BAR_FONT_KEY));
+    if (Number.isFinite(raw) && raw >= 16 && raw <= 56) return Math.round(raw);
+  } catch {
+    // ignore
+  }
+  return 26;
+}
 
 function getInitialOverlayLayout(): OverlayLayoutMode {
   try {
@@ -188,6 +249,27 @@ export default function OverlayWindow() {
   const [detectedSourceLabel, setDetectedSourceLabel] = useState<string>("");
   const [audienceInfo, setAudienceInfo] = useState<AudienceInfo | null>(null);
 
+  // Floating Transparent Glass Subtitle Bar mode (beneath Slides on Monitor #2 or over Video)
+  const [floatingBarMode, setFloatingBarMode] = useState<boolean>(() => isInitialFloatingBarUrl());
+  const [barAnchor, setBarAnchor] = useState<"bottom" | "top">("bottom");
+  const [barMonitorIndex, setBarMonitorIndex] = useState<number>(0);
+  const [barMonitorName, setBarMonitorName] = useState<string>("");
+  const [barMonitors, setBarMonitors] = useState<MonitorInfo[]>([]);
+  const [barClickThrough, setBarClickThrough] = useState<boolean>(false);
+  const [barBgAlpha, setBarBgAlpha] = useState<number>(() => getInitialBarAlpha());
+  const [barTextColor, setBarTextColor] = useState<"#ffffff" | "#fde047">(() => getInitialBarColor());
+  const [barShowSource, setBarShowSource] = useState<boolean>(() => getInitialBarShowSource());
+  const [barFontSize, setBarFontSize] = useState<number>(() => getInitialBarFontSize());
+  const [barHovered, setBarHovered] = useState<boolean>(false);
+
+  const isMacOs = useMemo(() => {
+    if (status?.platform?.os) return status.platform.os === "Darwin";
+    if (typeof navigator !== "undefined") {
+      return /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
+    }
+    return false;
+  }, [status?.platform?.os]);
+
   const wsRef = useRef<WebSocket | null>(null);
   const partialRef = useRef<PartialEvent | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -200,6 +282,8 @@ export default function OverlayWindow() {
   const scrollAnimRef = useRef<number | null>(null);
   const hideBarTimerRef = useRef<number | null>(null);
   const ytDwellTimerRef = useRef<number | null>(null);
+  const floatingBarHideTimerRef = useRef<number | null>(null);
+  const floatingControlsHoverRef = useRef(false);
 
   const fetchAudienceInfo = useCallback(() => {
     fetch(`${ENGINE_HTTP}/api/audience/info`)
@@ -242,6 +326,103 @@ export default function OverlayWindow() {
       // ignore
     }
   }, [fullTextColor]);
+
+  // Persist Floating Slide/Video Subtitle Bar preferences
+  useEffect(() => {
+    try {
+      localStorage.setItem(BAR_ALPHA_KEY, String(barBgAlpha));
+    } catch {
+      // ignore
+    }
+  }, [barBgAlpha]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(BAR_COLOR_KEY, barTextColor);
+    } catch {
+      // ignore
+    }
+  }, [barTextColor]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(BAR_SOURCE_KEY, barShowSource ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  }, [barShowSource]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(BAR_FONT_KEY, String(barFontSize));
+    } catch {
+      // ignore
+    }
+  }, [barFontSize]);
+
+  const refreshBarMonitors = useCallback(async () => {
+    if (!isTauriEnv()) return;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const list = await invoke<MonitorInfo[]>("list_monitors");
+      if (Array.isArray(list)) setBarMonitors(list);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Listen to Tauri dock-mode & click-through sync events (from Main App or Cmd/Ctrl+Shift+X hotkey)
+  useEffect(() => {
+    if (!isTauriEnv()) return;
+    let cancelled = false;
+    let unlistenDock: (() => void) | undefined;
+    let unlistenCt: (() => void) | undefined;
+    refreshBarMonitors();
+    import("@tauri-apps/api/event")
+      .then(({ listen }) => {
+        listen<OverlayDockPayload>("overlay-dock-mode", (ev) => {
+          const p = ev.payload;
+          if (!p) return;
+          setFloatingBarMode(Boolean(p.docked));
+          if (p.anchor === "top" || p.anchor === "bottom") {
+            setBarAnchor(p.anchor);
+          }
+          if (typeof p.monitor_index === "number") {
+            setBarMonitorIndex(p.monitor_index);
+          }
+          if (typeof p.monitor_name === "string") {
+            setBarMonitorName(p.monitor_name);
+          }
+          if (typeof p.click_through === "boolean") {
+            setBarClickThrough(p.click_through);
+          }
+          if (p.docked) {
+            void refreshBarMonitors();
+          }
+        })
+          .then((fn) => {
+            if (cancelled) fn();
+            else unlistenDock = fn;
+          })
+          .catch(() => {});
+
+        listen<boolean>("overlay-clickthrough-changed", (ev) => {
+          setBarClickThrough(Boolean(ev.payload));
+        })
+          .then((fn) => {
+            if (cancelled) fn();
+            else unlistenCt = fn;
+          })
+          .catch(() => {});
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+      unlistenDock?.();
+      unlistenCt?.();
+    };
+  }, [refreshBarMonitors]);
 
   // Re-pin & sync scroll positions cleanly whenever entering Full-Text or re-mounting the left column
   useEffect(() => {
@@ -368,6 +549,7 @@ export default function OverlayWindow() {
   }, [autoHideActive, revealControlsTemporarily]);
 
   useEffect(() => {
+    document.documentElement.classList.add("overlay-body");
     document.body.classList.add("overlay-body");
     let closed = false;
     let timer: number | undefined;
@@ -534,10 +716,53 @@ export default function OverlayWindow() {
         window.clearTimeout(ytDwellTimerRef.current);
         ytDwellTimerRef.current = null;
       }
+      if (floatingBarHideTimerRef.current) {
+        window.clearTimeout(floatingBarHideTimerRef.current);
+        floatingBarHideTimerRef.current = null;
+      }
       wsRef.current?.close();
+      document.documentElement.classList.remove("overlay-body");
       document.body.classList.remove("overlay-body");
     };
   }, [fetchAudienceInfo]);
+
+  // Reliable auto-hide for Floating Bar micro-controls on pointer leave, blur, or idle
+  const revealFloatingBarControls = useCallback(() => {
+    setBarHovered(true);
+    if (floatingBarHideTimerRef.current) {
+      window.clearTimeout(floatingBarHideTimerRef.current);
+      floatingBarHideTimerRef.current = null;
+    }
+    if (!floatingControlsHoverRef.current) {
+      floatingBarHideTimerRef.current = window.setTimeout(() => {
+        if (!floatingControlsHoverRef.current) {
+          setBarHovered(false);
+        }
+        floatingBarHideTimerRef.current = null;
+      }, 3200);
+    }
+  }, []);
+
+  const hideFloatingBarControlsNow = useCallback(() => {
+    floatingControlsHoverRef.current = false;
+    if (floatingBarHideTimerRef.current) {
+      window.clearTimeout(floatingBarHideTimerRef.current);
+      floatingBarHideTimerRef.current = null;
+    }
+    setBarHovered(false);
+  }, []);
+
+  useEffect(() => {
+    if (!floatingBarMode) return;
+    const onDocLeave = () => hideFloatingBarControlsNow();
+    const onBlur = () => hideFloatingBarControlsNow();
+    document.addEventListener("mouseleave", onDocLeave);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      document.removeEventListener("mouseleave", onDocLeave);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [floatingBarMode, hideFloatingBarControlsNow]);
 
   // Silky-smooth eased auto-scroll (prevents harsh instant jumps on conference LED screens)
   useEffect(() => {
@@ -629,12 +854,85 @@ export default function OverlayWindow() {
     if (isTauriEnv()) {
       try {
         const { invoke } = await import("@tauri-apps/api/core");
-        await invoke("toggle_overlay");
+        await invoke("hide_overlay");
       } catch {
         // ignore
       }
     } else {
       window.close();
+    }
+  };
+
+  const handleEnterFloatingBar = async (
+    targetMonitor?: number,
+    targetAnchor: "bottom" | "top" = barAnchor
+  ) => {
+    if (isTauriEnv()) {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const payload = await invoke<OverlayDockPayload>("dock_overlay_subtitle_bar", {
+          monitorIndex: targetMonitor ?? null,
+          anchor: targetAnchor,
+          heightPx: 176,
+          clickThrough: barClickThrough,
+        });
+        setFloatingBarMode(true);
+        setBarAnchor(payload.anchor === "top" ? "top" : "bottom");
+        setBarMonitorIndex(payload.monitor_index);
+        setBarMonitorName(payload.monitor_name);
+        setBarClickThrough(payload.click_through);
+        void refreshBarMonitors();
+      } catch {
+        setFloatingBarMode(true);
+        setBarAnchor(targetAnchor);
+      }
+    } else {
+      setFloatingBarMode(true);
+      setBarAnchor(targetAnchor);
+    }
+  };
+
+  const handleExitFloatingBar = async () => {
+    if (isTauriEnv()) {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("undock_overlay_subtitle_bar");
+      } catch {
+        // ignore
+      }
+    }
+    setFloatingBarMode(false);
+    setBarClickThrough(false);
+  };
+
+  const handleBarToggleClickThrough = async () => {
+    const next = !barClickThrough;
+    setBarClickThrough(next);
+    if (isTauriEnv()) {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("set_overlay_clickthrough", { ignore: next });
+      } catch {
+        setBarClickThrough(!next);
+      }
+    }
+  };
+
+  const handleCycleBarAlpha = () => {
+    const idx = BAR_ALPHA_PRESETS.findIndex((p) => Math.abs(p - barBgAlpha) < 0.01);
+    const next = BAR_ALPHA_PRESETS[(idx + 1) % BAR_ALPHA_PRESETS.length];
+    setBarBgAlpha(next);
+  };
+
+  const handleBarDragMouseDown = async (e: React.MouseEvent<HTMLElement>) => {
+    if (e.button !== 0 || barClickThrough) return;
+    if ((e.target as HTMLElement).closest("button")) return;
+    if (!isTauriEnv()) return;
+    try {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      await getCurrentWindow().startDragging();
+    } catch {
+      // fallback to data-tauri-drag-region
     }
   };
 
@@ -751,6 +1049,275 @@ export default function OverlayWindow() {
   const srcStackedSize = Math.max(14, Math.round(fontSize * 0.66));
   const hideTopbar = autoHideActive && !controlsVisible;
   const ftTargetInk = theme === "light" ? "#0f172a" : fullTextColor;
+
+  if (floatingBarMode) {
+    const latestFinal = entries[entries.length - 1] || null;
+    const rawActiveHasMt = Boolean(
+      partial && (partial.translated_text || partial.stable_text || partial.unstable_text)
+    );
+    const activePartial: PartialEvent | null = rawActiveHasMt
+      ? partial
+      : inflightPartial && (!latestFinal || inflightPartial.id !== latestFinal.id)
+        ? inflightPartial
+        : partial;
+    const activeHasMt = Boolean(
+      activePartial &&
+        (activePartial.translated_text || activePartial.stable_text || activePartial.unstable_text)
+    );
+    const partialWords = (activePartial?.translated_text || activePartial?.source_text || "")
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean).length;
+    const holdFreshFinal = Boolean(
+      latestFinal?.translated_text &&
+        activePartial &&
+        activePartial.id !== latestFinal.id &&
+        Date.now() < ytDwellHoldUntil &&
+        partialWords < 6
+    );
+    const showLivePrimary = Boolean(activeHasMt && activePartial && !holdFreshFinal);
+    const barSourceText = showLivePrimary
+      ? activePartial?.source_text || ""
+      : latestFinal?.source_text || activePartial?.source_text || "";
+    const isPureTransparent = barBgAlpha <= 0.01;
+    const alphaLabel = isPureTransparent
+      ? "Trong 0%"
+      : `Mờ ${Math.round(barBgAlpha * 100)}%`;
+    const ctShortcutHint = isMacOs ? "⌘⇧X" : "Ctrl+Shift+X";
+    const barControlsOpen = barHovered && !barClickThrough;
+
+    const controlsStrip = (
+      <div
+        className={`floating-bar-controls ${barControlsOpen ? "visible" : ""}`}
+        data-tauri-drag-region
+        onMouseDown={handleBarDragMouseDown}
+        onMouseEnter={() => {
+          floatingControlsHoverRef.current = true;
+          if (floatingBarHideTimerRef.current) {
+            window.clearTimeout(floatingBarHideTimerRef.current);
+            floatingBarHideTimerRef.current = null;
+          }
+          setBarHovered(true);
+        }}
+        onMouseLeave={() => {
+          floatingControlsHoverRef.current = false;
+          revealFloatingBarControls();
+        }}
+        role="toolbar"
+        aria-label="Điều khiển thanh phụ đề nổi Dưới Slide / Video"
+      >
+        <span
+          className="floating-bar-grip"
+          data-tauri-drag-region
+          title="Kéo thả thanh phụ đề này lên bất kỳ vị trí nào trên Slide hoặc Video"
+        >
+          <GripHorizontal size={12.5} />
+          <span className="floating-bar-tag">
+            {barMonitorName ? barMonitorName : "Slide / Video"}
+          </span>
+        </span>
+
+        {barMonitors.length > 1 && (
+          <div className="floating-bar-seg" role="group" aria-label="Chọn màn hình">
+            {barMonitors.map((m) => (
+              <button
+                key={m.index}
+                type="button"
+                className={`fb-btn ${barMonitorIndex === m.index ? "active" : ""}`}
+                title={`Chuyển thanh phụ đề sang Màn ${m.index + 1} (${m.name} — ${m.width}×${m.height})`}
+                onClick={() => void handleEnterFloatingBar(m.index, barAnchor)}
+              >
+                <Monitor size={11} /> Màn {m.index + 1}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <button
+          type="button"
+          className="fb-btn"
+          title={barAnchor === "bottom" ? "Chuyển thanh phụ đề lên mép trên màn hình" : "Chuyển thanh phụ đề xuống mép dưới màn hình"}
+          onClick={() =>
+            void handleEnterFloatingBar(
+              barMonitors.length > 0 ? barMonitorIndex : undefined,
+              barAnchor === "bottom" ? "top" : "bottom"
+            )
+          }
+        >
+          {barAnchor === "bottom" ? <ArrowUpToLine size={11.5} /> : <ArrowDownToLine size={11.5} />}
+          {barAnchor === "bottom" ? "Mép trên" : "Mép dưới"}
+        </button>
+
+        <button
+          type="button"
+          className={`fb-btn ${isPureTransparent ? "active" : ""}`}
+          title="Đổi độ mờ nền kính (75% → 90% → Trong suốt 0% → 55%)"
+          onClick={handleCycleBarAlpha}
+        >
+          <Contrast size={11.5} /> {alphaLabel}
+        </button>
+
+        <button
+          type="button"
+          className="fb-btn"
+          title={barTextColor === "#ffffff" ? "Đổi chữ sang màu Vàng nổi bật" : "Đổi chữ sang màu Trắng tinh"}
+          onClick={() => setBarTextColor((c) => (c === "#ffffff" ? "#fde047" : "#ffffff"))}
+        >
+          <span
+            className="fb-color-swatch"
+            style={{ backgroundColor: barTextColor }}
+            aria-hidden="true"
+          />
+          {barTextColor === "#ffffff" ? "Trắng" : "Vàng"}
+        </button>
+
+        <button
+          type="button"
+          className={`fb-btn ${barShowSource ? "active" : ""}`}
+          title={
+            barShowSource
+              ? "Đang hiện thêm dòng lời nói gốc nhỏ — bấm để ẩn cho gọn 1–2 dòng"
+              : "Hiện thêm 1 dòng lời nói gốc nhỏ ngay trên bản dịch"
+          }
+          onClick={() => setBarShowSource((v) => !v)}
+        >
+          <Mic size={11} /> {barShowSource ? "Gốc: Bật" : "Gốc: Tắt"}
+        </button>
+
+        <div className="floating-bar-seg" role="group" aria-label="Cỡ chữ thanh phụ đề">
+          <button
+            type="button"
+            className="fb-btn icon"
+            title="Giảm cỡ chữ"
+            onClick={() => setBarFontSize((s) => Math.max(16, s - 2))}
+          >
+            <Minus size={11} />
+          </button>
+          <span className="fb-size-val">{barFontSize}px</span>
+          <button
+            type="button"
+            className="fb-btn icon"
+            title="Tăng cỡ chữ"
+            onClick={() => setBarFontSize((s) => Math.min(56, s + 2))}
+          >
+            <Plus size={11} />
+          </button>
+        </div>
+
+        <button
+          type="button"
+          className={`fb-btn ${barClickThrough ? "active" : ""}`}
+          title={`Bật Xuyên chuột để bấm Slide/Video bên dưới không bị vướng (Phím tắt toàn cục: ${ctShortcutHint})`}
+          onClick={() => void handleBarToggleClickThrough()}
+        >
+          <MousePointerClick size={11.5} /> Xuyên chuột ({ctShortcutHint})
+        </button>
+
+        <button
+          type="button"
+          className="fb-btn accent"
+          title="Mở rộng về cửa sổ Màn LED lớn (đầy đủ 6 chế độ hiển thị)"
+          onClick={() => void handleExitFloatingBar()}
+        >
+          <Layers size={11.5} /> Màn LED
+        </button>
+
+        <button
+          type="button"
+          className="fb-btn icon close"
+          title="Đóng thanh phụ đề nổi"
+          onClick={() => void handleClose()}
+        >
+          <X size={12} />
+        </button>
+      </div>
+    );
+
+    return (
+      <div
+        className={`overlay-stage-root floating-bar-mode anchor-${barAnchor} ${
+          barClickThrough ? "click-through" : ""
+        }`}
+        onMouseEnter={revealFloatingBarControls}
+        onMouseMove={revealFloatingBarControls}
+        onMouseLeave={hideFloatingBarControlsNow}
+      >
+        {barAnchor === "bottom" && controlsStrip}
+
+        <div
+          className={`floating-bar-capsule ${isPureTransparent ? "pure-transparent" : ""} ${
+            showLivePrimary ? "live" : ""
+          }`}
+          data-tauri-drag-region
+          onMouseDown={handleBarDragMouseDown}
+          style={
+            isPureTransparent
+              ? undefined
+              : { background: `rgba(8, 11, 18, ${barBgAlpha})` }
+          }
+        >
+          {displayFrozen ? (
+            <div
+              className="floating-bar-tgt frozen"
+              style={{ fontSize: Math.max(18, Math.round(barFontSize * 0.85)), color: barTextColor }}
+            >
+              DAU Voice Pro — {freezeMessage}
+            </div>
+          ) : isEmpty ? (
+            <div
+              className="floating-bar-placeholder"
+              style={{ fontSize: Math.max(15, Math.round(barFontSize * 0.72)) }}
+            >
+              <span className={`dot ${connected && status?.listening ? "pulse" : ""}`} />
+              <span>
+                {!connected
+                  ? "Đang kết nối DAU Voice Pro..."
+                  : status?.listening
+                  ? `Đang lắng nghe (${srcLabel} → ${tgtLabel})...`
+                  : `Phụ đề nổi Dưới Slide / Video (${srcLabel} → ${tgtLabel}) — rê chuột để chỉnh hoặc kéo vị trí`}
+              </span>
+            </div>
+          ) : (
+            <>
+              {barShowSource && barSourceText && (
+                <div
+                  className="floating-bar-src"
+                  style={{ fontSize: Math.max(12, Math.round(barFontSize * 0.56)) }}
+                >
+                  {barSourceText}
+                </div>
+              )}
+              <div
+                className="floating-bar-tgt"
+                style={{ fontSize: barFontSize, color: barTextColor }}
+              >
+                {showLivePrimary && activePartial ? (
+                  renderLiveTarget(activePartial)
+                ) : latestFinal?.translated_text ? (
+                  <>
+                    {latestFinal.translated_text}
+                    {Boolean(activePartial) && <span className="live-caret" aria-hidden="true" />}
+                  </>
+                ) : activePartial ? (
+                  <span className="overlay-translating-dots">
+                    <span className="live-dots" aria-hidden="true">
+                      <span />
+                      <span />
+                      <span />
+                    </span>
+                  </span>
+                ) : (
+                  "—"
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
+        {barAnchor === "top" && controlsStrip}
+      </div>
+    );
+  }
 
   return (
     <div
@@ -958,6 +1525,14 @@ export default function OverlayWindow() {
               >
                 {displayFrozen ? <Eye size={12.5} /> : <EyeOff size={12.5} />}
                 {displayFrozen ? "Phát lại LED" : "Tạm ẩn"}
+              </button>
+
+              <button
+                className="btn sm overlay-ctrl-btn"
+                title="Thu gọn thành thanh phụ đề kính mờ trong suốt đặt dưới Slide (Màn 2) hoặc nổi trên Video"
+                onClick={() => void handleEnterFloatingBar()}
+              >
+                <PictureInPicture2 size={12.5} /> Dưới Slide / Video
               </button>
 
               <button

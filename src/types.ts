@@ -376,6 +376,25 @@ export interface EngineStatus {
   boot_error: string;
 }
 
+export interface MonitorInfo {
+  index: number;
+  name: string;
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+  scale_factor: number;
+  is_primary: boolean;
+}
+
+export interface OverlayDockPayload {
+  docked: boolean;
+  monitor_index: number;
+  monitor_name: string;
+  anchor: "bottom" | "top" | string;
+  click_through: boolean;
+}
+
 export type OverlayLayoutMode = "led-stage" | "full-text" | "stacked" | "youtube" | "target-only" | "split";
 export const OVERLAY_LAYOUT_KEY = "polyvoice_overlay_layout";
 
